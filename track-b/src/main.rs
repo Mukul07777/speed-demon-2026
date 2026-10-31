@@ -6,8 +6,9 @@
 //! 1. Read the queries and put every term in one table. A token that is not in it is
 //!    dropped after one hash, whatever else the corpus holds.
 //! 2. Index at document level only. Terms common enough to deserve it get a bitmap, chosen
-//!    from a small sample of the corpus. The rest become sorted lists of document ids,
-//!    written as rows that need no shared counters.
+//!    from a small sample of the corpus. The rest become lists of document ids, written as
+//!    rows that need no shared counters. Rows last one phase of 32 MiB of text, then become
+//!    16-bit postings, so that rows and postings never fill memory together.
 //! 3. Store no positions. A phrase starts from its rarest term, which the query generator
 //!    guarantees is rare, and checks each candidate against the mapped text itself.
 //! 4. Evaluate BOOL strictly left to right on whichever of list or bitmap suits each step.
@@ -22,6 +23,7 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn memchr(text: *const u8, byte: i32, len: usize) -> *const u8;
 }
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -29,13 +31,15 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
-const MADV_DONTNEED: i32 = 4;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
 const MADV_POPULATE_READ: i32 = 22;
 
 const HUGE_PAGE: usize = 1 << 21;
-const CLAIM: usize = 1 << 20;
+const CLAIM: usize = 1 << 18;
+const PHASE_CLAIMS: usize = 128; // 32 MiB of text between turning rows into postings
+const HEADER: usize = 5; // u16s of a list part: previous part, first document, length
+const MAX_PHRASE: usize = 8;
 const BATCH: usize = 1 << 14; // bytes of text between the token pass and the term pass
 const MAX_TOKENS: usize = BATCH / 2 + 64;
 const BUCKET_BITS: u32 = 15;
@@ -45,7 +49,6 @@ const MAX_TERMS: usize = BUCKETS * BUCKET_SLOTS;
 const AHEAD: usize = 12; // tokens between a bucket's prefetch and its lookup
 const HEAVY: u32 = 1 << 31; // an action: 0 for no term, a bitmap index here, or a term id + 1
 const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look further
-const SAMPLE_CLAIMS: usize = 3; // 3 MiB holds about 3,000 documents, plenty to find common terms
 const HEAVY_SHARE: usize = 32; // a term in 1/32 of documents is cheaper as a bitmap
 const MAX_HEAVY: usize = 4096;
 const SHARDS: usize = 64;
@@ -87,7 +90,7 @@ struct Buffers {
 struct Term {
     text: u32, // offset into the query text
     len: u32,
-    first: u32, // offset into the postings, or the bitmap index
+    first: u32, // the term's last list part, or its bitmap index
     count: u32, // documents containing the term
     heavy: bool,
 }
@@ -140,7 +143,7 @@ struct Run {
     rows: *mut u32,
     stride: usize,
     claimed: Vec<AtomicUsize>,
-    postings: *mut u32,
+    postings: *mut u16,
     next_posting: AtomicUsize,
     parts: Mutex<Vec<Vec<u8>>>,
 }
@@ -233,23 +236,25 @@ impl Run {
     /// The position and id of the first line at or after `at` whose id is a multiple of 64.
     /// Claims start on such lines, so no two workers ever share a word of a bitmap.
     unsafe fn aligned_line(&self, at: usize) -> Option<(usize, usize)> {
+        let past_line = |from: usize| {
+            let found = memchr(self.text.add(from), b'\n' as i32, self.len - from);
+            found as usize - self.text as usize + 1
+        };
         if at >= self.len {
             return None;
         }
-        let text = std::slice::from_raw_parts(self.text, self.len);
-        let mut line = at;
-        if at > 0 && text[at - 1] != b'\n' {
-            line = at + text[at..].iter().position(|&c| c == b'\n')? + 1;
-        }
+        let at_line = at == 0 || *self.text.add(at - 1) == b'\n';
+        let mut line = if at_line { at } else { past_line(at) };
         if line >= self.len {
             return None;
         }
-        let digits = text[line..].iter().position(|&c| c == b'\t')?;
-        let mut id = text[line..line + digits]
-            .iter()
-            .fold(0, |v, &d| v * 10 + (d - b'0') as usize);
+        let (mut id, mut digit) = (0, line);
+        while *self.text.add(digit) != b'\t' {
+            id = id * 10 + (*self.text.add(digit) - b'0') as usize;
+            digit += 1;
+        }
         while id % 64 != 0 {
-            line += text[line..].iter().position(|&c| c == b'\n')? + 1;
+            line = past_line(line);
             id += 1;
             if line >= self.len {
                 return None;
@@ -522,7 +527,7 @@ impl Run {
 
     /// Sorts a shard's rows into one list per term. Chunks are taken in claim order, and each
     /// claim writes in document order, so the result is sorted with no sorting of rows.
-    unsafe fn build_shard(&self, shard: usize) {
+    unsafe fn build_shard(&self, shard: usize, base: u32) {
         let region = self.rows.add(shard * self.stride);
         let claimed = self.claimed[shard].load(Relaxed);
         let mut chunks: Vec<(u32, u32)> = (0..claimed)
@@ -535,33 +540,37 @@ impl Run {
         for_rows(region, &chunks, |low, _| {
             *cursors.get_unchecked_mut(low) += 1
         });
-        // Each list follows a sentinel, so a document can always be compared with the one
-        // before it. A term repeats within a document, but a document's rows are adjacent.
-        let total = cursors.iter().sum::<u32>() as usize + terms;
+        // Until a part is complete its length field holds a sentinel, so a document can always
+        // be compared with the one before it. A term repeats within a document, but a
+        // document's rows are adjacent.
+        let parts = cursors.iter().filter(|&&size| size > 0).count();
+        let total = cursors.iter().sum::<u32>() as usize + parts * HEADER;
         let mut at = self.next_posting.fetch_add(total, Relaxed) as u32;
-        for cursor in &mut cursors {
+        for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
             let size = *cursor;
-            *self.postings.add(at as usize) = u32::MAX;
-            *cursor = at + 1;
-            at += size + 1;
+            *cursor = at + HEADER as u32;
+            *self.postings.add(*cursor as usize - 1) = u16::MAX;
+            at += size + HEADER as u32;
         }
         let firsts = cursors.clone();
         for_rows(region, &chunks, |low, doc| {
             let cursor = cursors.get_unchecked_mut(low);
             let slot = self.postings.add(*cursor as usize);
-            *slot = doc;
-            *cursor += (*slot.sub(1) != doc) as u32;
+            *slot = (doc - base) as u16;
+            *cursor += (*slot.sub(1) != *slot) as u32;
         });
-        for low in 0..terms {
-            let term = low * SHARDS + shard;
-            if term < self.term_count && !(*self.terms.add(term)).heavy {
-                let info = &mut *self.terms.add(term);
-                (info.first, info.count) = (firsts[low], cursors[low] - firsts[low]);
-            }
+        for low in (0..terms).filter(|&low| firsts[low] > 0) {
+            let info = &mut *self.terms.add(low * SHARDS + shard);
+            let part = firsts[low] - HEADER as u32;
+            let head = self.postings.add(part as usize);
+            let size = cursors[low] - firsts[low];
+            head.cast::<u32>().write_unaligned(info.first);
+            head.add(2).cast::<u32>().write_unaligned(base);
+            *head.add(4) = size as u16;
+            info.first = part;
+            info.count += size;
         }
-        let start = region as usize;
-        let whole = (claimed * 4).div_ceil(4096) * 4096;
-        madvise(start as *mut u8, whole, MADV_DONTNEED);
+        std::ptr::write_bytes(region, 0, claimed);
     }
 
     unsafe fn count_bitmaps(&self) {
@@ -578,19 +587,29 @@ impl Run {
         self.bitmaps.add(index as usize * self.words)
     }
 
-    unsafe fn set_of(&self, term: u32) -> Set {
+    /// A term's documents. A list is rebuilt in `space` from its parts, last part first.
+    unsafe fn set_of(&self, term: u32, space: &mut Vec<u32>) -> Set {
         let info = *self.terms.add(term as usize);
         if info.heavy {
-            Set::Bits(std::slice::from_raw_parts(
-                self.bitmap(info.first),
-                self.words,
-            ))
-        } else {
-            Set::List(std::slice::from_raw_parts(
-                self.postings.add(info.first as usize),
-                info.count as usize,
-            ))
+            let bits = self.bitmap(info.first);
+            return Set::Bits(std::slice::from_raw_parts(bits, self.words));
         }
+        let mut end = info.count as usize;
+        space.clear();
+        space.reserve(end);
+        let out = space.as_mut_ptr();
+        let mut part = info.first;
+        while part != 0 {
+            let head = self.postings.add(part as usize);
+            let base = head.add(2).cast::<u32>().read_unaligned();
+            let size = *head.add(4) as usize;
+            end -= size;
+            for i in 0..size {
+                *out.add(end + i) = base + *head.add(HEADER + i) as u32;
+            }
+            part = head.cast::<u32>().read_unaligned();
+        }
+        Set::List(std::slice::from_raw_parts(out, info.count as usize))
     }
 
     fn term_text(&self, term: u32) -> &[u8] {
@@ -598,10 +617,16 @@ impl Run {
         &self.query_text[info.text as usize..(info.text + info.len) as usize]
     }
 
-    unsafe fn answer_bool(&self, steps: &[(Op, u32)], scratch: &mut Scratch) -> Set {
-        let mut current = self.set_of(steps[0].1);
+    unsafe fn answer_bool(
+        &self,
+        steps: &[(Op, u32)],
+        scratch: &mut Scratch,
+        spaces: &mut [Vec<u32>],
+    ) -> Set {
+        let (head, rest) = spaces.split_at_mut(1);
+        let mut current = self.set_of(steps[0].1, &mut head[0]);
         for &(op, term) in &steps[1..] {
-            current = apply(op, current, self.set_of(term), scratch);
+            current = apply(op, current, self.set_of(term, &mut rest[0]), scratch);
         }
         current
     }
@@ -688,7 +713,12 @@ impl Run {
     }
 
     /// Matching documents for a phrase, in `found`.
-    unsafe fn answer_phrase(&self, phrase: &[(Op, u32)], found: &mut Vec<u32>) {
+    unsafe fn answer_phrase(
+        &self,
+        phrase: &[(Op, u32)],
+        spaces: &mut [Vec<u32>],
+        found: &mut Vec<u32>,
+    ) {
         found.clear();
         let count = |step: &(Op, u32)| (*self.terms.add(step.1 as usize)).count;
         if phrase.iter().any(|step| count(step) == 0) {
@@ -697,7 +727,11 @@ impl Run {
         let pivot = (0..phrase.len())
             .min_by_key(|&i| count(&phrase[i]))
             .unwrap();
-        let others: Vec<Set> = phrase.iter().map(|step| self.set_of(step.1)).collect();
+        let others: Vec<Set> = phrase
+            .iter()
+            .zip(spaces)
+            .map(|(step, space)| self.set_of(step.1, space))
+            .collect();
         let mut positions = vec![0usize; phrase.len()];
         let mut check = |doc: u32| {
             for (i, set) in others.iter().enumerate() {
@@ -716,7 +750,7 @@ impl Run {
                 found.push(doc);
             }
         };
-        match self.set_of(phrase[pivot].1) {
+        match others[pivot] {
             Set::List(list) => list.iter().for_each(|&doc| check(doc)),
             Set::Bits(bits) => {
                 for (index, &word) in bits.iter().enumerate() {
@@ -734,6 +768,7 @@ impl Run {
         &self,
         batch: usize,
         scratch: &mut Scratch,
+        spaces: &mut [Vec<u32>],
         found: &mut Vec<u32>,
         out: &mut Vec<u8>,
     ) {
@@ -741,10 +776,10 @@ impl Run {
         for query in &self.queries[first..(first + QUERY_BATCH).min(self.queries.len())] {
             let steps = &self.steps[query.first as usize..(query.first + query.len) as usize];
             if query.phrase {
-                self.answer_phrase(steps, found);
+                self.answer_phrase(steps, spaces, found);
                 write_list(out, found);
             } else {
-                match self.answer_bool(steps, scratch) {
+                match self.answer_bool(steps, scratch, spaces) {
                     Set::List(list) => write_list(out, list),
                     Set::Bits(bits) => write_bits(out, bits),
                 }
@@ -763,11 +798,7 @@ impl Run {
         };
         let mut counts = vec![0u32; self.term_count];
         let claim = self.next_claim.fetch_add(1, Relaxed);
-        let docs = if claim < SAMPLE_CLAIMS {
-            self.index_claim::<true>(claim, &mut counts, &mut buffers)
-        } else {
-            0
-        };
+        let docs = self.index_claim::<true>(claim, &mut counts, &mut buffers);
         {
             let mut samples = self.samples.lock().unwrap();
             samples
@@ -783,16 +814,34 @@ impl Run {
             self.next_claim.store(0, Relaxed);
         }
         self.step.wait();
-        loop {
-            let claim = self.next_claim.fetch_add(1, Relaxed);
-            if claim * CLAIM >= self.len {
-                break;
+        for phase in 0..self.len.div_ceil(PHASE_CLAIMS * CLAIM) {
+            let limit = (phase + 1) * PHASE_CLAIMS;
+            loop {
+                let claim = self.next_claim.fetch_add(1, Relaxed);
+                if claim >= limit || claim * CLAIM >= self.len {
+                    break;
+                }
+                self.index_claim::<false>(claim, &mut [], &mut buffers);
             }
-            self.index_claim::<false>(claim, &mut [], &mut buffers);
+            if self.step.wait().is_leader() {
+                self.next_job.store(0, Relaxed);
+                self.next_claim.store(limit, Relaxed);
+            }
+            self.step.wait();
+            let first_doc = |claim| {
+                self.aligned_line(claim * CLAIM)
+                    .map_or(self.docs, |line| line.1)
+            };
+            let base = first_doc(phase * PHASE_CLAIMS);
+            assert!(first_doc(limit) - base < u16::MAX as usize);
+            self.each_job(SHARDS, |shard| self.build_shard(shard, base as u32));
+            if self.step.wait().is_leader() {
+                self.next_job.store(0, Relaxed);
+                self.claimed.iter().for_each(|rows| rows.store(0, Relaxed));
+            }
+            self.step.wait();
         }
         drop(buffers);
-        self.next_step();
-        self.each_job(SHARDS, |shard| self.build_shard(shard));
         if self.step.wait().is_leader() {
             self.count_bitmaps();
             self.next_job.store(0, Relaxed);
@@ -805,10 +854,11 @@ impl Run {
             active: 0,
             bits: vec![0; self.words],
         };
+        let mut spaces = vec![Vec::new(); MAX_PHRASE];
         let mut found = Vec::new();
         self.each_job(batches, |batch| {
             let mut out = Vec::with_capacity(QUERY_BATCH * 64);
-            self.answer_batch(batch, &mut scratch, &mut found, &mut out);
+            self.answer_batch(batch, &mut scratch, &mut spaces, &mut found, &mut out);
             self.parts.lock().unwrap()[batch] = out;
         });
     }
@@ -1168,8 +1218,8 @@ fn main() {
             rows: reserve(SHARDS * stride * 4, MADV_NOHUGEPAGE).cast(),
             stride,
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
-            postings: reserve(len * 4 / 4, MADV_HUGEPAGE).cast(),
-            next_posting: AtomicUsize::new(0),
+            postings: reserve(len * 2 + HUGE_PAGE, MADV_HUGEPAGE).cast(),
+            next_posting: AtomicUsize::new(1),
             parts: Mutex::new(Vec::new()),
         }
     };
