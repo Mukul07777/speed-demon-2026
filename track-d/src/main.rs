@@ -12,13 +12,13 @@
 //!
 //! An edge is 4 bytes: 21 bits of head and 11 of weight. Only about 3,500 of the 5,000,000
 //! weights need more, so those edges live in a side list and their tails carry a flag.
+use std::arch::x86_64::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::ptr::read_unaligned;
-use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread;
@@ -81,7 +81,10 @@ impl Rows {
     unsafe fn new(shards: usize) -> Rows {
         let bytes = shards * SHARD_ROWS * size_of::<Row>();
         let rows = reserve(bytes, MADV_NOHUGEPAGE);
-        Rows { rows: rows.cast(), claimed: (0..shards).map(|_| AtomicUsize::new(0)).collect() }
+        Rows {
+            rows: rows.cast(),
+            claimed: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
+        }
     }
 
     /// The rows of a shard, one chunk at a time, skipping each chunk's unused end.
@@ -112,7 +115,9 @@ struct Writer {
 impl Writer {
     fn new(shards: usize) -> Writer {
         let empty = std::ptr::null_mut();
-        Writer { cursors: vec![(empty, empty); shards] }
+        Writer {
+            cursors: vec![(empty, empty); shards],
+        }
     }
 
     #[inline(always)]
@@ -120,12 +125,18 @@ impl Writer {
         let shard = node >> SHARD_SHIFT;
         let cursor = self.cursors.get_unchecked_mut(shard);
         if cursor.0 == cursor.1 {
-            let offset = rows.claimed.get_unchecked(shard).fetch_add(CHUNK_ROWS, Relaxed);
+            let offset = rows
+                .claimed
+                .get_unchecked(shard)
+                .fetch_add(CHUNK_ROWS, Relaxed);
             cursor.0 = rows.rows.add(shard * SHARD_ROWS + offset);
             cursor.1 = cursor.0.add(CHUNK_ROWS);
         }
         let packed = ((other as u32 + 1) << WEIGHT_BITS) | weight as u32;
-        cursor.0.write_unaligned(Row { packed, low: (node & (SHARD_NODES - 1)) as u16 });
+        cursor.0.write_unaligned(Row {
+            packed,
+            low: (node & (SHARD_NODES - 1)) as u16,
+        });
         cursor.0 = cursor.0.add(1);
     }
 }
@@ -192,7 +203,14 @@ impl Graph {
 /// Anonymous memory that costs nothing until it is touched.
 unsafe fn reserve(bytes: usize, advice: i32) -> *mut u8 {
     let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    let region = mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
+    let region = mmap(
+        std::ptr::null_mut(),
+        bytes,
+        PROT_READ | PROT_WRITE,
+        flags,
+        -1,
+        0,
+    );
     madvise(region, bytes, advice);
     region
 }
@@ -201,7 +219,14 @@ unsafe fn map_file(file: &File, len: usize) -> *const u8 {
     let span = len.div_ceil(4096) * 4096 + 4096;
     let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     let base = mmap(std::ptr::null_mut(), span, PROT_READ, flags, -1, 0);
-    mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
+    mmap(
+        base,
+        len,
+        PROT_READ,
+        MAP_PRIVATE | MAP_FIXED,
+        file.as_raw_fd(),
+        0,
+    );
     base
 }
 
@@ -268,7 +293,11 @@ impl Run {
             if claim >= self.text_len {
                 break;
             }
-            madvise(text.add(claim) as *mut u8, CLAIM.min(mapped_end - claim), MADV_POPULATE_READ);
+            madvise(
+                text.add(claim) as *mut u8,
+                CLAIM.min(mapped_end - claim),
+                MADV_POPULATE_READ,
+            );
             // A line belongs to the claim it starts in. The header belongs to nobody.
             let mut at = claim;
             if claim == 0 || *text.add(claim - 1) != b'\n' {
@@ -282,7 +311,8 @@ impl Run {
                 // A line is at most 27 bytes, so one load holds all three of its separators.
                 let line = text.add(at);
                 let chunk = _mm256_loadu_si256(line.cast());
-                let mut separators = _mm256_movemask_epi8(_mm256_cmpgt_epi8(digit_floor, chunk)) as u32;
+                let mut separators =
+                    _mm256_movemask_epi8(_mm256_cmpgt_epi8(digit_floor, chunk)) as u32;
                 let first = separators.trailing_zeros() as usize;
                 separators &= separators - 1;
                 let second = separators.trailing_zeros() as usize;
@@ -368,7 +398,9 @@ impl Run {
                 head += 1;
                 let label = &*self.labels.add(node);
                 let value = ((worker as u32 + 1) << LABEL_SHIFT) | order.len() as u32;
-                if label.load(Relaxed) != 0 || label.compare_exchange(0, value, Relaxed, Relaxed).is_err() {
+                if label.load(Relaxed) != 0
+                    || label.compare_exchange(0, value, Relaxed, Relaxed).is_err()
+                {
                     continue;
                 }
                 order.push(node as u32);
@@ -402,13 +434,24 @@ impl Run {
             edges += edge_count;
         }
         let map = |old: u32| unsafe { self.new_id(&node_base, old as usize) };
-        let queries = self.raw_queries.iter().map(|&(s, t)| (map(s), map(t))).collect();
+        let queries = self
+            .raw_queries
+            .iter()
+            .map(|&(s, t)| (map(s), map(t)))
+            .collect();
         let heavy = self.heavy.lock().unwrap();
-        let mut heavy_out: Vec<Heavy> = heavy.iter().map(|&(u, v, w)| (map(u), map(v), w)).collect();
+        let mut heavy_out: Vec<Heavy> =
+            heavy.iter().map(|&(u, v, w)| (map(u), map(v), w)).collect();
         let mut heavy_in: Vec<Heavy> = heavy_out.iter().map(|&(u, v, w)| (v, u, w)).collect();
         heavy_out.sort_unstable();
         heavy_in.sort_unstable();
-        Layout { node_base, edge_base, queries, heavy_out, heavy_in }
+        Layout {
+            node_base,
+            edge_base,
+            queries,
+            heavy_out,
+            heavy_in,
+        }
     }
 
     /// Translates every edge head to its new id, which is a random lookup per edge. Working
@@ -438,7 +481,8 @@ impl Run {
                     let head = self.new_id(&layout.node_base, (edge >> WEIGHT_BITS) as usize);
                     *self.forward.edges.add(at) = head << WEIGHT_BITS | (edge & (LIGHT as u32 - 1));
                     at += 1;
-                    (*self.backward.nodes.add(head as usize).cast::<AtomicU32>()).fetch_add(1, Relaxed);
+                    (*self.backward.nodes.add(head as usize).cast::<AtomicU32>())
+                        .fetch_add(1, Relaxed);
                 }
             }
         }
@@ -481,7 +525,10 @@ impl Run {
         self.each_job(self.shards, |shard| self.raw.build_shard(&self.rows, shard));
         self.next_step(|| self.rows.release());
         let (order, edges) = self.grow_cells(worker);
-        self.claimed.lock().unwrap().push((worker, order.len(), edges));
+        self.claimed
+            .lock()
+            .unwrap()
+            .push((worker, order.len(), edges));
         self.next_step(|| {
             let _ = self.layout.set(self.plan_layout());
         });
@@ -531,9 +578,19 @@ impl Run {
             }
             let forward_turn = forward.queue.live <= backward.queue.live;
             let (side, other, graph, heavy) = if forward_turn {
-                (&mut *forward, &mut *backward, &self.forward, &layout.heavy_out)
+                (
+                    &mut *forward,
+                    &mut *backward,
+                    &self.forward,
+                    &layout.heavy_out,
+                )
             } else {
-                (&mut *backward, &mut *forward, &self.backward, &layout.heavy_in)
+                (
+                    &mut *backward,
+                    &mut *forward,
+                    &self.backward,
+                    &layout.heavy_in,
+                )
             };
             let distance = side.queue.now;
             let node = side.queue.pop();
@@ -549,12 +606,25 @@ impl Run {
             let limit = best.saturating_sub(other.queue.now);
             for &edge in graph.edges_of(node) {
                 let weight = (edge & (LIGHT as u32 - 1)) as u64;
-                side.reach((edge >> WEIGHT_BITS) as usize, distance + weight, limit, other, &mut best);
+                side.reach(
+                    (edge >> WEIGHT_BITS) as usize,
+                    distance + weight,
+                    limit,
+                    other,
+                    &mut best,
+                );
             }
             if *graph.nodes.add(node) & HEAVY_FLAG != 0 {
                 let from = heavy.partition_point(|h| (h.0 as usize) < node);
-                for &(_, head, weight) in heavy[from..].iter().take_while(|h| h.0 as usize == node) {
-                    side.reach(head as usize, distance + weight as u64, limit, other, &mut best);
+                for &(_, head, weight) in heavy[from..].iter().take_while(|h| h.0 as usize == node)
+                {
+                    side.reach(
+                        head as usize,
+                        distance + weight as u64,
+                        limit,
+                        other,
+                        &mut best,
+                    );
                 }
             }
         }
@@ -783,7 +853,10 @@ impl Side {
 
 fn read_queries() -> Vec<(u32, u32)> {
     let text = std::fs::read("/data/queries.txt").unwrap();
-    let number = |word: &[u8]| word.iter().fold(0, |value, &digit| value * 10 + (digit - b'0') as u32);
+    let number = |word: &[u8]| {
+        word.iter()
+            .fold(0, |value, &digit| value * 10 + (digit - b'0') as u32)
+    };
     text.split(|&c| c == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| {
@@ -803,7 +876,13 @@ fn main() {
         let header = std::slice::from_raw_parts(text, 64);
         let line_end = header.iter().position(|&c| c == b'\n').unwrap();
         let mut words = header[..line_end].split(|&c| c == b' ');
-        let mut number = || words.next().unwrap().iter().fold(0, |v, &d| v * 10 + (d - b'0') as usize);
+        let mut number = || {
+            words
+                .next()
+                .unwrap()
+                .iter()
+                .fold(0, |v, &d| v * 10 + (d - b'0') as usize)
+        };
         let (nodes, edges) = (number(), number());
         let shards = (nodes >> SHARD_SHIFT) + 1;
         Run {
@@ -823,7 +902,10 @@ fn main() {
             heavy: Mutex::new(Vec::new()),
             claimed: Mutex::new(Vec::new()),
             layout: OnceLock::new(),
-            answers: raw_queries.iter().map(|_| AtomicU64::new(UNREACHED)).collect(),
+            answers: raw_queries
+                .iter()
+                .map(|_| AtomicU64::new(UNREACHED))
+                .collect(),
             raw_queries,
         }
     };
@@ -831,7 +913,9 @@ fn main() {
         for worker in 1..threads {
             let builder = thread::Builder::new().stack_size(1 << 19);
             let run = &run;
-            builder.spawn_scoped(s, move || unsafe { run.work(worker) }).unwrap();
+            builder
+                .spawn_scoped(s, move || unsafe { run.work(worker) })
+                .unwrap();
         }
         unsafe { run.work(0) };
     });
@@ -843,5 +927,8 @@ fn main() {
             distance => out.push_str(&format!("{distance}\n")),
         }
     }
-    File::create("/out/distances.txt").unwrap().write_all(out.as_bytes()).unwrap();
+    File::create("/out/distances.txt")
+        .unwrap()
+        .write_all(out.as_bytes())
+        .unwrap();
 }
