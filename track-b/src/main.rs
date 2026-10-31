@@ -9,8 +9,10 @@
 //!    from a small sample of the corpus. The rest become lists of document ids, written as
 //!    rows that need no shared counters. Rows last one phase of 32 MiB of text, then become
 //!    16-bit postings, so that rows and postings never fill memory together.
-//! 3. Store no positions. A phrase starts from its rarest term, which the query generator
-//!    guarantees is rare, and checks each candidate against the mapped text itself.
+//! 3. Store no positions. A phrase is checked during the scan, when the document's tokens
+//!    are at hand: when its rarest term appears, the neighbouring tokens' hashes are compared
+//!    with the phrase. A match writes a row for a pseudo-term that stands for the phrase, so
+//!    a phrase query is then a one-term lookup, and no document is ever read twice.
 //! 4. Evaluate BOOL strictly left to right on whichever of list or bitmap suits each step.
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -39,9 +41,8 @@ const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 const PHASE_CLAIMS: usize = 128; // 32 MiB of text between turning rows into postings
 const HEADER: usize = 5; // u16s of a list part: previous part, first document, length
-const MAX_PHRASE: usize = 8;
 const BATCH: usize = 1 << 14; // bytes of text between the token pass and the term pass
-const MAX_TOKENS: usize = BATCH / 2 + 64;
+const MAX_TOKENS: usize = 1 << 19; // of a batch and an unfinished document
 const BUCKET_BITS: u32 = 15;
 const BUCKETS: usize = 1 << BUCKET_BITS;
 const BUCKET_SLOTS: usize = 5;
@@ -49,6 +50,7 @@ const MAX_TERMS: usize = BUCKETS * BUCKET_SLOTS;
 const AHEAD: usize = 12; // tokens between a bucket's prefetch and its lookup
 const HEAVY: u32 = 1 << 31; // an action: 0 for no term, a bitmap index here, or a term id + 1
 const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look further
+const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its check here
 const HEAVY_SHARE: usize = 32; // a term in 1/32 of documents is cheaper as a bitmap
 const MAX_HEAVY: usize = 4096;
 const SHARDS: usize = 64;
@@ -56,17 +58,6 @@ const SHARD_BITS: u32 = 6;
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
-
-/// The 256 bytes that are part of a token.
-static TOKEN_BYTE: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut c = 0;
-    while c < 256 {
-        table[c] = (c as u8).is_ascii_alphanumeric();
-        c += 1;
-    }
-    table
-};
 
 /// One cache line. The last action answers for a hash found in no slot, so that a miss
 /// takes the same path as a hit.
@@ -78,24 +69,35 @@ struct Bucket {
 
 /// A worker's space for a batch of text.
 struct Buffers {
-    starts: Vec<u32>,
-    ends: Vec<u32>,
-    lines: Vec<u32>,
-    hashes: Vec<u64>,
-    heavy_hits: Vec<u32>, // bitmap << DOC_BITS | document
-    list_hits: Vec<u64>,  // action << 32 | document
+    starts: &'static mut [u32],
+    ends: &'static mut [u32],
+    lines: &'static mut [u32],
+    hashes: &'static mut [u64],
+    heavy_hits: &'static mut [u32],  // bitmap << DOC_BITS | document
+    list_hits: &'static mut [u64],   // action << 32 | document
+    anchor_hits: &'static mut [u64], // term + 1 << 40 | document << 20 | token
 }
 
 #[derive(Clone, Copy)]
 struct Term {
-    text: u32, // offset into the query text
-    len: u32,
-    first: u32, // the term's last list part, or its bitmap index
-    count: u32, // documents containing the term
+    first: u32,   // the term's last list part, or its bitmap index
+    count: u32,   // documents containing the term
+    phrases: u32, // the first phrase anchored here, + 1
     heavy: bool,
+    in_bool: bool,
 }
 
-/// Queries, flattened: each is a run of (op, term) with the first op unused.
+/// A phrase, its words in `words` and `word_terms`, and the pseudo-term holding its matches.
+struct Phrase {
+    term: u32,
+    first: u32,
+    len: u32,
+    pivot: u32, // which word is the anchor, chosen from the sample
+    next: u32,  // the next phrase with the same anchor, + 1
+}
+
+/// Queries, flattened: each is a run of (op, term) with the first op unused. A phrase is one
+/// step, on its pseudo-term.
 #[derive(Clone, Copy, PartialEq)]
 enum Op {
     And,
@@ -104,7 +106,6 @@ enum Op {
 }
 
 struct Query {
-    phrase: bool,
     first: u32,
     len: u32,
 }
@@ -126,20 +127,21 @@ struct Run {
     text: *const u8,
     len: usize,
     docs: usize,
-    words: usize, // of a bitmap
-    query_text: Vec<u8>,
+    words_per_bitmap: usize,
     buckets: *mut Bucket,
     terms: *mut Term,
     term_count: usize,
     queries: Vec<Query>,
     steps: Vec<(Op, u32)>,
+    phrases: *mut Phrase,
+    phrase_count: usize,
+    words: Vec<u64>,
+    word_terms: Vec<u32>,
     samples: Mutex<(Vec<u32>, usize)>,
     next_claim: AtomicUsize,
     next_job: AtomicUsize,
     step: Barrier,
-    doc_starts: *mut u32,
     bitmaps: *mut u64,
-    heavy_count: AtomicUsize,
     rows: *mut u32,
     stride: usize,
     claimed: Vec<AtomicUsize>,
@@ -163,6 +165,12 @@ unsafe fn reserve(bytes: usize, advice: i32) -> *mut u8 {
     let aligned = region.add(region.align_offset(HUGE_PAGE));
     madvise(aligned, bytes, advice);
     aligned
+}
+
+/// Lazily backed space on small pages, so that large bounds cost only what is touched.
+unsafe fn space<T>(count: usize) -> &'static mut [T] {
+    let region = reserve(count * size_of::<T>(), MADV_NOHUGEPAGE);
+    std::slice::from_raw_parts_mut(region.cast(), count)
 }
 
 unsafe fn map_file(file: &File, len: usize) -> *const u8 {
@@ -327,7 +335,6 @@ impl Run {
         let text = self.text;
         let page = start / 4096 * 4096;
         madvise(text.add(page) as *mut u8, end - page, MADV_POPULATE_READ);
-        *self.doc_starts.add(doc) = start as u32;
 
         let empty = std::ptr::null_mut();
         let mut cursors = [(empty, empty); SHARDS];
@@ -338,6 +345,7 @@ impl Run {
             hashes,
             heavy_hits,
             list_hits,
+            anchor_hits,
         } = buffers;
         let (mut token_count, mut end_count, mut line_count) = (0, 0, 0);
         let mut carry = 0u32; // whether the previous 32 bytes ended inside a token
@@ -408,8 +416,11 @@ impl Run {
                 at += 32;
             }
 
-            // Tokens that opened but have not closed wait for the next batch.
-            let ready = end_count;
+            // Only whole documents go on, so that a phrase has all its tokens at hand.
+            let mut ready = if line_count > 0 { end_count } else { 0 };
+            while ready > 0 && *starts.get_unchecked(ready - 1) > lines[line_count - 1] {
+                ready -= 1;
+            }
             let (mut token, mut line) = (0, 0);
             let mut next_line = if line_count > 0 {
                 lines[0] as usize + 1
@@ -419,6 +430,7 @@ impl Run {
             if first_token && ready > 0 {
                 first_token = false;
                 token = 1; // the id of the claim's first document
+                hashes[0] = 0;
             }
             for i in token..ready {
                 let (from, to) = (
@@ -427,37 +439,61 @@ impl Run {
                 );
                 *hashes.get_unchecked_mut(i) = hash_of(text.add(from), to - from);
             }
-            let (mut heavy_count, mut list_count) = (0, 0);
+            let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
             while token < ready {
                 if *starts.get_unchecked(token) as usize >= next_line {
                     doc += 1;
-                    *self.doc_starts.add(doc) = next_line as u32;
                     line += 1;
                     next_line = if line < line_count {
                         lines[line] as usize + 1
                     } else {
                         usize::MAX
                     };
-                    token += 1; // a line's first token is its id
+                    // A line's first token is its id. As hash 0 it also stops a phrase check
+                    // from running on into the next document.
+                    *hashes.get_unchecked_mut(token) = 0;
+                    token += 1;
                     continue;
                 }
                 let ahead = bucket_of(*hashes.get_unchecked(token + AHEAD));
                 _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(ahead).cast());
                 let action = self.action_of(*hashes.get_unchecked(token));
-                token += 1;
-                // Both stores happen, and only the right count moves.
+                // All three stores happen, and only the right counts move.
                 *heavy_hits.get_unchecked_mut(heavy_count) = action << DOC_BITS | doc as u32;
                 heavy_count += (action >> 31) as usize;
                 *list_hits.get_unchecked_mut(list_count) = (action as u64) << 32 | doc as u64;
                 list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
+                *anchor_hits.get_unchecked_mut(anchor_count) =
+                    (action as u64) << 40 | (doc as u64) << 20 | token as u64;
+                anchor_count += (action >> 29 & 1) as usize;
+                token += 1;
+            }
+            for &hit in &anchor_hits[..anchor_count] {
+                let token = hit as usize & ((1 << 20) - 1);
+                let mut next = (*self.terms.add((hit >> 40) as usize - 1)).phrases;
+                while next != 0 {
+                    let phrase = &*self.phrases.add(next as usize - 1);
+                    next = phrase.next;
+                    let (first, len) = (phrase.first as usize, phrase.len as usize);
+                    let pivot = phrase.pivot as usize;
+                    if token >= pivot
+                        && token - pivot + len <= ready
+                        && hashes[token - pivot..token - pivot + len]
+                            == self.words[first..first + len]
+                    {
+                        list_hits[list_count] =
+                            (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
+                        list_count += 1;
+                    }
+                }
             }
             for &hit in &heavy_hits[..heavy_count] {
                 let doc = hit as usize & ((1 << DOC_BITS) - 1);
-                let bitmap = (hit >> DOC_BITS) as usize * self.words;
+                let bitmap = (hit >> DOC_BITS) as usize * self.words_per_bitmap;
                 *self.bitmaps.add(bitmap + doc / 64) |= 1 << (doc % 64);
             }
             for &hit in &list_hits[..list_count] {
-                let term = (hit >> 32) as u32 - 1;
+                let term = ((hit >> 32) as u32 & !ANCHOR) - 1;
                 if SAMPLE {
                     counts[term as usize] += 1;
                     continue;
@@ -475,7 +511,8 @@ impl Run {
             line_count -= line;
             starts.copy_within(ready..token_count, 0);
             token_count -= ready;
-            end_count = 0;
+            ends.copy_within(ready..end_count, 0);
+            end_count -= ready;
         }
         // The sample's rows do not exist, so its claims are read again by the main pass.
         doc - first_doc + 1
@@ -491,17 +528,23 @@ impl Run {
         }
     }
 
-    fn next_step(&self) {
-        if self.step.wait().is_leader() {
-            self.next_job.store(0, Relaxed);
-        }
-        self.step.wait();
-    }
-
-    /// Terms that the sample saw often enough get bitmaps from here on.
-    unsafe fn choose_heavy(&self) {
+    /// Uses the sample to give each phrase its rarest word as an anchor, and common terms a
+    /// bitmap. A term that only phrases use needs no list unless it anchors one.
+    unsafe fn plan_terms(&self) {
         let samples = self.samples.lock().unwrap();
         let (counts, docs) = (&samples.0, samples.1);
+        for index in 0..self.phrase_count {
+            let phrase = &mut *self.phrases.add(index);
+            let first = phrase.first as usize;
+            let terms = &self.word_terms[first..first + phrase.len as usize];
+            let pivot = (0..terms.len())
+                .min_by_key(|&i| counts[terms[i] as usize])
+                .unwrap();
+            let anchor = &mut *self.terms.add(terms[pivot] as usize);
+            phrase.pivot = pivot as u32;
+            phrase.next = anchor.phrases;
+            anchor.phrases = index as u32 + 1;
+        }
         let mut heavy = 0;
         for index in 0..BUCKETS {
             let bucket = &mut *self.buckets.add(index);
@@ -511,7 +554,11 @@ impl Run {
                 }
                 let id = *action as usize - 1;
                 let term = &mut *self.terms.add(id);
-                if counts[id] as usize * HEAVY_SHARE >= docs && heavy < MAX_HEAVY {
+                if term.phrases != 0 {
+                    *action |= ANCHOR;
+                } else if !term.in_bool {
+                    *action = 0;
+                } else if counts[id] as usize * HEAVY_SHARE >= docs && heavy < MAX_HEAVY {
                     *action = HEAVY | heavy as u32;
                     *term = Term {
                         heavy: true,
@@ -522,7 +569,6 @@ impl Run {
                 }
             }
         }
-        self.heavy_count.store(heavy, Relaxed);
     }
 
     /// Sorts a shard's rows into one list per term. Chunks are taken in claim order, and each
@@ -577,14 +623,15 @@ impl Run {
         for term in 0..self.term_count {
             let info = &mut *self.terms.add(term);
             if info.heavy {
-                let bits = std::slice::from_raw_parts(self.bitmap(info.first), self.words);
+                let bits =
+                    std::slice::from_raw_parts(self.bitmap(info.first), self.words_per_bitmap);
                 info.count = bits.iter().map(|w| w.count_ones()).sum();
             }
         }
     }
 
     unsafe fn bitmap(&self, index: u32) -> *mut u64 {
-        self.bitmaps.add(index as usize * self.words)
+        self.bitmaps.add(index as usize * self.words_per_bitmap)
     }
 
     /// A term's documents. A list is rebuilt in `space` from its parts, last part first.
@@ -592,7 +639,7 @@ impl Run {
         let info = *self.terms.add(term as usize);
         if info.heavy {
             let bits = self.bitmap(info.first);
-            return Set::Bits(std::slice::from_raw_parts(bits, self.words));
+            return Set::Bits(std::slice::from_raw_parts(bits, self.words_per_bitmap));
         }
         let mut end = info.count as usize;
         space.clear();
@@ -612,189 +659,46 @@ impl Run {
         Set::List(std::slice::from_raw_parts(out, info.count as usize))
     }
 
-    fn term_text(&self, term: u32) -> &[u8] {
-        let info = unsafe { *self.terms.add(term as usize) };
-        &self.query_text[info.text as usize..(info.text + info.len) as usize]
-    }
-
     unsafe fn answer_bool(
         &self,
         steps: &[(Op, u32)],
         scratch: &mut Scratch,
-        spaces: &mut [Vec<u32>],
+        spaces: &mut [Vec<u32>; 2],
     ) -> Set {
-        let (head, rest) = spaces.split_at_mut(1);
-        let mut current = self.set_of(steps[0].1, &mut head[0]);
+        let [head, rest] = spaces;
+        let mut current = self.set_of(steps[0].1, head);
         for &(op, term) in &steps[1..] {
-            current = apply(op, current, self.set_of(term, &mut rest[0]), scratch);
+            current = apply(op, current, self.set_of(term, rest), scratch);
         }
         current
-    }
-
-    /// Whether the document holds the phrase, found from one occurrence of its term `pivot`.
-    unsafe fn holds_phrase(&self, doc: usize, phrase: &[(Op, u32)], pivot: usize) -> bool {
-        let line = *self.doc_starts.add(doc) as usize;
-        let next = if doc + 1 < self.docs {
-            *self.doc_starts.add(doc + 1) as usize
-        } else {
-            self.len
-        };
-        let text = std::slice::from_raw_parts(self.text.add(line), next - 1 - line);
-        let body = text.iter().position(|&c| c == b'\t').unwrap() + 1;
-        let word = self.term_text(phrase[pivot].1);
-        let size = word.len();
-        // Search for the first and last bytes together, 32 positions at a time.
-        let first = _mm256_set1_epi8(word[0] as i8);
-        let last = _mm256_set1_epi8(word[size - 1] as i8);
-        let fold = _mm256_set1_epi8(0x20);
-        let mut at = body;
-        while at + size <= text.len() {
-            let a = _mm256_or_si256(_mm256_loadu_si256(text.as_ptr().add(at).cast()), fold);
-            let b = _mm256_or_si256(
-                _mm256_loadu_si256(text.as_ptr().add(at + size - 1).cast()),
-                fold,
-            );
-            let hits = _mm256_and_si256(_mm256_cmpeq_epi8(a, first), _mm256_cmpeq_epi8(b, last));
-            let mut mask = _mm256_movemask_epi8(hits) as u32;
-            while mask != 0 {
-                let from = at + mask.trailing_zeros() as usize;
-                mask &= mask - 1;
-                if from + size <= text.len()
-                    && (from == body || !TOKEN_BYTE[text[from - 1] as usize])
-                    && matches_word(text, from, word)
-                    && self.neighbours_match(text, body, from, phrase, pivot)
-                {
-                    return true;
-                }
-            }
-            at += 32;
-        }
-        false
-    }
-
-    /// Steps out from a matched term, token by token, in both directions.
-    fn neighbours_match(
-        &self,
-        text: &[u8],
-        body: usize,
-        from: usize,
-        phrase: &[(Op, u32)],
-        pivot: usize,
-    ) -> bool {
-        let mut at = from + self.term_text(phrase[pivot].1).len();
-        for &(_, term) in &phrase[pivot + 1..] {
-            while at < text.len() && !TOKEN_BYTE[text[at] as usize] {
-                at += 1;
-            }
-            let word = self.term_text(term);
-            if at >= text.len() || !matches_word(text, at, word) {
-                return false;
-            }
-            at += word.len();
-        }
-        let mut at = from;
-        for &(_, term) in phrase[..pivot].iter().rev() {
-            while at > body && !TOKEN_BYTE[text[at - 1] as usize] {
-                at -= 1;
-            }
-            let word = self.term_text(term);
-            if at < body + word.len() {
-                return false;
-            }
-            let start = at - word.len();
-            if !matches_word(text, start, word)
-                || (start > body && TOKEN_BYTE[text[start - 1] as usize])
-            {
-                return false;
-            }
-            at = start;
-        }
-        true
-    }
-
-    /// Matching documents for a phrase, in `found`.
-    unsafe fn answer_phrase(
-        &self,
-        phrase: &[(Op, u32)],
-        spaces: &mut [Vec<u32>],
-        found: &mut Vec<u32>,
-    ) {
-        found.clear();
-        let count = |step: &(Op, u32)| (*self.terms.add(step.1 as usize)).count;
-        if phrase.iter().any(|step| count(step) == 0) {
-            return;
-        }
-        let pivot = (0..phrase.len())
-            .min_by_key(|&i| count(&phrase[i]))
-            .unwrap();
-        let others: Vec<Set> = phrase
-            .iter()
-            .zip(spaces)
-            .map(|(step, space)| self.set_of(step.1, space))
-            .collect();
-        let mut positions = vec![0usize; phrase.len()];
-        let mut check = |doc: u32| {
-            for (i, set) in others.iter().enumerate() {
-                let present = match *set {
-                    Set::Bits(bits) => bits[doc as usize / 64] >> (doc % 64) & 1 == 1,
-                    Set::List(list) => {
-                        positions[i] = gallop(list, positions[i], doc);
-                        list.get(positions[i]) == Some(&doc)
-                    }
-                };
-                if !present {
-                    return;
-                }
-            }
-            if self.holds_phrase(doc as usize, phrase, pivot) {
-                found.push(doc);
-            }
-        };
-        match others[pivot] {
-            Set::List(list) => list.iter().for_each(|&doc| check(doc)),
-            Set::Bits(bits) => {
-                for (index, &word) in bits.iter().enumerate() {
-                    let mut word = word;
-                    while word != 0 {
-                        check((index * 64) as u32 + word.trailing_zeros());
-                        word &= word - 1;
-                    }
-                }
-            }
-        }
     }
 
     unsafe fn answer_batch(
         &self,
         batch: usize,
         scratch: &mut Scratch,
-        spaces: &mut [Vec<u32>],
-        found: &mut Vec<u32>,
+        spaces: &mut [Vec<u32>; 2],
         out: &mut Vec<u8>,
     ) {
         let first = batch * QUERY_BATCH;
         for query in &self.queries[first..(first + QUERY_BATCH).min(self.queries.len())] {
             let steps = &self.steps[query.first as usize..(query.first + query.len) as usize];
-            if query.phrase {
-                self.answer_phrase(steps, spaces, found);
-                write_list(out, found);
-            } else {
-                match self.answer_bool(steps, scratch, spaces) {
-                    Set::List(list) => write_list(out, list),
-                    Set::Bits(bits) => write_bits(out, bits),
-                }
+            match self.answer_bool(steps, scratch, spaces) {
+                Set::List(list) => write_list(out, list),
+                Set::Bits(bits) => write_bits(out, bits),
             }
         }
     }
 
     unsafe fn work(&self) {
         let mut buffers = Buffers {
-            starts: vec![0; MAX_TOKENS + 32],
-            ends: vec![0; MAX_TOKENS + 32],
-            lines: vec![0; BATCH / 2 + 64],
-            hashes: vec![0; MAX_TOKENS + 32 + AHEAD],
-            heavy_hits: vec![0; MAX_TOKENS + 32],
-            list_hits: vec![0; MAX_TOKENS + 32],
+            starts: space(MAX_TOKENS + 32),
+            ends: space(MAX_TOKENS + 32),
+            lines: space(BATCH / 2 + 64),
+            hashes: space(MAX_TOKENS + 32 + AHEAD),
+            heavy_hits: space(MAX_TOKENS + 32),
+            list_hits: space(MAX_TOKENS + 32),
+            anchor_hits: space(MAX_TOKENS + 32),
         };
         let mut counts = vec![0u32; self.term_count];
         let claim = self.next_claim.fetch_add(1, Relaxed);
@@ -810,7 +714,7 @@ impl Run {
         }
         drop(counts);
         if self.step.wait().is_leader() {
-            self.choose_heavy();
+            self.plan_terms();
             self.next_claim.store(0, Relaxed);
         }
         self.step.wait();
@@ -841,7 +745,6 @@ impl Run {
             }
             self.step.wait();
         }
-        drop(buffers);
         if self.step.wait().is_leader() {
             self.count_bitmaps();
             self.next_job.store(0, Relaxed);
@@ -852,13 +755,12 @@ impl Run {
         let mut scratch = Scratch {
             lists: [Vec::new(), Vec::new()],
             active: 0,
-            bits: vec![0; self.words],
+            bits: vec![0; self.words_per_bitmap],
         };
-        let mut spaces = vec![Vec::new(); MAX_PHRASE];
-        let mut found = Vec::new();
+        let mut spaces = [Vec::new(), Vec::new()];
         self.each_job(batches, |batch| {
             let mut out = Vec::with_capacity(QUERY_BATCH * 64);
-            self.answer_batch(batch, &mut scratch, &mut spaces, &mut found, &mut out);
+            self.answer_batch(batch, &mut scratch, &mut spaces, &mut out);
             self.parts.lock().unwrap()[batch] = out;
         });
     }
@@ -876,18 +778,6 @@ unsafe fn for_rows(region: *const u32, chunks: &[(u32, u32)], mut visit: impl Fn
             visit((row >> DOC_BITS) as usize - 1, row & ((1 << DOC_BITS) - 1));
         }
     }
-}
-
-/// Whether the text has `word`, a lowercase term, at `from`, ending at a token boundary.
-#[inline]
-fn matches_word(text: &[u8], from: usize, word: &[u8]) -> bool {
-    let end = from + word.len();
-    end <= text.len()
-        && text[from..end]
-            .iter()
-            .zip(word)
-            .all(|(&c, &w)| c.to_ascii_lowercase() == w)
-        && (end == text.len() || !TOKEN_BYTE[text[end] as usize])
 }
 
 /// The start of the first run of `list` at or after `value`, searched from `from` in steps
@@ -1106,8 +996,7 @@ fn write_bits(out: &mut Vec<u8>, bits: &[u64]) {
 }
 
 /// Adds a term to the table, or finds it, and returns its id.
-unsafe fn intern(run: &mut Run, offset: usize, len: usize) -> u32 {
-    let hash = hash_of(run.query_text.as_ptr().add(offset), len);
+unsafe fn intern(run: &mut Run, hash: u64) -> u32 {
     let mut index = bucket_of(hash);
     loop {
         let bucket = &mut *run.buckets.add(index);
@@ -1119,13 +1008,6 @@ unsafe fn intern(run: &mut Run, offset: usize, len: usize) -> u32 {
                 let term = run.term_count as u32;
                 bucket.tags[slot] = hash;
                 bucket.actions[slot] = term + 1;
-                *run.terms.add(run.term_count) = Term {
-                    text: offset as u32,
-                    len: len as u32,
-                    first: 0,
-                    count: 0,
-                    heavy: false,
-                };
                 run.term_count += 1;
                 return term;
             }
@@ -1135,13 +1017,13 @@ unsafe fn intern(run: &mut Run, offset: usize, len: usize) -> u32 {
     }
 }
 
-unsafe fn parse_queries(run: &mut Run) {
-    let bytes = run.query_text.len() - 64;
-    let text = run.query_text.as_ptr();
+unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
+    let text = bytes.as_ptr();
+    let size = bytes.len() - 64;
     let mut at = 0;
-    while at < bytes {
+    while at < size {
         let phrase = *text.add(at) == b'P';
-        let first = run.steps.len() as u32;
+        let (first, first_word) = (run.steps.len() as u32, run.words.len() as u32);
         at += if phrase { 8 } else { 5 }; // past `PHRASE "` or `BOOL `
         let mut op = Op::And;
         loop {
@@ -1150,8 +1032,15 @@ unsafe fn parse_queries(run: &mut Run) {
             while *text.add(at) >= b'0' {
                 at += 1;
             }
-            let term = intern(run, word, at - word);
-            run.steps.push((op, term));
+            let hash = hash_of(text.add(word), at - word);
+            let term = intern(run, hash);
+            if phrase {
+                run.words.push(hash);
+                run.word_terms.push(term);
+            } else {
+                (*run.terms.add(term as usize)).in_bool = true;
+                run.steps.push((op, term));
+            }
             let stop = *text.add(at);
             at += 1;
             if stop != b' ' {
@@ -1166,8 +1055,22 @@ unsafe fn parse_queries(run: &mut Run) {
                 };
             }
         }
+        if phrase {
+            let term = run.term_count as u32;
+            let len = run.words.len() as u32 - first_word;
+            run.term_count += 1;
+            run.steps.push((Op::And, term));
+            *run.phrases.add(run.phrase_count) = Phrase {
+                term,
+                first: first_word,
+                len,
+                pivot: 0,
+                next: 0,
+            };
+            run.phrase_count += 1;
+        }
         let len = run.steps.len() as u32 - first;
-        run.queries.push(Query { phrase, first, len });
+        run.queries.push(Query { first, len });
     }
 }
 
@@ -1195,26 +1098,27 @@ fn main() {
             .fold(0, |v, &d| v * 10 + (d - b'0') as usize);
         let docs = if len == 0 { 0 } else { last_id + 1 };
         assert!(docs < 1 << DOC_BITS);
-        let words = docs.div_ceil(64) + 1;
+        let words_per_bitmap = docs.div_ceil(64) + 1;
         let stride = len + 4096; // rows per shard: more than any shard can hold
         Run {
             text,
             len,
             docs,
-            words,
-            query_text,
+            words_per_bitmap,
             buckets: reserve(BUCKETS * size_of::<Bucket>(), MADV_HUGEPAGE).cast(),
             terms: reserve(MAX_TERMS * size_of::<Term>(), MADV_NOHUGEPAGE).cast(),
             term_count: 0,
             queries: Vec::with_capacity(1 << 16),
             steps: Vec::with_capacity(1 << 18),
+            phrases: reserve(MAX_TERMS * size_of::<Phrase>(), MADV_NOHUGEPAGE).cast(),
+            phrase_count: 0,
+            words: Vec::with_capacity(1 << 18),
+            word_terms: Vec::with_capacity(1 << 18),
             samples: Mutex::new((Vec::new(), 0)),
             next_claim: AtomicUsize::new(0),
             next_job: AtomicUsize::new(0),
             step: Barrier::new(threads),
-            doc_starts: reserve((docs + 1) * 4, MADV_NOHUGEPAGE).cast(),
-            bitmaps: reserve(MAX_HEAVY * words * 8, MADV_HUGEPAGE).cast(),
-            heavy_count: AtomicUsize::new(0),
+            bitmaps: reserve(MAX_HEAVY * words_per_bitmap * 8, MADV_HUGEPAGE).cast(),
             rows: reserve(SHARDS * stride * 4, MADV_NOHUGEPAGE).cast(),
             stride,
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
@@ -1223,7 +1127,8 @@ fn main() {
             parts: Mutex::new(Vec::new()),
         }
     };
-    unsafe { parse_queries(&mut run) };
+    unsafe { parse_queries(&mut run, &query_text) };
+    drop(query_text);
     let batches = run.queries.len().div_ceil(QUERY_BATCH);
     *run.parts.lock().unwrap() = vec![Vec::new(); batches];
     *run.samples.lock().unwrap() = (vec![0; run.term_count], 0);

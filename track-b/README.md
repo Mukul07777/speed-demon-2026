@@ -16,7 +16,7 @@ Rust, standard library only. The queries are readable from the start, so this an
 
 **BOOL.** Evaluated strictly left to right, as the spec requires, on whichever of list or bitmap suits each step: galloping intersection and difference between lists, a bit test between a list and a bitmap, and word-wide operations between bitmaps. The bitmap of a term is used in place until a step has to change it. A result held as a bitmap gets its count and id sum from popcounts, one for each bit of the position.
 
-**PHRASE.** A phrase starts from its rarest term, and the spec guarantees that nearly every phrase has a rare one. Candidates are filtered by the phrase's other terms, then checked against the mapped text: an AVX2 search for the first and last byte of the term finds its occurrences, and the check steps out token by token in both directions. Separators never need handling because stepping skips all of them, which is also what lets a phrase cross a sentence boundary.
+**PHRASE.** Checked during the scan, because that is when a document's tokens and their hashes are already in memory. The sample names each phrase's rarest word as its anchor. When an anchor appears, the neighbouring hashes are compared with the phrase, and a match writes a row for a pseudo-term that stands for the phrase, so a phrase query is a one-term lookup afterwards. Separators need no handling, because only tokens are in the array, which is also what lets a phrase cross a sentence boundary. A batch stops at a document boundary so that a phrase always has its tokens, and each document's id token gets hash 0, so no check can run into the next document. The first version searched each candidate's text after the scan, and 184,000 of 214,000 candidates failed only after reading a whole document.
 
 ## Dependencies
 
@@ -24,4 +24,4 @@ None.
 
 ## With another 24 hours
 
-Keep the offset of each rare term, so a phrase check jumps to its position instead of searching the document. 184,000 of 214,000 candidates fail that check, and each one reads a whole document.
+Tokenising is now the largest part of the scan, so finish token ends and starts in one array. Then look at the 230 ms of CPU the BOOL queries take.
