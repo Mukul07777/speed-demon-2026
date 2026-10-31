@@ -346,6 +346,11 @@ impl Run {
                     line = end.add(1);
                 }
             }
+            // Drop the claim's pages now, while every thread is busy. Left mapped, they are
+            // torn down by one thread at exit, which cost about 7 ms on the scoring kernel.
+            // A later read of this range, by the next claim's first line, refaults the same
+            // bytes, because the mapping is a read-only private file mapping.
+            madvise(input.add(claim) as *mut u8, CLAIM.min(mapped_end - claim), MADV_DONTNEED);
         }
     }
 
