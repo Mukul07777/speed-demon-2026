@@ -40,6 +40,7 @@ const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MADV_HUGEPAGE: i32 = 14;
+const MADV_DONTNEED: i32 = 4;
 const MADV_POPULATE_READ: i32 = 22;
 const PR_SET_THP_DISABLE: i32 = 41;
 
@@ -61,7 +62,7 @@ const SEEN_WORDS: usize = MAX_NAMES / 64; // of one group's row of the name bit 
 const LETTERS: usize = 26 * 26 * 26;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C, align(64))]
 struct Stats {
     count: u64,
@@ -70,22 +71,18 @@ struct Stats {
     amount_min: i64,
     amount_max: i64,
     names_distinct: u64,
-    name_bytes: u64,
-    note_bytes: u64,
+    // Name bytes in the low half and note bytes in the high half: the spec keeps each below
+    // 2^31, so the halves never carry into each other and one add updates both.
+    lengths: u64,
 }
 
 impl Stats {
     fn new() -> Stats {
         let (amount_min, amount_max) = (i64::MAX, i64::MIN);
         Stats {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
             amount_min,
             amount_max,
-            names_distinct: 0,
-            name_bytes: 0,
-            note_bytes: 0,
+            ..Stats::default()
         }
     }
 
@@ -96,8 +93,7 @@ impl Stats {
         self.amount_min = self.amount_min.min(other.amount_min);
         self.amount_max = self.amount_max.max(other.amount_max);
         self.names_distinct += other.names_distinct;
-        self.name_bytes += other.name_bytes;
-        self.note_bytes += other.note_bytes;
+        self.lengths += other.lengths;
     }
 }
 
@@ -108,8 +104,7 @@ struct Pending {
     id: u64,
     amount: i64,
     region: u32,
-    name_bytes: u32,
-    note_bytes: u32,
+    lengths: u64, // as in `Stats`
 }
 
 /// One cache line: name hashes and their numbers + 1. Numbers are dense, which keeps the bit
@@ -199,31 +194,28 @@ fn fold_multiply(a: u64, b: u64) -> u64 {
 /// so they cost one predicted branch here.
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    #[repr(align(32))]
-    struct Masks([u8; 64]);
-    static MASKS: Masks = {
+    // 32 bytes of ones then 32 of zeros: loading at 32 - len keeps the first `len` bytes.
+    static MASKS: [u8; 64] = {
         let mut bytes = [0u8; 64];
         let mut i = 0;
         while i < 32 {
             bytes[i] = 0xFF;
             i += 1;
         }
-        Masks(bytes)
+        bytes
     };
     if len >= 32 {
         return long_name_hash(name, len);
     }
-    let bytes = _mm256_and_si256(load(name), load(MASKS.0.as_ptr().add(32 - len)));
-    let lane0 = _mm256_extract_epi64(bytes, 0) as u64;
-    let lane1 = _mm256_extract_epi64(bytes, 1) as u64;
-    let lane2 = _mm256_extract_epi64(bytes, 2) as u64;
-    let lane3 = _mm256_extract_epi64(bytes, 3) as u64;
-    let low = fold_multiply(lane0 ^ 0xA076_1D64_78BD_642F, lane1 ^ 0xE703_7ED1_A0B4_28DB);
-    let high = fold_multiply(
-        lane2 ^ 0x8EBC_6AF0_9C88_C6E3,
-        lane3 ^ len as u64 ^ 0x5899_65CC_7537_4CC3,
+    let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().add(32 - len)));
+    let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
+    let mixed = _mm_aesenc_si128(
+        _mm_xor_si128(_mm256_castsi256_si128(bytes), key),
+        _mm256_extracti128_si256::<1>(bytes),
     );
-    fold_multiply(low ^ 0x1D8E_4E27_C47D_124F, high ^ 0xEB44_ACCA_B455_D165) | 1
+    let mixed = _mm_aesenc_si128(mixed, _mm_set1_epi64x(0xA076_1D64_78BD_642F_u64 as i64));
+    let mixed = _mm_aesenc_si128(mixed, _mm_set1_epi64x(0xEB44_ACCA_B455_D165_u64 as i64));
+    _mm_cvtsi128_si64(mixed) as u64 | 1
 }
 
 #[cold]
@@ -291,10 +283,8 @@ impl Run {
                 return self.records_len;
             };
             at += found + 1;
-            if at >= self.records_len || claim == 0 || (*input.add(at)).is_ascii_digit() {
-                return at;
-            }
-            if *input.add(at) == 0xEF {
+            if at >= self.records_len || claim == 0 || matches!(*input.add(at), b'0'..=b'9' | 0xEF)
+            {
                 return at;
             }
         }
@@ -412,8 +402,8 @@ impl Run {
                         id,
                         amount,
                         region: region as u32,
-                        name_bytes: value_len(raw_name, name_quotes) as u32,
-                        note_bytes: value_len(comma3 - comma2 - 1, note_quotes) as u32,
+                        lengths: value_len(raw_name, name_quotes) as u64
+                            | (value_len(comma3 - comma2 - 1, note_quotes) as u64) << 32,
                     });
                 }
                 // The region table and the name table were each a cache miss on every record,
@@ -428,8 +418,7 @@ impl Run {
                     s.amount_sum += name.amount;
                     s.amount_min = s.amount_min.min(name.amount);
                     s.amount_max = s.amount_max.max(name.amount);
-                    s.name_bytes += name.name_bytes as u64;
-                    s.note_bytes += name.note_bytes as u64;
+                    s.lengths += name.lengths;
                     let id = self.intern(name) as usize;
                     let word = group * SEEN_WORDS + id / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.seen.add(word).cast());
@@ -444,6 +433,14 @@ impl Run {
                 positions.copy_within(read_positions..filled, 0);
                 filled = left;
             }
+            // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
+            // ~50,000 page-table entries on one thread at exit, which the timer includes. A
+            // record running into the next claim just faults its few pages back in.
+            madvise(
+                input.add(claim) as *mut u8,
+                CLAIM.min(mapped_end - claim),
+                MADV_DONTNEED,
+            );
         }
         let mut totals = self.totals.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -596,26 +593,24 @@ fn main() {
     });
 
     let mut totals = run.totals.lock().unwrap();
-    for (group, total) in totals.iter_mut().enumerate() {
+    let codes = run.countries.lock().unwrap();
+    let mut order: Vec<usize> = (1..=codes.len()).collect();
+    order.sort_unstable_by_key(|&group| codes[group - 1]);
+    // `_UNMATCHED` sorts after every country code.
+    order.push(0);
+    let mut out = String::new();
+    for group in order {
+        let s = &mut totals[group];
         let row =
             unsafe { std::slice::from_raw_parts(run.seen.add(group * SEEN_WORDS), SEEN_WORDS) };
-        total.names_distinct = row
+        s.names_distinct = row
             .iter()
-            .map(|word| word.load(Relaxed).count_ones() as u64)
+            .map(|w| w.load(Relaxed).count_ones() as u64)
             .sum();
-    }
-    let totals = totals;
-    let mut lines: Vec<(String, &Stats)> = Vec::new();
-    for (group, code) in run.countries.lock().unwrap().iter().enumerate() {
-        lines.push((
-            String::from_utf8_lossy(code).into_owned(),
-            &totals[group + 1],
-        ));
-    }
-    lines.push(("_UNMATCHED".to_string(), &totals[0]));
-    lines.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let mut out = String::new();
-    for (key, s) in lines {
+        let key = match group {
+            0 => "_UNMATCHED",
+            _ => std::str::from_utf8(&codes[group - 1]).unwrap(),
+        };
         if s.count > 0 {
             out += &format!(
                 "{key} {} {} {} {} {} {} {} {}\n",
@@ -625,8 +620,8 @@ fn main() {
                 money(s.amount_min),
                 money(s.amount_max),
                 s.names_distinct,
-                s.name_bytes,
-                s.note_bytes
+                s.lengths & 0xFFFF_FFFF,
+                s.lengths >> 32
             );
         }
     }
