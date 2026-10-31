@@ -12,7 +12,6 @@
 //!
 //! An edge is 4 bytes: 21 bits of head and 11 of weight. Only about 3,500 of the 5,000,000
 //! weights need more, so those edges live in a side list and their tails carry a flag.
-include!("probe.rs");
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -795,7 +794,6 @@ fn read_queries() -> Vec<(u32, u32)> {
 }
 
 fn main() {
-    probe::begin();
     let file = File::open("/data/graph.txt").unwrap();
     let text_len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -846,24 +844,4 @@ fn main() {
         }
     }
     File::create("/out/distances.txt").unwrap().write_all(out.as_bytes()).unwrap();
-    let facts = [
-        ("k", "/proc/sys/kernel/osrelease"),
-        ("thp", "/sys/kernel/mm/transparent_hugepage/enabled"),
-        ("dfg", "/sys/kernel/mm/transparent_hugepage/defrag"),
-        ("shm", "/sys/kernel/mm/transparent_hugepage/shmem_enabled"),
-        ("idle", "/sys/devices/system/cpu/cpuidle/current_driver"),
-        ("gov", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-        ("khz", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"),
-        ("spec", "/sys/devices/system/cpu/vulnerabilities/spectre_v2"),
-    ];
-    let mut extra = String::new();
-    for (key, path) in facts {
-        extra += &format!(" {key}={}", probe::fact(path));
-    }
-    let mount = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    for line in mount.lines().filter(|l| l.contains(" /data ") || l.contains(" /out ")) {
-        let tail = line.split(" - ").nth(1).unwrap_or("?");
-        extra += &format!(" fs={}", tail.split(' ').next().unwrap_or("?"));
-    }
-    probe::report(&extra);
 }

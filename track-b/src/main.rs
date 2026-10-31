@@ -14,7 +14,6 @@
 //!    with the phrase. A match writes a row for a pseudo-term that stands for the phrase, so
 //!    a phrase query is then a one-term lookup, and no document is ever read twice.
 //! 4. Evaluate BOOL strictly left to right on whichever of list or bitmap suits each step.
-include!("probe.rs");
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -701,7 +700,6 @@ impl Run {
             list_hits: space(MAX_TOKENS + 32),
             anchor_hits: space(MAX_TOKENS + 32),
         };
-        probe::stamp(1);
         let mut counts = vec![0u32; self.term_count];
         let claim = self.next_claim.fetch_add(1, Relaxed);
         let docs = self.index_claim::<true>(claim, &mut counts, &mut buffers);
@@ -720,9 +718,7 @@ impl Run {
             self.next_claim.store(0, Relaxed);
         }
         self.step.wait();
-        probe::stamp(2);
         for phase in 0..self.len.div_ceil(PHASE_CLAIMS * CLAIM) {
-            let phase_start = probe::now();
             let limit = (phase + 1) * PHASE_CLAIMS;
             loop {
                 let claim = self.next_claim.fetch_add(1, Relaxed);
@@ -731,10 +727,7 @@ impl Run {
                 }
                 self.index_claim::<false>(claim, &mut [], &mut buffers);
             }
-            let scan_end = probe::now();
-            let leader = self.step.wait().is_leader();
-            if leader {
-                probe::add(3, scan_end.max(phase_start) - phase_start);
+            if self.step.wait().is_leader() {
                 self.next_job.store(0, Relaxed);
                 self.next_claim.store(limit, Relaxed);
             }
@@ -745,12 +738,8 @@ impl Run {
             };
             let base = first_doc(phase * PHASE_CLAIMS);
             assert!(first_doc(limit) - base < u16::MAX as usize);
-            let build_start = probe::now();
             self.each_job(SHARDS, |shard| self.build_shard(shard, base as u32));
-            let build_end = probe::now();
-            let leader = self.step.wait().is_leader();
-            if leader {
-                probe::add(4, build_end - build_start);
+            if self.step.wait().is_leader() {
                 self.next_job.store(0, Relaxed);
                 self.claimed.iter().for_each(|rows| rows.store(0, Relaxed));
             }
@@ -762,7 +751,6 @@ impl Run {
         }
         self.step.wait();
 
-        probe::stamp(5);
         let batches = self.queries.len().div_ceil(QUERY_BATCH);
         let mut scratch = Scratch {
             lists: [Vec::new(), Vec::new()],
@@ -775,7 +763,6 @@ impl Run {
             self.answer_batch(batch, &mut scratch, &mut spaces, &mut out);
             self.parts.lock().unwrap()[batch] = out;
         });
-        probe::stamp(6);
     }
 }
 
@@ -1088,7 +1075,6 @@ unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
 }
 
 fn main() {
-    probe::begin();
     let file = File::open("/data/docs.txt").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let mut query_text = std::fs::read("/data/queries.txt").unwrap();
@@ -1142,7 +1128,6 @@ fn main() {
         }
     };
     unsafe { parse_queries(&mut run, &query_text) };
-    probe::stamp(0);
     drop(query_text);
     let batches = run.queries.len().div_ceil(QUERY_BATCH);
     *run.parts.lock().unwrap() = vec![Vec::new(); batches];
@@ -1160,5 +1145,4 @@ fn main() {
     for part in run.parts.lock().unwrap().iter() {
         out.write_all(part).unwrap();
     }
-    probe::report("");
 }
