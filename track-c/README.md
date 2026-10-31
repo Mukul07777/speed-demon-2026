@@ -14,7 +14,7 @@ Rust, standard library only. The design comes from measuring the data first: see
 
 **Distinct names.** Names are compared by their raw bytes, because every non-empty name is quoted, so equal raw bytes mean equal values. Names are drawn uniformly from 100,000 values, so every lookup misses the cache. A name is reduced to a 64-bit hash and looked up in a table of 64-byte buckets, prefetched a batch ahead, so a lookup is one cache line and one AVX2 compare, with no probing. Comparing hashes instead of names is the one deliberate shortcut in this program: two of the 100,000 names sharing a hash has odds of about 3 in 10 billion, far below the chance of a hardware fault, and the saving is a memory access per record. Names are added with a compare-and-swap on each slot, so no lock is needed.
 
-Each record appends its name's number to its country's rows. Afterwards a worker takes one country at a time and counts its distinct names with a private bitset.
+Each record sets its name's bit in its country's row of one shared bit matrix, and popcounts of the rows give the distinct names. Names get dense numbers, kept in the bucket next to their hashes, so the matrix is 4 MiB and sits on huge pages. A locked update of a cold line stalls the core, so a batch prefetches its lines for write first and updates them in a second pass.
 
 ## Dependencies
 
@@ -22,4 +22,4 @@ None.
 
 ## With another 24 hours
 
-Shrink the rows to three bytes, and take them from one shared arena that can use huge pages, so fewer page faults reach the kernel.
+Cut the field pass, which is now most of the run, and check whether the region table can share a huge page.

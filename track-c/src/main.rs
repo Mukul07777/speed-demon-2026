@@ -17,14 +17,14 @@
 //!    Two different names sharing a hash would need odds of about 3 in 10 billion, well below
 //!    the chance of a hardware fault, and the saving is a second memory access per record.
 //!
-//! Each record then appends its name's number to its country's rows. Afterwards a worker
-//! takes one country at a time and counts distinct names with a private bitset.
+//! Each record then sets its name's bit in its country's row of one shared bit matrix, and
+//! popcounts of the rows give the distinct names.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::ptr::read_unaligned;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex};
 use std::thread;
 
@@ -39,9 +39,11 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
+const MADV_HUGEPAGE: i32 = 14;
 const MADV_POPULATE_READ: i32 = 22;
 const PR_SET_THP_DISABLE: i32 = 41;
 
+const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 20;
 const REGION_CLAIM: usize = 1 << 16;
 const BATCH_WORDS: usize = 256; // 64-byte steps of the file between record passes
@@ -51,11 +53,11 @@ const MAX_POSITIONS: usize = BATCH_WORDS * 64 / MIN_RECORD * FIELDS + 2 * FIELDS
 const MAX_RECORDS: usize = MAX_POSITIONS / FIELDS;
 const QUOTE_WORDS: usize = 1 << 10; // masks kept for the rank query, more than one batch
 const BUCKETS: usize = 1 << 15;
-const BUCKET_SLOTS: usize = 8;
-const CHUNK: usize = 64; // rows of a group's region a worker claims at a time
-const MAX_NAMES: usize = BUCKETS * BUCKET_SLOTS;
+const BUCKET_SLOTS: usize = 5;
+const MAX_NAMES: usize = 1 << 17; // the generator draws from 100,000
 const REGION_IDS: usize = 1_000_000; // lookup ids stay below this; anything above is unmatched
 const GROUPS: usize = 256; // 240 countries, with index 0 for unmatched
+const SEEN_WORDS: usize = MAX_NAMES / 64; // of one group's row of the name bit matrix
 const LETTERS: usize = 26 * 26 * 26;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
@@ -106,9 +108,13 @@ struct Pending {
     group: u32,
 }
 
-/// Eight name hashes. A name's number is its position in the table.
-#[repr(align(64))]
-struct Bucket([AtomicU64; BUCKET_SLOTS]);
+/// One cache line: name hashes and their numbers + 1. Numbers are dense, which keeps the bit
+/// matrix small.
+#[repr(C, align(64))]
+struct Bucket {
+    tags: [AtomicU64; BUCKET_SLOTS],
+    numbers: [AtomicU32; BUCKET_SLOTS],
+}
 
 struct Run {
     records: *const u8,
@@ -117,16 +123,13 @@ struct Run {
     regions_len: usize,
     next_region_claim: AtomicUsize,
     next_claim: AtomicUsize,
-    region_table: *mut u8, // region id to group
-    letters: Vec<AtomicU8>, // country code to group
+    region_table: *mut u8,          // region id to group
+    letters: Vec<AtomicU8>,         // country code to group
     countries: Mutex<Vec<[u8; 3]>>, // group - 1 to country code
     regions_done: Barrier,
     buckets: *mut Bucket,
-    rows: *mut u32, // name + 1, in one reserved span per group; 0 ends a chunk
-    stride: usize,
-    claimed: Vec<AtomicUsize>, // rows of each group's span given out in chunks
-    records_done: Barrier,
-    next_group: AtomicUsize,
+    next_name: AtomicUsize,
+    seen: *const AtomicU64, // SEEN_WORDS per group
     totals: Mutex<Vec<Stats>>,
 }
 unsafe impl Sync for Run {}
@@ -162,7 +165,7 @@ unsafe fn cents_before(end: *const u8, len: usize) -> i64 {
     let drop = 64 - 8 * len;
     let bytes = (read(end.sub(8)) ^ ZEROS) >> drop << drop;
     let bytes = bytes & !((negative * 0xFF) << drop); // the sign reads as a leading zero
-    // Close the gap the point leaves: its byte is always third from the end.
+                                                      // Close the gap the point leaves: its byte is always third from the end.
     let closed = (bytes & 0xFF_FFFF_FFFF) << 8 | bytes & 0xFFFF_0000_0000_0000;
     (eight_digits(closed) as i64 ^ -(negative as i64)) + negative as i64
 }
@@ -171,7 +174,11 @@ unsafe fn cents_before(end: *const u8, len: usize) -> i64 {
 /// mask of everything inside quotes.
 unsafe fn prefix_xor(bits: u64) -> u64 {
     let ones = _mm_set1_epi8(-1);
-    _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(bits as i64), ones, 0)) as u64
+    _mm_cvtsi128_si64(_mm_clmulepi64_si128(
+        _mm_cvtsi64_si128(bits as i64),
+        ones,
+        0,
+    )) as u64
 }
 
 /// Multiplies to 128 bits and folds, the mixing step of wyhash.
@@ -207,7 +214,10 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     let lane2 = _mm256_extract_epi64(bytes, 2) as u64;
     let lane3 = _mm256_extract_epi64(bytes, 3) as u64;
     let low = fold_multiply(lane0 ^ 0xA076_1D64_78BD_642F, lane1 ^ 0xE703_7ED1_A0B4_28DB);
-    let high = fold_multiply(lane2 ^ 0x8EBC_6AF0_9C88_C6E3, lane3 ^ len as u64 ^ 0x5899_65CC_7537_4CC3);
+    let high = fold_multiply(
+        lane2 ^ 0x8EBC_6AF0_9C88_C6E3,
+        lane3 ^ len as u64 ^ 0x5899_65CC_7537_4CC3,
+    );
     fold_multiply(low ^ 0x1D8E_4E27_C47D_124F, high ^ 0xEB44_ACCA_B455_D165) | 1
 }
 
@@ -247,7 +257,8 @@ impl Run {
             let stop = (claim + REGION_CLAIM + 1).min(len);
             while line < stop {
                 let word = read(input.add(line)) ^ 0x2C2C_2C2C_2C2C_2C2C;
-                let comma = word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
+                let comma =
+                    word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
                 let digits = comma.trailing_zeros() as usize / 8;
                 let comma = input.add(line + digits);
                 let id = number_before(comma, digits) as usize;
@@ -293,15 +304,17 @@ impl Run {
         let mut quotes = [0u64; QUOTE_WORDS];
         let mut quotes_before = [0u32; QUOTE_WORDS];
         let mut pending: Vec<Pending> = Vec::with_capacity(MAX_RECORDS);
-        let empty = std::ptr::null_mut();
-        let mut cursors = vec![(empty, empty); GROUPS];
         loop {
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= len {
                 break;
             }
             let claim_end = claim + CLAIM;
-            madvise(input.add(claim) as *mut u8, CLAIM.min(mapped_end - claim), MADV_POPULATE_READ);
+            madvise(
+                input.add(claim) as *mut u8,
+                CLAIM.min(mapped_end - claim),
+                MADV_POPULATE_READ,
+            );
             let origin = self.first_record(claim);
             let mut record = origin; // the next record to read
             let mut at = origin; // the next byte to scan
@@ -313,7 +326,8 @@ impl Run {
                     }
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
-                    let mask = |byte| equal_mask(low, byte) as u64 | (equal_mask(high, byte) as u64) << 32;
+                    let mask =
+                        |byte| equal_mask(low, byte) as u64 | (equal_mask(high, byte) as u64) << 32;
                     let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
                     let inside_now = prefix_xor(quote) ^ inside;
                     inside = ((inside_now as i64) >> 63) as u64;
@@ -331,7 +345,8 @@ impl Run {
                     }
                     let mut extra = 8;
                     while structural != 0 {
-                        positions[filled + extra] = (at + structural.trailing_zeros() as usize) as u32;
+                        positions[filled + extra] =
+                            (at + structural.trailing_zeros() as usize) as u32;
                         structural &= structural - 1;
                         extra += 1;
                     }
@@ -344,7 +359,9 @@ impl Run {
                     let (word, bit) = ((position - origin) / 64, (position - origin) % 64);
                     let word = word % QUOTE_WORDS;
                     let below = _bzhi_u64(*quotes.get_unchecked(word), bit as u32);
-                    quotes_before.get_unchecked(word).wrapping_add(below.count_ones())
+                    quotes_before
+                        .get_unchecked(word)
+                        .wrapping_add(below.count_ones())
                 };
                 let complete = filled / FIELDS;
                 pending.clear();
@@ -365,7 +382,8 @@ impl Run {
 
                     let bom = (*start == 0xEF) as usize * 3;
                     let id_end = input.add(comma1);
-                    let id = number_before(id_end, comma1 - (start as usize - input as usize) - bom);
+                    let id =
+                        number_before(id_end, comma1 - (start as usize - input as usize) - bom);
                     let region = number_before(input.add(comma4), comma4 - comma3 - 1) as usize;
                     let end = newline - (*input.add(newline - 1) == b'\r') as usize;
                     let amount = cents_before(input.add(end), end - comma4 - 1);
@@ -392,16 +410,21 @@ impl Run {
                     let hash = name_hash(input.add(comma1 + 2), raw_name.saturating_sub(2));
                     let bucket = (hash >> (64 - BUCKETS.trailing_zeros())) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(bucket).cast());
-                    pending.push(Pending { hash, group: group as u32 });
+                    pending.push(Pending {
+                        hash,
+                        group: group as u32,
+                    });
+                }
+                // A locked update of a cold line stalls the core, so fetch the lines first.
+                for name in &mut pending {
+                    let id = self.intern(name) as usize;
+                    let word = name.group as usize * SEEN_WORDS + id / 64;
+                    _mm_prefetch::<_MM_HINT_ET0>(self.seen.add(word).cast());
+                    name.hash = (word << 6 | id % 64) as u64;
                 }
                 for name in &pending {
-                    let id = self.intern(name);
-                    let cursor: &mut (*mut u32, *mut u32) = cursors.get_unchecked_mut(name.group as usize);
-                    if cursor.0 == cursor.1 {
-                        *cursor = self.claim_chunk(name.group as usize);
-                    }
-                    *cursor.0 = id + 1;
-                    cursor.0 = cursor.0.add(1);
+                    (*self.seen.add((name.hash >> 6) as usize))
+                        .fetch_or(1 << (name.hash & 63), Relaxed);
                 }
 
                 let left = filled - read_positions;
@@ -409,12 +432,8 @@ impl Run {
                 filled = left;
             }
         }
-        self.records_done.wait();
-        let mut distinct = [0; GROUPS];
-        self.count_names(&mut distinct);
         let mut totals = self.totals.lock().unwrap();
-        for (group, (total, part)) in totals.iter_mut().zip(&mut stats).enumerate() {
-            part.names_distinct = distinct[group];
+        for (total, part) in totals.iter_mut().zip(&stats) {
             total.merge(part);
         }
     }
@@ -428,59 +447,43 @@ impl Run {
         let low = _mm256_cmpeq_epi64(_mm256_load_si256(slots), wanted);
         let high = _mm256_cmpeq_epi64(_mm256_load_si256(slots.add(1)), wanted);
         let found = _mm256_movemask_pd(_mm256_castsi256_pd(low))
-            | _mm256_movemask_pd(_mm256_castsi256_pd(high)) << 4;
+            | (_mm256_movemask_pd(_mm256_castsi256_pd(high)) & 1) << 4;
         if found != 0 {
-            return (index * BUCKET_SLOTS) as u32 + found.trailing_zeros();
+            let number =
+                (*self.buckets.add(index)).numbers[found.trailing_zeros() as usize].load(Relaxed);
+            if number != 0 {
+                return number - 1;
+            }
         }
         self.insert(index, name.hash)
     }
 
-    /// Finds or adds a hash that is not in its first bucket. Only about 100,000 lookups get
-    /// here. A compare-and-swap decides each slot, so workers can add names at the same time.
+    /// Finds or adds a name that its first bucket does not answer for. Only about 100,000
+    /// lookups add one, and a compare-and-swap decides each slot, so no lock is needed.
     #[cold]
     unsafe fn insert(&self, mut index: usize, hash: u64) -> u32 {
         loop {
-            for (slot, cell) in (*self.buckets.add(index)).0.iter().enumerate() {
-                let found = match cell.compare_exchange(0, hash, Relaxed, Relaxed) {
-                    Ok(_) => true,
-                    Err(other) => other == hash,
-                };
-                if found {
-                    return (index * BUCKET_SLOTS + slot) as u32;
+            let bucket = &*self.buckets.add(index);
+            for (tag, cell) in bucket.tags.iter().zip(&bucket.numbers) {
+                let current = tag.load(Relaxed);
+                let won = current == 0 && tag.compare_exchange(0, hash, Relaxed, Relaxed).is_ok();
+                if won {
+                    let number = self.next_name.fetch_add(1, Relaxed) as u32 + 1;
+                    assert!((number as usize) <= MAX_NAMES);
+                    cell.store(number, Relaxed);
+                    return number - 1;
+                }
+                if tag.load(Relaxed) == hash {
+                    // Another worker may still be writing the number.
+                    loop {
+                        let number = cell.load(Relaxed);
+                        if number != 0 {
+                            return number - 1;
+                        }
+                    }
                 }
             }
             index = (index + 1) % BUCKETS;
-        }
-    }
-
-    #[cold]
-    unsafe fn claim_chunk(&self, group: usize) -> (*mut u32, *mut u32) {
-        let offset = self.claimed[group].fetch_add(CHUNK, Relaxed);
-        let at = self.rows.add(group * self.stride + offset);
-        (at, at.add(CHUNK))
-    }
-
-    /// Takes one group at a time and counts its distinct names. Each worker owns its bitset
-    /// and the rows are only read, so this part shares nothing.
-    unsafe fn count_names(&self, distinct: &mut [u64; GROUPS]) {
-        let mut seen = vec![0u64; MAX_NAMES / 64 + 1];
-        loop {
-            let group = self.next_group.fetch_add(1, Relaxed);
-            if group >= GROUPS {
-                return;
-            }
-            seen.fill(0);
-            let region = self.rows.add(group * self.stride);
-            for chunk in (0..self.claimed[group].load(Relaxed)).step_by(CHUNK) {
-                for i in chunk..chunk + CHUNK {
-                    let row = *region.add(i);
-                    if row == 0 {
-                        break;
-                    }
-                    *seen.get_unchecked_mut(row as usize / 64) |= 1 << (row % 64);
-                }
-            }
-            distinct[group] = seen.iter().map(|word| word.count_ones() as u64).sum();
         }
     }
 
@@ -504,15 +507,43 @@ unsafe fn map_file(file: &File, len: usize) -> *const u8 {
     let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     let base = mmap(std::ptr::null_mut(), span, PROT_READ, flags, -1, 0);
     if len > 0 {
-        mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
+        mmap(
+            base,
+            len,
+            PROT_READ,
+            MAP_PRIVATE | MAP_FIXED,
+            file.as_raw_fd(),
+            0,
+        );
     }
     base
+}
+
+/// A table of whole huge pages, which must start on a huge page boundary to get any. It is
+/// touched at once, because huge pages are about to be disabled for everything else.
+unsafe fn zeroed_huge<T>(count: usize) -> *mut T {
+    let bytes = count * size_of::<T>();
+    let region: *mut u8 = zeroed(bytes + HUGE_PAGE);
+    let aligned = region.add(region.align_offset(HUGE_PAGE));
+    madvise(aligned, bytes, MADV_HUGEPAGE);
+    for page in (0..bytes).step_by(HUGE_PAGE) {
+        *aligned.add(page) = 0;
+    }
+    aligned.cast()
 }
 
 unsafe fn zeroed<T>(count: usize) -> *mut T {
     let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     let bytes = count * size_of::<T>();
-    mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, flags, -1, 0).cast()
+    mmap(
+        std::ptr::null_mut(),
+        bytes,
+        PROT_READ | PROT_WRITE,
+        flags,
+        -1,
+        0,
+    )
+    .cast()
 }
 
 fn main() {
@@ -523,8 +554,9 @@ fn main() {
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
 
     let run = unsafe {
+        let buckets = zeroed_huge(BUCKETS);
+        let seen = zeroed_huge(GROUPS * SEEN_WORDS);
         prctl(PR_SET_THP_DISABLE, 1usize, 0usize, 0usize, 0usize);
-        let stride = records_len / MIN_RECORD + threads * CHUNK + CHUNK;
         Run {
             records: map_file(&records, records_len),
             records_len,
@@ -536,12 +568,9 @@ fn main() {
             letters: (0..LETTERS).map(|_| AtomicU8::new(0)).collect(),
             countries: Mutex::new(Vec::new()),
             regions_done: Barrier::new(threads),
-            buckets: zeroed(BUCKETS),
-            rows: zeroed(stride * GROUPS),
-            stride,
-            claimed: (0..GROUPS).map(|_| AtomicUsize::new(0)).collect(),
-            records_done: Barrier::new(threads),
-            next_group: AtomicUsize::new(0),
+            buckets,
+            next_name: AtomicUsize::new(0),
+            seen,
             totals: Mutex::new(vec![Stats::new(); GROUPS]),
         }
     };
@@ -553,10 +582,22 @@ fn main() {
         run.work();
     });
 
-    let totals = run.totals.lock().unwrap();
+    let mut totals = run.totals.lock().unwrap();
+    for (group, total) in totals.iter_mut().enumerate() {
+        let row =
+            unsafe { std::slice::from_raw_parts(run.seen.add(group * SEEN_WORDS), SEEN_WORDS) };
+        total.names_distinct = row
+            .iter()
+            .map(|word| word.load(Relaxed).count_ones() as u64)
+            .sum();
+    }
+    let totals = totals;
     let mut lines: Vec<(String, &Stats)> = Vec::new();
     for (group, code) in run.countries.lock().unwrap().iter().enumerate() {
-        lines.push((String::from_utf8_lossy(code).into_owned(), &totals[group + 1]));
+        lines.push((
+            String::from_utf8_lossy(code).into_owned(),
+            &totals[group + 1],
+        ));
     }
     lines.push(("_UNMATCHED".to_string(), &totals[0]));
     lines.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -576,5 +617,8 @@ fn main() {
             );
         }
     }
-    File::create("/out/aggregates.txt").unwrap().write_all(out.as_bytes()).unwrap();
+    File::create("/out/aggregates.txt")
+        .unwrap()
+        .write_all(out.as_bytes())
+        .unwrap();
 }
