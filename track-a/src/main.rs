@@ -6,9 +6,10 @@
 //!    faulting pages in one at a time from every thread costs more than parsing them. Then,
 //!    64 KiB at a time, they find every newline first and read each line from both ends
 //!    with no data-dependent branches. Each line becomes a 4-byte row in its hour's region.
-//! 2. Summarise. Workers claim one hour each, group its rows by endpoint with a counting
-//!    sort, select only the three percentiles, and give the memory back. Whoever finds the
-//!    next hour ready writes it, so the output overlaps the work instead of following it.
+//! 2. Summarise. Workers claim one hour each and radix sort its rows by latency, inside the
+//!    hour's own pages. Dealing the sorted rows out by endpoint keeps them in order, so every
+//!    endpoint's latencies come out sorted and a percentile is one array read. Whoever finds
+//!    the next hour ready writes it, so the output overlaps the work instead of following it.
 //!
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
@@ -56,6 +57,8 @@ const HIGHS: u64 = 0x8080_8080_8080_8080;
 /// keeps almost every row at 4 bytes. A row of 0 marks the unused end of a chunk.
 const LATENCY_BITS: u32 = 20;
 const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
+const DIGIT_BITS: u32 = 10;
+const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
 
 #[derive(Clone, Copy)]
 struct Cursor {
@@ -197,9 +200,7 @@ impl Catalogue {
     fn sorted_ids(&self) -> Vec<u16> {
         let count = self.used.lock().unwrap().0;
         let mut ids: Vec<u16> = (0..count as u16).collect();
-        ids.sort_unstable_by(|&a, &b| unsafe {
-            self.name(a as usize).cmp(self.name(b as usize))
-        });
+        ids.sort_unstable_by(|&a, &b| unsafe { self.name(a as usize).cmp(self.name(b as usize)) });
         ids
     }
 }
@@ -236,22 +237,23 @@ unsafe fn find_newlines(input: *const u8, from: usize, to: usize, ends: &mut [u3
     count
 }
 
-/// Calls `visit(group, is_error, latency)` for each row of an hour's region.
-#[inline(always)]
-unsafe fn for_each_row(region: *const u32, claimed: usize, mut visit: impl FnMut(usize, u32, u32)) {
-    for chunk in (0..claimed).step_by(CHUNK) {
-        let rows = region.add(chunk);
-        let mut i = 0;
-        while i < CHUNK && *rows.add(i) != 0 {
-            let row = *rows.add(i);
-            let mut latency = row & ESCAPE;
-            if latency == ESCAPE {
-                i += 1;
-                latency = *rows.add(i);
-            }
-            visit((row >> (LATENCY_BITS + 1)) as usize, row >> LATENCY_BITS & 1, latency);
-            i += 1;
-        }
+/// One stable pass of a radix sort, on the digit above `shift`. `sizes` counts that digit.
+unsafe fn radix_pass(
+    from: *const u32,
+    to: *mut u32,
+    count: usize,
+    shift: u32,
+    sizes: &mut [u32; DIGITS],
+) {
+    let mut total = 0;
+    for size in sizes.iter_mut() {
+        (total, *size) = (total + *size, total);
+    }
+    for i in 0..count {
+        let row = *from.add(i);
+        let slot = sizes.get_unchecked_mut((row >> shift) as usize & (DIGITS - 1));
+        *to.add(*slot as usize) = row;
+        *slot += 1;
     }
 }
 
@@ -271,13 +273,19 @@ impl Run {
     unsafe fn claim_chunk(&self, hour: usize) -> Cursor {
         let offset = self.claimed[hour].fetch_add(CHUNK, Relaxed);
         let at = self.rows.add(hour * self.stride + offset);
-        Cursor { at, last: at.add(CHUNK - 1) }
+        Cursor {
+            at,
+            last: at.add(CHUNK - 1),
+        }
     }
 
     unsafe fn parse(&self) {
         let input = self.input;
         let empty = std::ptr::null_mut();
-        let mut cursors = [Cursor { at: empty, last: empty }; HOURS];
+        let mut cursors = [Cursor {
+            at: empty,
+            last: empty,
+        }; HOURS];
         let mut ends = [0u32; LINES_PER_BLOCK + 1];
         let mapped_end = self.len.div_ceil(4096) * 4096;
         loop {
@@ -285,7 +293,11 @@ impl Run {
             if claim >= self.len {
                 return;
             }
-            madvise(input.add(claim) as *mut u8, CLAIM.min(mapped_end - claim), MADV_POPULATE_READ);
+            madvise(
+                input.add(claim) as *mut u8,
+                CLAIM.min(mapped_end - claim),
+                MADV_POPULATE_READ,
+            );
             // A line belongs to the claim holding its newline. The first one starts after
             // the previous claim's last newline, at most one line back.
             let mut line = input.add(claim);
@@ -341,24 +353,62 @@ impl Run {
         let region = self.rows.add(hour * self.stride);
         let claimed = self.claimed[hour].load(Relaxed);
 
-        let Tables { starts, errors, latencies } = tables;
+        let Tables {
+            starts,
+            errors,
+            latencies,
+            long,
+        } = tables;
         starts.fill(0);
         errors.fill(0);
-        for_each_row(region, claimed, |group, is_error, _| {
-            *starts.get_unchecked_mut(group) += 1;
-            *errors.get_unchecked_mut(group) += is_error;
-        });
+        long.clear();
+        // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
+        // are all longer than the rest, so sorted on their own they simply follow them.
+        let mut sizes = [[0u32; DIGITS]; 2];
+        let mut count = 0;
+        for chunk in (0..claimed).step_by(CHUNK) {
+            let mut at = chunk;
+            while at < chunk + CHUNK && *region.add(at) != 0 {
+                let row = *region.add(at);
+                at += 1;
+                let group = (row >> (LATENCY_BITS + 1)) as usize;
+                *starts.get_unchecked_mut(group) += 1;
+                *errors.get_unchecked_mut(group) += row >> LATENCY_BITS & 1;
+                if row & ESCAPE == ESCAPE {
+                    long.push((*region.add(at), row));
+                    at += 1;
+                } else {
+                    *region.add(count) = row;
+                    count += 1;
+                    sizes[0][row as usize & (DIGITS - 1)] += 1;
+                    sizes[1][(row >> DIGIT_BITS) as usize & (DIGITS - 1)] += 1;
+                }
+            }
+        }
+        latencies.resize(count + long.len(), 0);
+        let [low, high] = &mut sizes;
+        radix_pass(region, latencies.as_mut_ptr(), count, 0, low);
+        radix_pass(latencies.as_ptr(), region, count, DIGIT_BITS, high);
+        long.sort_unstable();
+
         let mut total = 0;
         for start in starts.iter_mut() {
             (total, *start) = (total + *start, total);
         }
-        latencies.resize(total as usize, 0);
-        for_each_row(region, claimed, |group, _, latency| {
-            let start = starts.get_unchecked_mut(group);
+        let mut deal = |row: u32, latency: u32| {
+            let start = starts.get_unchecked_mut((row >> (LATENCY_BITS + 1)) as usize);
             *latencies.get_unchecked_mut(*start as usize) = latency;
             *start += 1; // leaves each group's end where the next group's start was
-        });
-        madvise(region.cast(), (claimed * 4).div_ceil(4096) * 4096, MADV_DONTNEED);
+        };
+        for i in 0..count {
+            deal(*region.add(i), *region.add(i) & ESCAPE);
+        }
+        long.iter().for_each(|&(latency, row)| deal(row, latency));
+        madvise(
+            region.cast(),
+            (claimed * 4).div_ceil(4096) * 4096,
+            MADV_DONTNEED,
+        );
 
         let label = hour_label(hour);
         let mut out: Vec<u8> = Vec::with_capacity(1 << 18);
@@ -369,7 +419,9 @@ impl Run {
                 continue;
             }
             let (n, bad) = (span.len() as u32, errors[group]);
-            let [p50, p95, p99] = percentiles(&mut latencies[span]);
+            let sorted = &latencies[span];
+            let at_rank = |p: usize| sorted[(p * sorted.len() + 99) / 100 - 1];
+            let (p50, p95, p99) = (at_rank(50), at_rank(95), at_rank(99));
             let name = self.catalogue.name(id as usize);
             out.reserve(LINE_MAX);
             let start = out.as_mut_ptr().add(out.len());
@@ -411,6 +463,7 @@ impl Run {
             starts: vec![0; size],
             errors: vec![0; size],
             latencies: Vec::new(),
+            long: Vec::new(),
         };
         loop {
             let hour = self.next_hour.fetch_add(1, Relaxed);
@@ -432,31 +485,21 @@ struct Tables {
     starts: Vec<u32>,
     errors: Vec<u32>,
     latencies: Vec<u32>,
+    long: Vec<(u32, u32)>, // latency, row
 }
 
 /// The hour as text with a trailing space, padded so it can be copied as one 32-byte load.
 fn hour_label(hour: usize) -> [u8; 32] {
     let (day, clock) = ((hour + 18) / 24, (hour + 18) % 24);
-    let (month, date) = if day < 2 { (10, 30 + day) } else { (11, day - 1) };
+    let (month, date) = if day < 2 {
+        (10, 30 + day)
+    } else {
+        (11, day - 1)
+    };
     let mut label = [0; 32];
     let text = format!("2026-{month}-{date:02}T{clock:02}:00:00Z ");
     label[..21].copy_from_slice(text.as_bytes());
     label
-}
-
-/// Nearest-rank p50, p95 and p99. Selecting p50 first halves the slice the other two search,
-/// and p95 then leaves p99 only the top 5%. Starting from p99 would rescan almost all of it.
-fn percentiles(v: &mut [u32]) -> [u32; 3] {
-    let n = v.len();
-    let rank = |p: usize| (p * n + 99) / 100 - 1;
-    if n <= 64 {
-        v.sort_unstable(); // also keeps the ranks from colliding in the selections below
-        return [v[rank(50)], v[rank(95)], v[rank(99)]];
-    }
-    let (_, &mut p50, high) = v.select_nth_unstable(rank(50));
-    let (_, &mut p95, high) = high.select_nth_unstable(rank(95) - rank(50) - 1);
-    let (_, &mut p99, _) = high.select_nth_unstable(rank(99) - rank(95) - 1);
-    [p50, p95, p99]
 }
 
 /// Eight digits at once, as bytes with the first digit lowest. Divides by 10000, then 100,
@@ -505,11 +548,25 @@ fn main() {
         let span = len.div_ceil(4096) * 4096 + 4096;
         let input = mmap(null, span, PROT_READ, private, -1, 0);
         if len > 0 {
-            mmap(input, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
+            mmap(
+                input,
+                len,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            );
         }
         let stride = (len / MIN_LINE + 1) * 3 + threads * CHUNK; // every line could escape
         let stride = stride.div_ceil(1024) * 1024;
-        let rows = mmap(null, stride * HOURS * 4, PROT_READ | PROT_WRITE, private, -1, 0);
+        let rows = mmap(
+            null,
+            stride * HOURS * 4,
+            PROT_READ | PROT_WRITE,
+            private,
+            -1,
+            0,
+        );
         (input as *const u8, rows.cast(), stride)
     };
 
