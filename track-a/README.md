@@ -12,6 +12,10 @@ Endpoints live in one shared open-addressed table that fills in the first moment
 
 **Summarise.** Workers take one hour at a time. Each hour is radix sorted by latency inside its own pages, then dealt out by endpoint. Dealing keeps rows in order, so every endpoint comes out sorted and a percentile is one array read. The 1% of latencies too long for a row are sorted aside and follow the rest. The hour's memory goes back to the kernel at once, so rows and output never add up. Each output line is built with branch-free number formatting. Whichever worker finds the next hour ready writes it, so the single-threaded write overlaps the parallel work.
 
+## Build
+
+The binary is linked statically (`+crt-static`), which removes dynamic loading from the start-up the timer includes.
+
 ## Dependencies
 
 None.
