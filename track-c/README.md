@@ -22,4 +22,4 @@ None.
 
 ## With another 24 hours
 
-Cut the field pass, which is now most of the run, and check whether the region table can share a huge page.
+Parse the numbers of four records at once in vector registers, because each number field still costs about 10% of the field pass.

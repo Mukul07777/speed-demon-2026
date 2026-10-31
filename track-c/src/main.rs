@@ -46,7 +46,7 @@ const PR_SET_THP_DISABLE: i32 = 41;
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 20;
 const REGION_CLAIM: usize = 1 << 16;
-const BATCH_WORDS: usize = 256; // 64-byte steps of the file between record passes
+const BATCH_WORDS: usize = 32; // 64-byte steps of the file between record passes
 const FIELDS: usize = 5; // structural bytes per record: four commas and an LF
 const MIN_RECORD: usize = 11; // `1,,,1,0.00` and an LF
 const MAX_POSITIONS: usize = BATCH_WORDS * 64 / MIN_RECORD * FIELDS + 2 * FIELDS;
@@ -105,7 +105,11 @@ impl Stats {
 #[derive(Clone, Copy)]
 struct Pending {
     hash: u64,
-    group: u32,
+    id: u64,
+    amount: i64,
+    region: u32,
+    name_bytes: u32,
+    note_bytes: u32,
 }
 
 /// One cache line: name hashes and their numbers + 1. Numbers are dense, which keeps the bit
@@ -164,8 +168,9 @@ unsafe fn cents_before(end: *const u8, len: usize) -> i64 {
     let negative = (*end.sub(len) == b'-') as u64;
     let drop = 64 - 8 * len;
     let bytes = (read(end.sub(8)) ^ ZEROS) >> drop << drop;
-    let bytes = bytes & !((negative * 0xFF) << drop); // the sign reads as a leading zero
-                                                      // Close the gap the point leaves: its byte is always third from the end.
+    // The sign reads as a leading zero.
+    let bytes = bytes & !((negative * 0xFF) << drop);
+    // Close the gap the point leaves: its byte is always third from the end.
     let closed = (bytes & 0xFF_FFFF_FFFF) << 8 | bytes & 0xFFFF_0000_0000_0000;
     (eight_digits(closed) as i64 ^ -(negative as i64)) + negative as i64
 }
@@ -385,9 +390,10 @@ impl Run {
                     let id =
                         number_before(id_end, comma1 - (start as usize - input as usize) - bom);
                     let region = number_before(input.add(comma4), comma4 - comma3 - 1) as usize;
+                    let region = region.min(REGION_IDS);
+                    _mm_prefetch::<_MM_HINT_T0>(self.region_table.add(region).cast());
                     let end = newline - (*input.add(newline - 1) == b'\r') as usize;
                     let amount = cents_before(input.add(end), end - comma4 - 1);
-                    let group = *self.region_table.add(region.min(REGION_IDS)) as usize;
 
                     let (rank2, rank3) = (quotes_up_to(comma2), quotes_up_to(comma3));
                     // A field of raw length L with q quote bytes has L - q/2 - 1 value bytes,
@@ -398,27 +404,34 @@ impl Run {
                     let note_quotes = rank3.wrapping_sub(rank2);
                     rank = rank3;
 
-                    let s = stats.get_unchecked_mut(group);
-                    s.count += 1;
-                    s.id_sum += id;
-                    s.amount_sum += amount;
-                    s.amount_min = s.amount_min.min(amount);
-                    s.amount_max = s.amount_max.max(amount);
-                    s.name_bytes += value_len(raw_name, name_quotes) as u64;
-                    s.note_bytes += value_len(comma3 - comma2 - 1, note_quotes) as u64;
-
                     let hash = name_hash(input.add(comma1 + 2), raw_name.saturating_sub(2));
                     let bucket = (hash >> (64 - BUCKETS.trailing_zeros())) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(bucket).cast());
                     pending.push(Pending {
                         hash,
-                        group: group as u32,
+                        id,
+                        amount,
+                        region: region as u32,
+                        name_bytes: value_len(raw_name, name_quotes) as u32,
+                        note_bytes: value_len(comma3 - comma2 - 1, note_quotes) as u32,
                     });
                 }
-                // A locked update of a cold line stalls the core, so fetch the lines first.
+                // The region table and the name table were each a cache miss on every record,
+                // half of the pass above when it read them itself. Now both are prefetched
+                // there and read here. A locked update of a cold line stalls the core, so
+                // its lines are fetched here and updated in the pass after.
                 for name in &mut pending {
+                    let group = *self.region_table.add(name.region as usize) as usize;
+                    let s = stats.get_unchecked_mut(group);
+                    s.count += 1;
+                    s.id_sum += name.id;
+                    s.amount_sum += name.amount;
+                    s.amount_min = s.amount_min.min(name.amount);
+                    s.amount_max = s.amount_max.max(name.amount);
+                    s.name_bytes += name.name_bytes as u64;
+                    s.note_bytes += name.note_bytes as u64;
                     let id = self.intern(name) as usize;
-                    let word = name.group as usize * SEEN_WORDS + id / 64;
+                    let word = group * SEEN_WORDS + id / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.seen.add(word).cast());
                     name.hash = (word << 6 | id % 64) as u64;
                 }
