@@ -4,11 +4,13 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only. One worker per hardware thread claims 128 KiB blocks of `requests.log` and reads them with `pread`, so the file is never held in memory whole. A line belongs to the block it starts in, and each read overlaps the next block by one maximum-length line.
+Rust, standard library only, in two phases on one pool of threads. The design comes from profiling: see `PERF.md` for what each step bought.
 
-Parsing never touches a date library. The span is fixed at 72 hours, so the hour index comes from a few timestamp digits, and the method's first two bytes give its length. An AVX2 scan finds the end of the endpoint, usually in one load. Latency lengths vary, so a byte loop would mispredict on nearly every line; instead eight bytes are converted at once with SWAR arithmetic. Each row packs into one `u64`, endpoint then latency then an error bit, and goes into that worker's bucket for the hour. Endpoints get worker-local ids from a small open-addressed table.
+**Parse.** The file is memory-mapped. A worker claims 1 MiB and maps it in with one `MADV_POPULATE_READ` call, because letting 12 threads fault pages in one at a time cost more than parsing them. It then works through 64 KiB blocks in two passes. The first finds every newline. Lines are longer than a 32-byte AVX2 step, so each step holds at most one newline and one unconditional store records it. The second pass reads each line from both ends with no branch that depends on the data: hour digits at a fixed offset, method length with a SWAR space search, and the latency back from the newline with SWAR arithmetic. Only about 1% of lines take a rare path.
 
-After parsing, the local ids merge through one more table, and the distinct names are sorted once to give each endpoint its output rank. Then the workers take one hour each. A counting sort groups the hour's latencies by endpoint rank in one pass. Each group then selects only its three percentiles, p99 first, so that p95 and p50 search a smaller slice. Hours are already in output order, so the file is the hours concatenated.
+Endpoints live in one shared open-addressed table that fills in the first moments and is read-only after that. A lookup compares the first and last 32 bytes of the name with one AVX2 test, which settles any name up to 64 bytes without a length-dependent loop. Each line becomes a 4-byte row (endpoint, error bit, 20-bit latency) in a region reserved for its hour, and the 1% of latencies that need more bits take a second slot.
+
+**Summarise.** Workers take one hour at a time. A counting sort groups the rows by endpoint, then each group selects only its three percentiles. Selecting p50 first halves what p95 and p99 search. The hour's memory goes back to the kernel at once, so rows and output never add up. Each output line is built with branch-free number formatting. Whichever worker finds the next hour ready writes it, so the single-threaded write overlaps the parallel work.
 
 ## Dependencies
 
@@ -16,4 +18,4 @@ None.
 
 ## With another 24 hours
 
-Shrink rows from eight bytes, free each hour's rows as it is summarised, and write the output in parallel.
+Spawn the threads as a tree, try profile-guided optimisation at build time, and replace selection on the largest groups with a histogram.
