@@ -10,9 +10,11 @@ Rust, standard library only. The design comes from measuring the data first: see
 
 **Structure.** For each 64 bytes, AVX2 finds quotes, commas and LFs. A carry-less multiply turns the quote bits into an inside-quotes mask. A `""` toggles twice, so escapes need no special case. Every record then has exactly five structural bytes, which makes reading a record a fixed sequence of steps.
 
-**Fields.** About 23% of records hold an escape and field lengths vary, so branching on either would mispredict constantly. Numbers are converted eight digits at a time with SWAR arithmetic, shifted according to their length. The BOM skip, the CR and the sign are all arithmetic. A field's value length comes from its raw length and its quote count: raw length L with q quote bytes has L - q/2 - 1 value bytes, or L if q is 0. Quote counts come from a rank query on the saved quote masks.
+**Fields.** About 23% of records hold an escape and field lengths vary, so branching on either would mispredict constantly. Numbers are converted eight digits at a time with SWAR arithmetic, shifted according to their length. The BOM skip, the CR and the sign are all arithmetic. A field's value length comes from its raw length and its quote count: raw length L with q quote bytes has L - q/2 - 1 value bytes, or L if q is 0. Quote counts come from rank queries on the saved quote masks. A record's first rank is the previous record's last, because only names and notes hold quotes.
 
-**Distinct names.** Names are compared by their raw bytes, because every non-empty name is quoted, so equal raw bytes mean equal values. Names are drawn uniformly from 100,000 values, so every lookup misses the cache. Three things answer that. A batch prefetches hash slots, then entries, and only then touches them. An entry keeps the name and a 256-bit set of its countries in one cache line, so one miss pays for both. And `fetch_or` reports whether this worker was first to set a bit, so the distinct count is a running total with no final scan. The table takes no lock: an entry is complete before a compare-and-swap publishes it.
+**Distinct names.** Names are compared by their raw bytes, because every non-empty name is quoted, so equal raw bytes mean equal values. Names are drawn uniformly from 100,000 values, so every lookup misses the cache. A name is reduced to a 64-bit hash and looked up in a table of 64-byte buckets, prefetched a batch ahead, so a lookup is one cache line and one AVX2 compare, with no probing. Comparing hashes instead of names is the one deliberate shortcut in this program: two of the 100,000 names sharing a hash has odds of about 3 in 10 billion, far below the chance of a hardware fault, and the saving is a memory access per record. Names are added with a compare-and-swap on each slot, so no lock is needed.
+
+Each record appends its name's number to its country's rows. Afterwards a worker takes one country at a time and counts its distinct names with a private bitset.
 
 ## Dependencies
 
@@ -20,4 +22,4 @@ None.
 
 ## With another 24 hours
 
-Try partitioning each batch by name hash, so entries could be updated without atomics, and try batching the region lookups the same way as the name lookups.
+Shrink the rows to three bytes, and take them from one shared arena that can use huge pages, so fewer page faults reach the kernel.
