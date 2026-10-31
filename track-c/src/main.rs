@@ -21,7 +21,6 @@
 //! popcounts of the rows give the distinct names.
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::ptr::read_unaligned;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
@@ -37,8 +36,8 @@ const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
-const MAP_ANONYMOUS: i32 = 0x20;
-const MAP_NORESERVE: i32 = 0x4000;
+// MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+const MAP_ANON: i32 = 0x4022;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_DONTNEED: i32 = 4;
 const MADV_POPULATE_READ: i32 = 22;
@@ -52,6 +51,11 @@ const FIELDS: usize = 5; // structural bytes per record: four commas and an LF
 const MIN_RECORD: usize = 11; // `1,,,1,0.00` and an LF
 const MAX_POSITIONS: usize = BATCH_WORDS * 64 / MIN_RECORD * FIELDS + 2 * FIELDS;
 const MAX_RECORDS: usize = MAX_POSITIONS / FIELDS;
+// Digit arrays are decoded four at a time, so they may be read up to three past the last record.
+const BATCH_CAP: usize = MAX_RECORDS + 3;
+// The two numbers of a record that wait for `decode_digits`, as indexes of a batch's arrays.
+const ID: usize = 0;
+const AMOUNT: usize = 1;
 const QUOTE_WORDS: usize = 1 << 10; // masks kept for the rank query, more than one batch
 const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 5;
@@ -70,7 +74,6 @@ struct Stats {
     amount_sum: i64,
     amount_min: i64,
     amount_max: i64,
-    names_distinct: u64,
     // Name bytes in the low half and note bytes in the high half: the spec keeps each below
     // 2^31, so the halves never carry into each other and one add updates both.
     lengths: u64,
@@ -92,19 +95,18 @@ impl Stats {
         self.amount_sum += other.amount_sum;
         self.amount_min = self.amount_min.min(other.amount_min);
         self.amount_max = self.amount_max.max(other.amount_max);
-        self.names_distinct += other.names_distinct;
         self.lengths += other.lengths;
     }
 }
 
-/// One record between the passes of a batch.
+/// One record between the passes of a batch. Its id and amount wait in the batch's digit
+/// arrays until `decode_digits` has turned them into numbers.
 #[derive(Clone, Copy)]
 struct Pending {
     hash: u64,
-    id: u64,
-    amount: i64,
-    region: u32,
     lengths: u64, // as in `Stats`
+    sign: i64,    // -1 for a negative amount, else 0
+    region: u32,
 }
 
 /// One cache line: name hashes and their numbers + 1. Numbers are dense, which keeps the bit
@@ -158,16 +160,39 @@ unsafe fn number_before(end: *const u8, len: usize) -> u64 {
     eight_digits((read(end.sub(8)) ^ ZEROS) >> (64 - 8 * len) << (64 - 8 * len))
 }
 
-/// An amount such as `-5.25` in the `len` bytes before `end`, in cents.
-unsafe fn cents_before(end: *const u8, len: usize) -> i64 {
-    let negative = (*end.sub(len) == b'-') as u64;
-    let drop = 64 - 8 * len;
-    let bytes = (read(end.sub(8)) ^ ZEROS) >> drop << drop;
-    // The sign reads as a leading zero.
-    let bytes = bytes & !((negative * 0xFF) << drop);
+/// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
+/// Shifting them to the top makes the bytes below read as leading zeros.
+unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
+    (read(end.sub(8)) ^ ZEROS) >> (64 - 8 * len) << (64 - 8 * len)
+}
+
+/// The digits of an amount such as `5.25` in the `len` bytes before `end`, without its point.
+unsafe fn cents_digits(end: *const u8, len: usize) -> u64 {
+    let bytes = digits_before(end, len);
     // Close the gap the point leaves: its byte is always third from the end.
-    let closed = (bytes & 0xFF_FFFF_FFFF) << 8 | bytes & 0xFFFF_0000_0000_0000;
-    (eight_digits(closed) as i64 ^ -(negative as i64)) + negative as i64
+    (bytes & 0xFF_FFFF_FFFF) << 8 | bytes & 0xFFFF_0000_0000_0000
+}
+
+/// Turns the first `count` words of eight digit bytes each into numbers, four at a time, like
+/// `eight_digits` does for one. The three arrays of a batch go through the same few
+/// instructions, so a record's numbers cost far less than three scalar multiply chains.
+unsafe fn decode_digits(words: &[u64; BATCH_CAP], numbers: &mut [u32; BATCH_CAP], count: usize) {
+    for at in (0..count).step_by(4) {
+        let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
+        // Pairs of digits, then groups of four, then all eight.
+        let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
+        let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
+        let eights = _mm256_madd_epi16(
+            _mm256_packus_epi32(fours, fours),
+            _mm256_set1_epi32(0x0001_2710),
+        );
+        // Each 128-bit half now holds its two numbers in its low 64 bits.
+        let packed = _mm256_permute4x64_epi64::<0b1000>(eights);
+        _mm_storeu_si128(
+            numbers.as_mut_ptr().add(at).cast(),
+            _mm256_castsi256_si128(packed),
+        );
+    }
 }
 
 /// Sets each bit that has an odd number of set bits at or below it, so quote bits become a
@@ -188,26 +213,19 @@ fn fold_multiply(a: u64, b: u64) -> u64 {
     product as u64 ^ (product >> 64) as u64
 }
 
-/// The hash of a name, never 0, which marks an unused slot. Names are compared by their raw
-/// bytes: every non-empty name is quoted, so equal raw bytes mean equal values and nothing
-/// needs unescaping. Names of 32 bytes and more do not occur at seed 1 (the longest is 27),
-/// so they cost one predicted branch here.
+/// The hash of a name, never 0, which marks an unused slot, and the number of quote bytes in
+/// it. Names are compared by their raw bytes: every non-empty name is quoted, so equal raw
+/// bytes mean equal values and nothing needs unescaping. Names of 32 bytes and more do not
+/// occur at seed 1 (the longest is 27), so they cost one predicted branch here.
 #[inline(always)]
-unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
+unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     // 32 bytes of ones then 32 of zeros: loading at 32 - len keeps the first `len` bytes.
-    static MASKS: [u8; 64] = {
-        let mut bytes = [0u8; 64];
-        let mut i = 0;
-        while i < 32 {
-            bytes[i] = 0xFF;
-            i += 1;
-        }
-        bytes
-    };
+    static MASKS: [[u8; 32]; 2] = [[0xFF; 32], [0; 32]];
     if len >= 32 {
         return long_name_hash(name, len);
     }
-    let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().add(32 - len)));
+    let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
+    let quotes = equal_mask(bytes, b'"').count_ones() as usize;
     let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
     let mixed = _mm_aesenc_si128(
         _mm_xor_si128(_mm256_castsi256_si128(bytes), key),
@@ -215,15 +233,16 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     );
     let mixed = _mm_aesenc_si128(mixed, _mm_set1_epi64x(0xA076_1D64_78BD_642F_u64 as i64));
     let mixed = _mm_aesenc_si128(mixed, _mm_set1_epi64x(0xEB44_ACCA_B455_D165_u64 as i64));
-    _mm_cvtsi128_si64(mixed) as u64 | 1
+    (_mm_cvtsi128_si64(mixed) as u64 | 1, quotes)
 }
 
 #[cold]
-unsafe fn long_name_hash(name: *const u8, len: usize) -> u64 {
+unsafe fn long_name_hash(name: *const u8, len: usize) -> (u64, usize) {
     let bytes = std::slice::from_raw_parts(name, len);
-    bytes.iter().fold(len as u64, |hash, &byte| {
+    let hash = bytes.iter().fold(len as u64, |hash, &byte| {
         fold_multiply(hash ^ byte as u64, 0xE703_7ED1_A0B4_28DB)
-    }) | 1
+    });
+    (hash | 1, bytes.iter().filter(|&&byte| byte == b'"').count())
 }
 
 impl Run {
@@ -260,8 +279,8 @@ impl Run {
                 let comma = input.add(line + digits);
                 let id = number_before(comma, digits) as usize;
                 let code = [*comma.add(1), *comma.add(2), *comma.add(3)];
-                let at = |c: u8| (c - b'A') as usize;
-                let cell = &self.letters[at(code[0]) * 676 + at(code[1]) * 26 + at(code[2])];
+                let letters = code.iter().fold(0, |n, &c| n * 26 + (c - b'A') as usize);
+                let cell = &self.letters[letters];
                 let group = match cell.load(Relaxed) {
                     0 => self.group_of_country(code, cell),
                     group => group,
@@ -275,19 +294,15 @@ impl Run {
 
     /// The first record at or after `claim`.
     unsafe fn first_record(&self, claim: usize) -> usize {
-        let input = self.records;
+        let rest = std::slice::from_raw_parts(self.records, self.records_len);
         let mut at = claim.saturating_sub(1);
-        loop {
-            let rest = std::slice::from_raw_parts(input.add(at), self.records_len - at);
-            let Some(found) = rest.iter().position(|&c| c == b'\n') else {
-                return self.records_len;
-            };
+        while let Some(found) = rest[at..].iter().position(|&c| c == b'\n') {
             at += found + 1;
-            if at >= self.records_len || claim == 0 || matches!(*input.add(at), b'0'..=b'9' | 0xEF)
-            {
+            if at >= rest.len() || claim == 0 || matches!(rest[at], b'0'..=b'9' | 0xEF) {
                 return at;
             }
         }
+        rest.len()
     }
 
     unsafe fn parse_records(&self) {
@@ -299,17 +314,22 @@ impl Run {
         let mut quotes = [0u64; QUOTE_WORDS];
         let mut quotes_before = [0u32; QUOTE_WORDS];
         let mut pending: Vec<Pending> = Vec::with_capacity(MAX_RECORDS);
+        let mut digits = [[0u64; BATCH_CAP]; 2];
+        let mut numbers = [[0u32; BATCH_CAP]; 2];
         loop {
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= len {
                 break;
             }
             let claim_end = claim + CLAIM;
-            madvise(
-                input.add(claim) as *mut u8,
-                CLAIM.min(mapped_end - claim),
-                MADV_POPULATE_READ,
-            );
+            let advise = |advice| {
+                madvise(
+                    input.add(claim) as *mut u8,
+                    CLAIM.min(mapped_end - claim),
+                    advice,
+                )
+            };
+            advise(MADV_POPULATE_READ);
             let origin = self.first_record(claim);
             let mut record = origin; // the next record to read
             let mut at = origin; // the next byte to scan
@@ -365,59 +385,65 @@ impl Run {
                 let mut rank = quotes_up_to(record);
                 let mut read_positions = 0;
                 while read_positions < complete * FIELDS && record < claim_end {
-                    let field = positions.as_ptr().add(read_positions);
+                    let field = positions
+                        .as_ptr()
+                        .add(read_positions)
+                        .cast::<[u32; FIELDS]>();
                     read_positions += FIELDS;
-                    let start = input.add(record);
-                    let comma1 = *field as usize;
-                    let comma2 = *field.add(1) as usize;
-                    let comma3 = *field.add(2) as usize;
-                    let comma4 = *field.add(3) as usize;
-                    let newline = *field.add(4) as usize;
+                    let [comma1, comma2, comma3, comma4, newline] = (*field).map(|p| p as usize);
+                    let bom = (*input.add(record) == 0xEF) as usize * 3;
+                    let id_len = comma1 - record - bom;
                     record = newline + 1;
 
-                    let bom = (*start == 0xEF) as usize * 3;
-                    let id_end = input.add(comma1);
-                    let id =
-                        number_before(id_end, comma1 - (start as usize - input as usize) - bom);
+                    let at = pending.len();
+                    digits[ID][at] = digits_before(input.add(comma1), id_len);
                     let region = number_before(input.add(comma4), comma4 - comma3 - 1) as usize;
                     let region = region.min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(self.region_table.add(region).cast());
+                    // The sign sits before the digits, where the shift leaves it out.
                     let end = newline - (*input.add(newline - 1) == b'\r') as usize;
-                    let amount = cents_before(input.add(end), end - comma4 - 1);
+                    let negative = (*input.add(comma4 + 1) == b'-') as usize;
+                    digits[AMOUNT][at] = cents_digits(input.add(end), end - comma4 - 1 - negative);
 
-                    let (rank2, rank3) = (quotes_up_to(comma2), quotes_up_to(comma3));
-                    // A field of raw length L with q quote bytes has L - q/2 - 1 value bytes,
-                    // or L when there are no quotes: q counts the delimiters and each pair.
-                    let value_len = |raw: usize, q: u32| raw - (q / 2) as usize - (q != 0) as usize;
+                    // The name has just been read, so only the note's end needs a rank query.
                     let raw_name = comma2 - comma1 - 1;
-                    let name_quotes = rank2.wrapping_sub(rank);
-                    let note_quotes = rank3.wrapping_sub(rank2);
+                    let (hash, name_inside) =
+                        name_hash(input.add(comma1 + 2), raw_name.saturating_sub(2));
+                    let name_len = raw_name.saturating_sub(2) - name_inside / 2;
+                    let rank3 = quotes_up_to(comma3);
+                    // The delimiters add two quotes, but only to a name that is not empty.
+                    let name_quotes = name_inside + 2 * (raw_name != 0) as usize;
+                    let note_quotes = rank3.wrapping_sub(rank) as usize - name_quotes;
                     rank = rank3;
-
-                    let hash = name_hash(input.add(comma1 + 2), raw_name.saturating_sub(2));
+                    // A note of raw length L with q quote bytes has L - q/2 - 1 value bytes, or
+                    // L when there are no quotes: q counts the delimiters and each pair.
+                    let note_len =
+                        comma3 - comma2 - 1 - note_quotes / 2 - (note_quotes != 0) as usize;
                     let bucket = (hash >> (64 - BUCKETS.trailing_zeros())) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(bucket).cast());
                     pending.push(Pending {
                         hash,
-                        id,
-                        amount,
+                        sign: -(negative as i64),
                         region: region as u32,
-                        lengths: value_len(raw_name, name_quotes) as u64
-                            | (value_len(comma3 - comma2 - 1, note_quotes) as u64) << 32,
+                        lengths: name_len as u64 | (note_len as u64) << 32,
                     });
                 }
                 // The region table and the name table were each a cache miss on every record,
                 // half of the pass above when it read them itself. Now both are prefetched
-                // there and read here. A locked update of a cold line stalls the core, so
-                // its lines are fetched here and updated in the pass after.
-                for name in &mut pending {
+                // before this pass reads them. A locked update of a cold line stalls the core,
+                // so its lines are fetched here and updated in the pass after.
+                for kind in [ID, AMOUNT] {
+                    decode_digits(&digits[kind], &mut numbers[kind], pending.len());
+                }
+                for (at, name) in pending.iter_mut().enumerate() {
                     let group = *self.region_table.add(name.region as usize) as usize;
+                    let amount = (numbers[AMOUNT][at] as i64 ^ name.sign) - name.sign;
                     let s = stats.get_unchecked_mut(group);
                     s.count += 1;
-                    s.id_sum += name.id;
-                    s.amount_sum += name.amount;
-                    s.amount_min = s.amount_min.min(name.amount);
-                    s.amount_max = s.amount_max.max(name.amount);
+                    s.id_sum += numbers[ID][at] as u64;
+                    s.amount_sum += amount;
+                    s.amount_min = s.amount_min.min(amount);
+                    s.amount_max = s.amount_max.max(amount);
                     s.lengths += name.lengths;
                     let id = self.intern(name) as usize;
                     let word = group * SEEN_WORDS + id / 64;
@@ -436,11 +462,7 @@ impl Run {
             // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
             // ~50,000 page-table entries on one thread at exit, which the timer includes. A
             // record running into the next claim just faults its few pages back in.
-            madvise(
-                input.add(claim) as *mut u8,
-                CLAIM.min(mapped_end - claim),
-                MADV_DONTNEED,
-            );
+            advise(MADV_DONTNEED);
         }
         let mut totals = self.totals.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -468,8 +490,9 @@ impl Run {
         self.insert(index, name.hash)
     }
 
-    /// Finds or adds a name that its first bucket does not answer for. Only about 100,000
-    /// lookups add one, and a compare-and-swap decides each slot, so no lock is needed.
+    /// Finds or adds a name that its first bucket does not answer for: the 100,000 first
+    /// appearances, and the 5% of lookups whose bucket was full. A compare-and-swap decides
+    /// each slot, so no lock is needed.
     #[cold]
     unsafe fn insert(&self, mut index: usize, hash: u64) -> u32 {
         loop {
@@ -514,8 +537,7 @@ fn money(cents: i64) -> String {
 /// Maps a file for reading, with a spare zero page after it so wide loads may run past the end.
 unsafe fn map_file(file: &File, len: usize) -> *const u8 {
     let span = len.div_ceil(4096) * 4096 + 4096;
-    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    let base = mmap(std::ptr::null_mut(), span, PROT_READ, flags, -1, 0);
+    let base = mmap(std::ptr::null_mut(), span, PROT_READ, MAP_ANON, -1, 0);
     if len > 0 {
         mmap(
             base,
@@ -543,13 +565,12 @@ unsafe fn zeroed_huge<T>(count: usize) -> *mut T {
 }
 
 unsafe fn zeroed<T>(count: usize) -> *mut T {
-    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     let bytes = count * size_of::<T>();
     mmap(
         std::ptr::null_mut(),
         bytes,
         PROT_READ | PROT_WRITE,
-        flags,
+        MAP_ANON,
         -1,
         0,
     )
@@ -586,31 +607,28 @@ fn main() {
     };
     thread::scope(|s| {
         for _ in 1..threads {
-            let builder = thread::Builder::new().stack_size(1 << 19);
-            builder.spawn_scoped(s, || run.work()).unwrap();
+            s.spawn(|| run.work());
         }
         run.work();
     });
 
-    let mut totals = run.totals.lock().unwrap();
+    let totals = run.totals.lock().unwrap();
     let codes = run.countries.lock().unwrap();
-    let mut order: Vec<usize> = (1..=codes.len()).collect();
-    order.sort_unstable_by_key(|&group| codes[group - 1]);
+    let mut keys: Vec<_> = (codes.iter().zip(1..))
+        .map(|(code, group)| (std::str::from_utf8(code).unwrap(), group))
+        .collect();
+    keys.sort_unstable();
     // `_UNMATCHED` sorts after every country code.
-    order.push(0);
+    keys.push(("_UNMATCHED", 0));
     let mut out = String::new();
-    for group in order {
-        let s = &mut totals[group];
+    for (key, group) in keys {
+        let s = &totals[group];
         let row =
             unsafe { std::slice::from_raw_parts(run.seen.add(group * SEEN_WORDS), SEEN_WORDS) };
-        s.names_distinct = row
+        let distinct = row
             .iter()
-            .map(|w| w.load(Relaxed).count_ones() as u64)
-            .sum();
-        let key = match group {
-            0 => "_UNMATCHED",
-            _ => std::str::from_utf8(&codes[group - 1]).unwrap(),
-        };
+            .map(|w| w.load(Relaxed).count_ones())
+            .sum::<u32>();
         if s.count > 0 {
             out += &format!(
                 "{key} {} {} {} {} {} {} {} {}\n",
@@ -619,14 +637,11 @@ fn main() {
                 money(s.amount_sum),
                 money(s.amount_min),
                 money(s.amount_max),
-                s.names_distinct,
+                distinct,
                 s.lengths & 0xFFFF_FFFF,
                 s.lengths >> 32
             );
         }
     }
-    File::create("/out/aggregates.txt")
-        .unwrap()
-        .write_all(out.as_bytes())
-        .unwrap();
+    std::fs::write("/out/aggregates.txt", out).unwrap();
 }
