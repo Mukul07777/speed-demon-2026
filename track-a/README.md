@@ -24,4 +24,4 @@ None.
 
 ## With another 24 hours
 
-Cooperate on one hour at a time in the summarise phase: the twelve scratch buffers of twelve hours in flight cost about 9 MB of peak memory, and one hour at a time would cut that to under 1 MB. Try profile-guided optimisation at build time, and replace selection on the largest groups with a histogram.
+Memory is near its floor for this design: the peak is the end of parsing, when all rows (about 12.5 MB) are live, so summary scratch is not the limit (see `PERF.md` step 9). Smaller rows are the only lever left. Try profile-guided optimisation at build time, and replace selection on the largest groups with a histogram.
