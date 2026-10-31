@@ -25,6 +25,7 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn prctl(option: i32, arg: usize, a: usize, b: usize, c: usize) -> i32;
     fn memchr(text: *const u8, byte: i32, len: usize) -> *const u8;
 }
 const PROT_READ: i32 = 1;
@@ -35,6 +36,8 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
+const MADV_DONTNEED: i32 = 4;
+const PR_SET_THP_DISABLE: i32 = 41;
 const MADV_POPULATE_READ: i32 = 22;
 
 const HUGE_PAGE: usize = 1 << 21;
@@ -514,6 +517,16 @@ impl Run {
             ends.copy_within(ready..end_count, 0);
             end_count -= ready;
         }
+        // Drop the scanned pages from this process's page tables now, on every thread, instead
+        // of one thread tearing down the whole mapping at exit. The mapping is a read-only
+        // private file, so a later touch (a neighbour's line search) just maps the page again.
+        // The sample's claims are read again by the main pass, so they are kept.
+        if !SAMPLE {
+            let (from, to) = (start.div_ceil(4096) * 4096, end / 4096 * 4096);
+            if from < to {
+                madvise(text.add(from) as *mut u8, to - from, MADV_DONTNEED);
+            }
+        }
         // The sample's rows do not exist, so its claims are read again by the main pass.
         doc - first_doc + 1
     }
@@ -747,6 +760,10 @@ impl Run {
         }
         if self.step.wait().is_leader() {
             self.count_bitmaps();
+            // Postings and bitmaps are on their huge pages by now. The answer phase only grows
+            // each thread's heap, and where the kernel backs every region with huge pages
+            // those growing heaps would be charged 2 MiB at a time.
+            prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
             self.next_job.store(0, Relaxed);
         }
         self.step.wait();
@@ -1077,8 +1094,8 @@ unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
 fn main() {
     let file = File::open("/data/docs.txt").unwrap();
     let len = file.metadata().unwrap().len() as usize;
-    let mut query_text = std::fs::read("/data/queries.txt").unwrap();
-    query_text.extend_from_slice(&[0; 64]);
+    let queries = File::open("/data/queries.txt").unwrap();
+    let query_len = queries.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
     let mut run = unsafe {
         let text = map_file(&file, len);
@@ -1106,7 +1123,7 @@ fn main() {
             docs,
             words_per_bitmap,
             buckets: reserve(BUCKETS * size_of::<Bucket>(), MADV_HUGEPAGE).cast(),
-            terms: reserve(MAX_TERMS * size_of::<Term>(), MADV_NOHUGEPAGE).cast(),
+            terms: reserve(MAX_TERMS * size_of::<Term>(), MADV_HUGEPAGE).cast(),
             term_count: 0,
             queries: Vec::with_capacity(1 << 16),
             steps: Vec::with_capacity(1 << 18),
@@ -1127,8 +1144,13 @@ fn main() {
             parts: Mutex::new(Vec::new()),
         }
     };
-    unsafe { parse_queries(&mut run, &query_text) };
-    drop(query_text);
+    // Mapped rather than read: a few fault-arounds instead of a copy into fresh pages. The
+    // 64 bytes past the end that the parser may look at are zeros, from the page's tail or
+    // from the spare page `map_file` leaves.
+    unsafe {
+        let text = map_file(&queries, query_len);
+        parse_queries(&mut run, std::slice::from_raw_parts(text, query_len + 64));
+    }
     let batches = run.queries.len().div_ceil(QUERY_BATCH);
     *run.parts.lock().unwrap() = vec![Vec::new(); batches];
     *run.samples.lock().unwrap() = (vec![0; run.term_count], 0);
