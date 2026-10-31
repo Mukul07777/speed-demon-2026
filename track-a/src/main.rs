@@ -15,10 +15,9 @@
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
-use std::mem::ManuallyDrop;
 use std::os::fd::AsRawFd;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread;
 
@@ -45,7 +44,9 @@ const HOURS: usize = 72; // the span is fixed for every seed: 2026-10-30T18 to 2
 const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const MAX_ENDPOINTS: usize = 2046; // the catalogue has 1,842, and id + 1 must fit 11 bits
-const TEXT_BYTES: usize = 1 << 20; // all endpoint names, with room to copy past the last
+const NAME_STRIDE: usize = 192; // a length byte, a name of up to 125 bytes, and room to copy 64 from its start
+const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
+const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const LINE_MAX: usize = 21 + 125 + 6 * 11 + 1 + 128; // one output line, plus wide-copy slack
 const SPACES: u64 = 0x2020_2020_2020_2020;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
@@ -87,118 +88,123 @@ fn spaces_in(word: u64) -> u64 {
 
 /// Every endpoint seen so far. Workers share it: it fills in the first moments of the run
 /// and is read-only after that, so one copy stays hot in cache.
+///
+/// Names are identified by a 64-bit hash alone (53 bits of it are compared), the same
+/// deliberate shortcut Tracks B and C take: with 1,842 names the chance of any two colliding
+/// is about 2e-10.
 struct Catalogue {
-    slots: Box<[AtomicU32]>, // tag << 20 | len << 12 | id + 1
-    keys: *mut [__m256i; 2], // each name's first and last 32 bytes, masked as in `lookup`
-    spans: *mut (u32, u32),  // each name's offset and length in `text`
-    text: *mut u8,
-    used: Mutex<(usize, usize)>, // ids and text bytes handed out
+    slots: Box<[AtomicU64]>, // hash >> 11 << 11 | id + 1; 0 is an empty slot
+    names: *mut u8,          // NAME_STRIDE bytes per id: the length, then the name
+    used: Mutex<usize>,      // ids handed out
 }
 
-#[repr(align(64))]
-struct Masks([u8; 96]);
-static MASKS: Masks = {
-    let mut bytes = [0u8; 96];
-    let mut i = 32;
-    while i < 64 {
-        bytes[i] = 0xFF;
-        i += 1;
+/// A hash of the whole name without a length-dependent loop: the masked first and last 32
+/// bytes cover any name up to 64 bytes, and the few longer ones also fold in the middle.
+/// Never leaves the id bits zero, so a live slot is never 0.
+#[inline(always)]
+unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
+    // Lane numbers 0 to 31, to keep the first or the last `short` bytes of a 32-byte load.
+    let lanes = _mm256_setr_epi8(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    );
+    let short = _mm256_set1_epi8(len.min(32) as i8);
+    let head = _mm256_and_si256(load(name), _mm256_cmpgt_epi8(short, lanes));
+    let ahead = _mm256_cmpgt_epi8(lanes, _mm256_sub_epi8(_mm256_set1_epi8(31), short));
+    let tail = _mm256_and_si256(load(name.add(len).sub(32)), ahead);
+    let mut hash = (len as u64).wrapping_mul(KEY);
+    if len > 64 {
+        hash = middle_hash(name, len);
     }
-    Masks(bytes)
-};
+    // Each pair of 8-byte lanes goes through one multiply-and-fold, with its own keys.
+    let lanes: [u64; 8] = std::mem::transmute([head, tail]);
+    for (i, pair) in lanes.chunks(2).enumerate() {
+        let keys = [
+            KEY.wrapping_mul(2 * i as u64 + 1),
+            KEY.wrapping_mul(2 * i as u64 + 2),
+        ];
+        hash ^= fold_multiply(pair[0] ^ keys[0], pair[1] ^ keys[1]);
+    }
+    hash | 1 << ID_BITS
+}
+
+const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Multiplies to 128 bits and folds, the mixing step of wyhash.
+fn fold_multiply(a: u64, b: u64) -> u64 {
+    let product = a as u128 * b as u128;
+    product as u64 ^ (product >> 64) as u64
+}
+
+#[cold]
+unsafe fn middle_hash(name: *const u8, len: usize) -> u64 {
+    let middle = std::slice::from_raw_parts(name.add(32), len - 64);
+    middle.iter().fold(len as u64, |hash, &byte| {
+        (hash.rotate_left(5) ^ byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
+    })
+}
 
 impl Catalogue {
     fn new() -> Catalogue {
-        let slots = (0..SLOTS).map(|_| AtomicU32::new(0)).collect();
         Catalogue {
-            slots,
-            keys: ManuallyDrop::new(Vec::with_capacity(MAX_ENDPOINTS)).as_mut_ptr(),
-            spans: ManuallyDrop::new(Vec::with_capacity(MAX_ENDPOINTS)).as_mut_ptr(),
-            text: vec![0u8; TEXT_BYTES].leak().as_mut_ptr(),
-            used: Mutex::new((0, 0)),
+            slots: (0..SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            names: vec![0u8; MAX_ENDPOINTS * NAME_STRIDE].leak().as_mut_ptr(),
+            used: Mutex::new(0),
         }
     }
 
-    /// Compares whole names without a length-dependent loop: the masked first and last 32
-    /// bytes cover any name up to 64 bytes, and only the 6% of lines above that look further.
+    /// The id of an endpoint name, new if this is its first appearance.
     #[inline(always)]
     unsafe fn lookup(&self, name: *const u8, len: usize) -> usize {
-        let masks = MASKS.0.as_ptr();
-        let short = len.min(32);
-        let head = _mm256_and_si256(load(name), load(masks.add(64 - short)));
-        let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(masks.add(short)));
-        let mixed = _mm256_extract_epi64(tail, 3) as u64
-            ^ (_mm256_extract_epi64(tail, 1) as u64).rotate_left(13)
-            ^ (_mm256_extract_epi64(head, 1) as u64).rotate_left(29)
-            ^ len as u64;
-        let hash = mixed.wrapping_mul(0x517c_c1b7_2722_0a95);
-        let stamp = (hash >> 32) as u32 & 0xFFF00 | len as u32;
+        let hash = name_hash(name, len);
+        match self.probe(hash) {
+            Ok(id) => id,
+            Err(_) => self.insert(hash, name, len),
+        }
+    }
+
+    /// The id with this hash, or the index of the empty slot that ends its probe sequence.
+    #[inline(always)]
+    fn probe(&self, hash: u64) -> Result<usize, usize> {
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
-            let slot = self.slots.get_unchecked(i).load(Acquire);
-            if slot >> 12 == stamp {
-                let id = (slot & 0xFFF) as usize - 1;
-                let [key_head, key_tail] = *self.keys.add(id);
-                let differs = _mm256_or_si256(
-                    _mm256_xor_si256(head, key_head),
-                    _mm256_xor_si256(tail, key_tail),
-                );
-                if _mm256_testz_si256(differs, differs) == 1 && (len <= 64 || self.same(id, name)) {
-                    return id;
-                }
+            let slot = self.slots[i].load(Acquire);
+            if slot >> ID_BITS == hash >> ID_BITS {
+                return Ok((slot & ID_MASK) as usize - 1);
             } else if slot == 0 {
-                return self.insert(i, stamp, name, len, [head, tail]);
+                return Err(i);
             }
             i = (i + 1) & (SLOTS - 1);
         }
+    }
+
+    /// The name is fully written before the Release store publishes the slot, so a reader
+    /// that sees the slot sees the name.
+    #[cold]
+    unsafe fn insert(&self, hash: u64, name: *const u8, len: usize) -> usize {
+        let mut used = self.used.lock().unwrap();
+        // Another worker may have added it while this one waited for the lock.
+        let slot = match self.probe(hash) {
+            Ok(id) => return id,
+            Err(slot) => slot,
+        };
+        let id = *used;
+        assert!(id < MAX_ENDPOINTS);
+        *self.names.add(id * NAME_STRIDE) = len as u8;
+        copy_nonoverlapping(name, self.names.add(id * NAME_STRIDE + 1), len);
+        *used += 1;
+        self.slots[slot].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
+        id
     }
 
     unsafe fn name(&self, id: usize) -> &[u8] {
-        let (offset, len) = *self.spans.add(id);
-        std::slice::from_raw_parts(self.text.add(offset as usize), len as usize)
-    }
-
-    unsafe fn same(&self, id: usize, name: *const u8) -> bool {
-        let known = self.name(id);
-        known == std::slice::from_raw_parts(name, known.len())
-    }
-
-    /// The key is fully written before the Release store publishes the slot, so a reader
-    /// that sees the slot sees the key.
-    #[cold]
-    unsafe fn insert(
-        &self,
-        mut i: usize,
-        stamp: u32,
-        name: *const u8,
-        len: usize,
-        key: [__m256i; 2],
-    ) -> usize {
-        let mut used = self.used.lock().unwrap();
-        loop {
-            let slot = self.slots[i].load(Relaxed);
-            if slot == 0 {
-                break;
-            }
-            let id = (slot & 0xFFF) as usize - 1;
-            if slot >> 12 == stamp && self.name(id).len() == len && self.same(id, name) {
-                return id; // another worker got here while this one waited for the lock
-            }
-            i = (i + 1) & (SLOTS - 1);
-        }
-        let (id, offset) = *used;
-        assert!(id < MAX_ENDPOINTS && offset + len + 64 < TEXT_BYTES);
-        copy_nonoverlapping(name, self.text.add(offset), len);
-        self.keys.add(id).write(key);
-        self.spans.add(id).write((offset as u32, len as u32));
-        *used = (id + 1, offset + len);
-        self.slots[i].store(stamp << 12 | (id + 1) as u32, Release);
-        id
+        let at = self.names.add(id * NAME_STRIDE);
+        std::slice::from_raw_parts(at.add(1), *at as usize)
     }
 
     /// Ids in output order. A &[u8] orders as unsigned bytes with a proper prefix first.
     fn sorted_ids(&self) -> Vec<u16> {
-        let count = self.used.lock().unwrap().0;
+        let count = *self.used.lock().unwrap();
         let mut ids: Vec<u16> = (0..count as u16).collect();
         ids.sort_unstable_by(|&a, &b| unsafe { self.name(a as usize).cmp(self.name(b as usize)) });
         ids
@@ -350,7 +356,11 @@ impl Run {
             // torn down by one thread at exit, which cost about 7 ms on the scoring kernel.
             // A later read of this range, by the next claim's first line, refaults the same
             // bytes, because the mapping is a read-only private file mapping.
-            madvise(input.add(claim) as *mut u8, CLAIM.min(mapped_end - claim), MADV_DONTNEED);
+            madvise(
+                input.add(claim) as *mut u8,
+                CLAIM.min(mapped_end - claim),
+                MADV_DONTNEED,
+            );
         }
     }
 
