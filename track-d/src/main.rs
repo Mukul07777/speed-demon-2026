@@ -39,7 +39,7 @@ const MADV_NOHUGEPAGE: i32 = 15;
 const MADV_POPULATE_READ: i32 = 22;
 
 const CLAIM: usize = 1 << 20;
-const SHARD_SHIFT: u32 = 10;
+const SHARD_SHIFT: u32 = 13; // few enough shards that a worker's write positions stay in L1
 const SHARD_NODES: usize = 1 << SHARD_SHIFT;
 const SHARD_ROWS: usize = SHARD_NODES * 16; // every node has fewer than 16 light edges
 const CHUNK_ROWS: usize = 64;
@@ -49,9 +49,14 @@ const DEGREE_MASK: u32 = 15;
 const HEAVY_FLAG: u32 = 16;
 const START_SHIFT: u32 = 5;
 const CELL: usize = 1 << 10;
-const BLOCK_SHIFT: u32 = 10; // distances live in blocks of this many neighbouring nodes
+const SEEDS_KEPT: usize = 32; // of a finished cell's queue
+const FAR_AHEAD: usize = 12; // queue entries ahead to prefetch a node
+const NEAR_AHEAD: usize = 6; // queue entries ahead to prefetch its edges
+const REWRITE_BATCH: usize = 32; // nodes translated together, after prefetching
+const BLOCK_SHIFT: u32 = 6; // distances live in blocks of this many neighbouring nodes
 const BLOCK_NODES: usize = 1 << BLOCK_SHIFT;
-const NODE_BITS: u32 = 21; // heap keys are distance << 21 | node
+const WINDOW: usize = 1 << WEIGHT_BITS; // light edges reach at most this far ahead
+const WINDOW_WORDS: usize = WINDOW / 64;
 const LABEL_SHIFT: u32 = 26; // a claimed node is (worker + 1) << 26 | position in its order
 const UNREACHED: u64 = u64::MAX;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
@@ -93,14 +98,9 @@ impl Rows {
         }
     }
 
-    unsafe fn release(&self, shard: usize) {
-        let bytes = self.claimed[shard].load(Relaxed) * size_of::<Row>();
-        let start = self.rows.add(shard * SHARD_ROWS) as usize;
-        let first = start / 4096 * 4096; // the shard before may end in this page
-        let whole = (start + bytes) / 4096 * 4096;
-        if whole > first + 4096 {
-            madvise((first + 4096) as *mut u8, whole - first - 4096, MADV_DONTNEED);
-        }
+    unsafe fn release(&self) {
+        let bytes = self.claimed.len() * SHARD_ROWS * size_of::<Row>();
+        madvise(self.rows.cast(), bytes, MADV_DONTNEED);
     }
 }
 
@@ -135,14 +135,19 @@ impl Writer {
 struct Graph {
     nodes: *mut u32,
     edges: *mut u32,
+    node_count: usize,
+    edge_bytes: usize,
     next_edge: AtomicUsize,
 }
 
 impl Graph {
-    unsafe fn new(nodes: usize, edges: usize) -> Graph {
+    unsafe fn new(node_count: usize, edge_count: usize) -> Graph {
+        let edge_bytes = edge_count * 4 + 4096;
         Graph {
-            nodes: reserve(nodes * 4, MADV_HUGEPAGE).cast(),
-            edges: reserve(edges * 4 + 4096, MADV_HUGEPAGE).cast(),
+            nodes: reserve(node_count * 4, MADV_HUGEPAGE).cast(),
+            edges: reserve(edge_bytes, MADV_HUGEPAGE).cast(),
+            node_count,
+            edge_bytes,
             next_edge: AtomicUsize::new(0),
         }
     }
@@ -154,7 +159,12 @@ impl Graph {
         std::slice::from_raw_parts(self.edges.add(start), (entry & DEGREE_MASK) as usize)
     }
 
-    /// Fills in one shard of nodes from its rows, then gives the rows' memory back.
+    unsafe fn release(&self) {
+        madvise(self.nodes.cast(), self.node_count * 4, MADV_DONTNEED);
+        madvise(self.edges.cast(), self.edge_bytes, MADV_DONTNEED);
+    }
+
+    /// Fills in one shard of nodes from its rows.
     unsafe fn build_shard(&self, rows: &Rows, shard: usize) {
         let mut degree = [0u32; SHARD_NODES];
         rows.each(shard, |row| degree[row.low as usize] += 1);
@@ -166,7 +176,7 @@ impl Graph {
             at[low] = next;
             assert!(degree[low] <= DEGREE_MASK);
             let node = (shard << SHARD_SHIFT) + low;
-            if node < self.limit() {
+            if node < self.node_count {
                 *self.nodes.add(node) = next << START_SHIFT | degree[low];
             }
             next += degree[low];
@@ -176,14 +186,8 @@ impl Graph {
             *self.edges.add(*slot as usize) = row.packed - (1 << WEIGHT_BITS);
             *slot += 1;
         });
-        rows.release(shard);
-    }
-
-    fn limit(&self) -> usize {
-        NODES.load(Relaxed)
     }
 }
-static NODES: AtomicUsize = AtomicUsize::new(0);
 
 /// Anonymous memory that costs nothing until it is touched.
 unsafe fn reserve(bytes: usize, advice: i32) -> *mut u8 {
@@ -240,8 +244,7 @@ struct Run {
     next_claim: AtomicUsize,
     next_job: AtomicUsize,
     step: Barrier,
-    rows_out: Rows,
-    rows_in: Rows,
+    rows: Rows,
     raw: Graph,
     forward: Graph,
     backward: Graph,
@@ -290,7 +293,7 @@ impl Run {
                 let w = number_before(line.add(third), third - second - 1);
                 at += third + 1;
                 if w < LIGHT {
-                    writer.push(&self.rows_out, u, v, w);
+                    writer.push(&self.rows, u, v, w);
                 } else {
                     heavy.push((u as u32, v as u32, w as u32));
                 }
@@ -310,21 +313,21 @@ impl Run {
         }
     }
 
-    /// Everyone waits; one worker resets the shared job counter.
-    fn next_step(&self) {
+    /// Everyone waits; one worker does `alone` and resets the shared job counter.
+    fn next_step(&self, alone: impl FnOnce()) {
         if self.step.wait().is_leader() {
+            alone();
             self.next_job.store(0, Relaxed);
         }
         self.step.wait();
     }
 
-    unsafe fn claim_node(&self, node: usize, value: u32) -> bool {
-        (*self.labels.add(node)).compare_exchange(0, value, Relaxed, Relaxed).is_ok()
-    }
-
-    /// Grows cells: a breadth-first search from one seed that stops at CELL nodes. What is
-    /// left of its queue becomes seeds, newest first, so that the next cell starts next door
-    /// and neighbouring cells land near each other in the numbering.
+    /// Grows cells: a breadth-first search from one seed that stops at CELL nodes. The end of
+    /// its queue becomes seeds, newest first, so that the next cell starts next door and
+    /// neighbouring cells land near each other in the numbering.
+    ///
+    /// With random ids a node's entry, its edges and its label are three cache misses. The
+    /// queue says what comes next, so each is prefetched in turn before it is needed.
     unsafe fn grow_cells(&self, worker: usize) -> (Vec<u32>, usize) {
         let mut order: Vec<u32> = Vec::with_capacity(2 * self.nodes / self.threads);
         let mut seeds: Vec<u32> = Vec::new();
@@ -353,27 +356,29 @@ impl Run {
             queue.push(seed as u32);
             let (mut head, mut size) = (0, 0);
             while head < queue.len() && size < CELL {
-                if head + 8 < queue.len() {
-                    let ahead = *queue.get_unchecked(head + 8) as usize;
-                    _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(ahead).cast());
+                if let Some(&ahead) = queue.get(head + FAR_AHEAD) {
+                    _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(ahead as usize).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(self.labels.add(ahead as usize).cast());
+                }
+                if let Some(&ahead) = queue.get(head + NEAR_AHEAD) {
+                    let start = *self.raw.nodes.add(ahead as usize) >> START_SHIFT;
+                    _mm_prefetch::<_MM_HINT_T0>(self.raw.edges.add(start as usize).cast());
                 }
                 let node = queue[head] as usize;
                 head += 1;
+                let label = &*self.labels.add(node);
                 let value = ((worker as u32 + 1) << LABEL_SHIFT) | order.len() as u32;
-                if !self.claim_node(node, value) {
+                if label.load(Relaxed) != 0 || label.compare_exchange(0, value, Relaxed, Relaxed).is_err() {
                     continue;
                 }
                 order.push(node as u32);
                 size += 1;
-                for &edge in self.raw.edges_of(node) {
-                    let head_node = edge >> WEIGHT_BITS;
-                    if (*self.labels.add(head_node as usize)).load(Relaxed) == 0 {
-                        queue.push(head_node);
-                    }
-                }
-                edges += self.raw.edges_of(node).len();
+                let neighbours = self.raw.edges_of(node);
+                edges += neighbours.len();
+                queue.extend(neighbours.iter().map(|&edge| edge >> WEIGHT_BITS));
             }
-            seeds.extend_from_slice(&queue[head..]);
+            let kept = queue.len().saturating_sub(SEEDS_KEPT).max(head);
+            seeds.extend_from_slice(&queue[kept..]);
         }
         (order, edges)
     }
@@ -406,25 +411,59 @@ impl Run {
         Layout { node_base, edge_base, queries, heavy_out, heavy_in }
     }
 
+    /// Translates every edge head to its new id, which is a random lookup per edge. Working
+    /// in small batches lets each one prefetch all it will touch before it touches it.
     unsafe fn rewrite_forward(&self, worker: usize, order: &[u32], layout: &Layout) {
-        let first_id = layout.node_base[worker] as usize;
+        let mut id = layout.node_base[worker] as usize;
         let mut at = layout.edge_base[worker];
-        for (i, &old) in order.iter().enumerate() {
-            let edges = self.raw.edges_of(old as usize);
-            *self.forward.nodes.add(first_id + i) = (at as u32) << START_SHIFT | edges.len() as u32;
-            for &edge in edges {
-                let head = self.new_id(&layout.node_base, (edge >> WEIGHT_BITS) as usize);
-                *self.forward.edges.add(at) = head << WEIGHT_BITS | (edge & (LIGHT as u32 - 1));
-                at += 1;
+        for batch in order.chunks(REWRITE_BATCH) {
+            for &old in batch {
+                _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(old as usize).cast());
+            }
+            for &old in batch {
+                let start = *self.raw.nodes.add(old as usize) >> START_SHIFT;
+                _mm_prefetch::<_MM_HINT_T0>(self.raw.edges.add(start as usize).cast());
+            }
+            for &old in batch {
+                for &edge in self.raw.edges_of(old as usize) {
+                    let head = (edge >> WEIGHT_BITS) as usize;
+                    _mm_prefetch::<_MM_HINT_T0>(self.labels.add(head).cast());
+                }
+            }
+            for &old in batch {
+                let edges = self.raw.edges_of(old as usize);
+                *self.forward.nodes.add(id) = (at as u32) << START_SHIFT | edges.len() as u32;
+                id += 1;
+                for &edge in edges {
+                    let head = self.new_id(&layout.node_base, (edge >> WEIGHT_BITS) as usize);
+                    *self.forward.edges.add(at) = head << WEIGHT_BITS | (edge & (LIGHT as u32 - 1));
+                    at += 1;
+                    (*self.backward.nodes.add(head as usize).cast::<AtomicU32>()).fetch_add(1, Relaxed);
+                }
             }
         }
     }
 
-    unsafe fn emit_reverse(&self, range: std::ops::Range<usize>, writer: &mut Writer) {
-        for node in range {
+    /// Turns the in-degree counts into entries that point just past each node's edges.
+    unsafe fn lay_out_backward(&self) {
+        let mut end = 0u32;
+        for node in 0..self.nodes {
+            let entry = self.backward.nodes.add(node);
+            assert!(*entry <= DEGREE_MASK);
+            end += *entry;
+            *entry |= end << START_SHIFT;
+        }
+    }
+
+    /// Each edge takes the slot below its head's end, and the entry ends up at its start.
+    unsafe fn fill_backward(&self, nodes: std::ops::Range<usize>) {
+        for node in nodes {
             for &edge in self.forward.edges_of(node) {
                 let head = (edge >> WEIGHT_BITS) as usize;
-                writer.push(&self.rows_in, head, node, (edge & (LIGHT as u32 - 1)) as u64);
+                let entry = &*self.backward.nodes.add(head).cast::<AtomicU32>();
+                let slot = (entry.fetch_sub(1 << START_SHIFT, Relaxed) >> START_SHIFT) - 1;
+                let weight = edge & (LIGHT as u32 - 1);
+                *self.backward.edges.add(slot as usize) = (node as u32) << WEIGHT_BITS | weight;
             }
         }
     }
@@ -438,30 +477,32 @@ impl Run {
     unsafe fn work(&self, worker: usize) {
         let mut writer = Writer::new(self.shards);
         self.parse(&mut writer);
-        self.next_step();
-        self.each_job(self.shards, |shard| self.raw.build_shard(&self.rows_out, shard));
-        self.next_step();
+        self.next_step(|| {});
+        self.each_job(self.shards, |shard| self.raw.build_shard(&self.rows, shard));
+        self.next_step(|| self.rows.release());
         let (order, edges) = self.grow_cells(worker);
         self.claimed.lock().unwrap().push((worker, order.len(), edges));
-        self.next_step();
-        let layout = self.layout.get_or_init(|| self.plan_layout());
+        self.next_step(|| {
+            let _ = self.layout.set(self.plan_layout());
+        });
+        let layout = self.layout.get().unwrap();
         self.rewrite_forward(worker, &order, layout);
-        self.next_step();
         let first_id = layout.node_base[worker] as usize;
-        let mut writer = Writer::new(self.shards);
-        self.emit_reverse(first_id..first_id + order.len(), &mut writer);
+        let own_nodes = first_id..first_id + order.len();
         drop(order);
-        self.next_step();
-        self.each_job(self.shards, |shard| self.backward.build_shard(&self.rows_in, shard));
-        if self.step.wait().is_leader() {
+        self.next_step(|| {
+            self.raw.release();
+            madvise(self.labels.cast(), self.nodes * 4, MADV_DONTNEED);
+            self.lay_out_backward();
+        });
+        self.fill_backward(own_nodes);
+        self.next_step(|| {
             self.mark_heavy(&self.forward, &layout.heavy_out);
             self.mark_heavy(&self.backward, &layout.heavy_in);
-            self.next_job.store(0, Relaxed);
-        }
-        self.step.wait();
+        });
 
-        let mut forward = Side::new(self.nodes);
-        let mut backward = Side::new(self.nodes);
+        let mut forward = Side::new(&self.forward);
+        let mut backward = Side::new(&self.backward);
         self.each_job(layout.queries.len(), |index| {
             let (s, t) = layout.queries[index];
             let distance = self.answer(s as usize, t as usize, layout, &mut forward, &mut backward);
@@ -469,7 +510,6 @@ impl Run {
         });
     }
 
-    #[inline(never)]
     unsafe fn answer(
         &self,
         s: usize,
@@ -481,22 +521,22 @@ impl Run {
         if s == t {
             return 0;
         }
-        forward.start(s);
-        backward.start(t);
+        forward.relax(s, 0);
+        backward.relax(t, 0);
         let mut best = UNREACHED;
         // When a side runs dry it has settled everything it can reach, so any path was seen.
-        while let (Some(&Reverse(f)), Some(&Reverse(b))) = (forward.heap.peek(), backward.heap.peek()) {
-            if (f >> NODE_BITS) + (b >> NODE_BITS) >= best {
+        while forward.queue.advance() && backward.queue.advance() {
+            if forward.queue.now + backward.queue.now >= best {
                 break;
             }
-            let forward_turn = forward.heap.len() <= backward.heap.len();
+            let forward_turn = forward.queue.live <= backward.queue.live;
             let (side, other, graph, heavy) = if forward_turn {
                 (&mut *forward, &mut *backward, &self.forward, &layout.heavy_out)
             } else {
                 (&mut *backward, &mut *forward, &self.backward, &layout.heavy_in)
             };
-            let Reverse(key) = side.heap.pop().unwrap();
-            let (distance, node) = (key >> NODE_BITS, (key & ((1 << NODE_BITS) - 1)) as usize);
+            let distance = side.queue.now;
+            let node = side.queue.pop();
             if distance > side.get(node) {
                 continue;
             }
@@ -504,20 +544,148 @@ impl Run {
             if met != UNREACHED {
                 best = best.min(distance + met);
             }
+            // A label at or past this limit cannot be part of a better path unless the
+            // other side has already settled that node, which `reach` checks instead.
+            let limit = best.saturating_sub(other.queue.now);
             for &edge in graph.edges_of(node) {
                 let weight = (edge & (LIGHT as u32 - 1)) as u64;
-                side.relax((edge >> WEIGHT_BITS) as usize, distance + weight);
+                side.reach((edge >> WEIGHT_BITS) as usize, distance + weight, limit, other, &mut best);
             }
             if *graph.nodes.add(node) & HEAVY_FLAG != 0 {
                 let from = heavy.partition_point(|h| (h.0 as usize) < node);
                 for &(_, head, weight) in heavy[from..].iter().take_while(|h| h.0 as usize == node) {
-                    side.relax(head as usize, distance + weight as u64);
+                    side.reach(head as usize, distance + weight as u64, limit, other, &mut best);
                 }
             }
         }
         forward.finish();
         backward.finish();
         best
+    }
+}
+
+/// A monotone bucket queue. A light edge reaches less than WINDOW ahead, so every live key
+/// sits in a circular window of exact distances, and popping is finding the next set bit,
+/// with none of a heap's unpredictable comparisons. Heavy edges wait in `far`.
+struct Queue {
+    heads: Vec<u32>, // item index + 1, per bucket
+    occupied: [u64; WINDOW_WORDS],
+    items: Vec<(u32, u32)>, // node, and the next item in its bucket
+    far: BinaryHeap<Reverse<(u64, u32)>>,
+    now: u64,
+    live: usize,
+}
+
+impl Queue {
+    fn new() -> Queue {
+        Queue {
+            heads: vec![0; WINDOW],
+            occupied: [0; WINDOW_WORDS],
+            items: Vec::new(),
+            far: BinaryHeap::new(),
+            now: 0,
+            live: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, distance: u64, node: usize) {
+        self.live += 1;
+        if distance - self.now >= WINDOW as u64 {
+            self.far.push(Reverse((distance, node as u32)));
+            return;
+        }
+        let bucket = distance as usize & (WINDOW - 1);
+        self.items.push((node as u32, self.heads[bucket]));
+        self.heads[bucket] = self.items.len() as u32;
+        self.occupied[bucket / 64] |= 1 << (bucket % 64);
+    }
+
+    /// Moves `now` to the smallest key, and says whether there is one.
+    #[inline(always)]
+    fn advance(&mut self) -> bool {
+        loop {
+            if !self.far.is_empty() {
+                self.bring_far_keys_in();
+            }
+            let from = self.now as usize & (WINDOW - 1);
+            let word = from / 64;
+            let here = self.occupied[word] >> (from % 64);
+            if here != 0 {
+                self.now += here.trailing_zeros() as u64;
+                return true;
+            }
+            if let Some(steps) = self.next_bucket(from) {
+                self.now += steps as u64;
+                continue;
+            }
+            match self.far.pop() {
+                Some(Reverse((distance, node))) => {
+                    self.now = distance;
+                    self.live -= 1;
+                    self.push(distance, node as usize);
+                }
+                None => return false,
+            }
+        }
+    }
+
+    /// How far ahead of `from` the next occupied bucket lies, looking past its own word.
+    #[inline(never)]
+    fn next_bucket(&self, from: usize) -> Option<usize> {
+        let word = from / 64;
+        for step in 1..=WINDOW_WORDS {
+            let index = (word + step) % WINDOW_WORDS;
+            let mut bits = self.occupied[index];
+            if step == WINDOW_WORDS {
+                bits &= (1 << (from % 64)) - 1; // back at the start, below `from` only
+            }
+            if bits != 0 {
+                let bucket = index * 64 + bits.trailing_zeros() as usize;
+                return Some((bucket + WINDOW - from) % WINDOW);
+            }
+        }
+        None
+    }
+
+    #[cold]
+    fn bring_far_keys_in(&mut self) {
+        while let Some(&Reverse((distance, node))) = self.far.peek() {
+            if distance - self.now >= WINDOW as u64 {
+                return;
+            }
+            self.far.pop();
+            self.live -= 1;
+            self.push(distance, node as usize);
+        }
+    }
+
+    /// Takes a node from the bucket `advance` found.
+    #[inline(always)]
+    fn pop(&mut self) -> usize {
+        let bucket = self.now as usize & (WINDOW - 1);
+        let item = self.heads[bucket] as usize - 1;
+        let (node, next) = self.items[item];
+        self.heads[bucket] = next;
+        if next == 0 {
+            self.occupied[bucket / 64] &= !(1 << (bucket % 64));
+        }
+        self.live -= 1;
+        node as usize
+    }
+
+    fn clear(&mut self) {
+        for word in 0..WINDOW_WORDS {
+            while self.occupied[word] != 0 {
+                let bit = self.occupied[word].trailing_zeros() as usize;
+                self.heads[word * 64 + bit] = 0;
+                self.occupied[word] &= self.occupied[word] - 1;
+            }
+        }
+        self.items.clear();
+        self.far.clear();
+        self.now = 0;
+        self.live = 0;
     }
 }
 
@@ -529,22 +697,22 @@ struct Side {
     distances: Vec<u64>,
     used: usize,
     touched: Vec<u32>,
-    heap: BinaryHeap<Reverse<u64>>,
+    queue: Queue,
+    graph: *const u32,
+    edges: *const u32,
 }
 
 impl Side {
-    fn new(nodes: usize) -> Side {
+    fn new(graph: &Graph) -> Side {
         Side {
-            blocks: vec![0; (nodes >> BLOCK_SHIFT) + 1],
+            blocks: vec![0; (graph.node_count >> BLOCK_SHIFT) + 1],
             distances: Vec::new(),
             used: 0,
             touched: Vec::new(),
-            heap: BinaryHeap::new(),
+            queue: Queue::new(),
+            graph: graph.nodes,
+            edges: graph.edges,
         }
-    }
-
-    fn start(&mut self, node: usize) {
-        self.relax(node, 0);
     }
 
     fn finish(&mut self) {
@@ -553,7 +721,7 @@ impl Side {
         }
         self.touched.clear();
         self.used = 0;
-        self.heap.clear();
+        self.queue.clear();
     }
 
     #[inline(always)]
@@ -578,7 +746,24 @@ impl Side {
         let known = unsafe { self.distances.get_unchecked_mut(at) };
         if distance < *known {
             *known = distance;
-            self.heap.push(Reverse(distance << NODE_BITS | node as u64));
+            self.queue.push(distance, node);
+            // The edges of a new label are read soon, and the graph is too big for the cache.
+            unsafe {
+                let start = *self.graph.add(node) >> START_SHIFT;
+                _mm_prefetch::<_MM_HINT_T1>(self.edges.add(start as usize).cast());
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn reach(&mut self, node: usize, distance: u64, limit: u64, other: &Side, best: &mut u64) {
+        if distance < limit {
+            self.relax(node, distance);
+        } else {
+            let met = other.get(node);
+            if met != UNREACHED {
+                *best = (*best).min(distance + met);
+            }
         }
     }
 
@@ -620,7 +805,6 @@ fn main() {
         let mut words = header[..line_end].split(|&c| c == b' ');
         let mut number = || words.next().unwrap().iter().fold(0, |v, &d| v * 10 + (d - b'0') as usize);
         let (nodes, edges) = (number(), number());
-        NODES.store(nodes, Relaxed);
         let shards = (nodes >> SHARD_SHIFT) + 1;
         Run {
             text,
@@ -631,8 +815,7 @@ fn main() {
             next_claim: AtomicUsize::new(0),
             next_job: AtomicUsize::new(0),
             step: Barrier::new(threads),
-            rows_out: Rows::new(shards),
-            rows_in: Rows::new(shards),
+            rows: Rows::new(shards),
             raw: Graph::new(nodes, edges),
             forward: Graph::new(nodes, edges),
             backward: Graph::new(nodes, edges),
