@@ -760,10 +760,6 @@ impl Run {
         }
         if self.step.wait().is_leader() {
             self.count_bitmaps();
-            // Postings and bitmaps are on their huge pages by now. The answer phase only grows
-            // each thread's heap, and where the kernel backs every region with huge pages
-            // those growing heaps would be charged 2 MiB at a time.
-            prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
             self.next_job.store(0, Relaxed);
         }
         self.step.wait();
@@ -1034,13 +1030,26 @@ unsafe fn intern(run: &mut Run, hash: u64) -> u32 {
     }
 }
 
-unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
-    let text = bytes.as_ptr();
-    let size = bytes.len() - 64;
-    let mut at = 0;
-    while at < size {
+/// The words of a run of queries, hashed but not yet interned. `marks` holds, per word, its
+/// operator, and flags for the last word of a query and for a phrase.
+struct Hashed {
+    hashes: Vec<u64>,
+    marks: Vec<u8>,
+}
+
+const LAST_WORD: u8 = 4;
+const IN_PHRASE: u8 = 8;
+
+/// Hashes every word of the queries in `bytes[from..to]`, which start and end at lines. This
+/// part needs no shared state, so several threads split the file.
+unsafe fn hash_queries(text: *const u8, from: usize, to: usize) -> Hashed {
+    let mut found = Hashed {
+        hashes: Vec::with_capacity((to - from) / 6 + 8),
+        marks: Vec::with_capacity((to - from) / 6 + 8),
+    };
+    let mut at = from;
+    while at < to {
         let phrase = *text.add(at) == b'P';
-        let (first, first_word) = (run.steps.len() as u32, run.words.len() as u32);
         at += if phrase { 8 } else { 5 }; // past `PHRASE "` or `BOOL `
         let mut op = Op::And;
         loop {
@@ -1049,18 +1058,14 @@ unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
             while *text.add(at) >= b'0' {
                 at += 1;
             }
-            let hash = hash_of(text.add(word), at - word);
-            let term = intern(run, hash);
-            if phrase {
-                run.words.push(hash);
-                run.word_terms.push(term);
-            } else {
-                (*run.terms.add(term as usize)).in_bool = true;
-                run.steps.push((op, term));
-            }
+            found.hashes.push(hash_of(text.add(word), at - word));
             let stop = *text.add(at);
             at += 1;
-            if stop != b' ' {
+            let last = stop != b' ';
+            found
+                .marks
+                .push(op as u8 | (last as u8) * LAST_WORD | (phrase as u8) * IN_PHRASE);
+            if last {
                 at += phrase as usize; // the newline after the closing quote
                 break;
             }
@@ -1072,7 +1077,31 @@ unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
                 };
             }
         }
-        if phrase {
+    }
+    found
+}
+
+/// Interns the hashed words in query order and appends the queries to `run`. The table is one
+/// cache line per bucket and mostly cold, so each bucket is prefetched a few words ahead.
+unsafe fn add_queries(run: &mut Run, found: &Hashed) {
+    let (mut first, mut first_word) = (run.steps.len() as u32, run.words.len() as u32);
+    for (at, (&hash, &mark)) in found.hashes.iter().zip(&found.marks).enumerate() {
+        if let Some(&later) = found.hashes.get(at + 8) {
+            _mm_prefetch::<_MM_HINT_T0>(run.buckets.add(bucket_of(later)).cast());
+        }
+        let term = intern(run, hash);
+        if mark & IN_PHRASE != 0 {
+            run.words.push(hash);
+            run.word_terms.push(term);
+        } else {
+            (*run.terms.add(term as usize)).in_bool = true;
+            let op = [Op::And, Op::Or, Op::Not][(mark & 3) as usize];
+            run.steps.push((op, term));
+        }
+        if mark & LAST_WORD == 0 {
+            continue;
+        }
+        if mark & IN_PHRASE != 0 {
             let term = run.term_count as u32;
             let len = run.words.len() as u32 - first_word;
             run.term_count += 1;
@@ -1088,7 +1117,39 @@ unsafe fn parse_queries(run: &mut Run, bytes: &[u8]) {
         }
         let len = run.steps.len() as u32 - first;
         run.queries.push(Query { first, len });
+        (first, first_word) = (run.steps.len() as u32, run.words.len() as u32);
     }
+}
+
+/// Reads the query file: threads hash its words in parallel, and this one interns them in file
+/// order, each part as soon as its thread is done.
+unsafe fn parse_queries(run: &mut Run, bytes: &[u8], threads: usize) {
+    let text = bytes.as_ptr() as usize;
+    let size = bytes.len() - 64;
+    // Part `k` starts at the first line start at or after `k / parts` of the file.
+    let parts = threads.min(6);
+    let start = |k: usize| match k * size / parts {
+        0 => 0,
+        at => bytes[at - 1..size]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(size, |n| at + n),
+    };
+    let bounds: Vec<usize> = (0..=parts)
+        .map(|k| if k == parts { size } else { start(k) })
+        .collect();
+    thread::scope(|s| {
+        let handles: Vec<_> = (1..parts)
+            .map(|k| {
+                let (from, to) = (bounds[k], bounds[k + 1]);
+                s.spawn(move || hash_queries(text as *const u8, from, to))
+            })
+            .collect();
+        add_queries(run, &hash_queries(text as *const u8, 0, bounds[1]));
+        for handle in handles {
+            add_queries(run, &handle.join().unwrap());
+        }
+    });
 }
 
 fn main() {
@@ -1144,12 +1205,24 @@ fn main() {
             parts: Mutex::new(Vec::new()),
         }
     };
+    // Huge pages are wanted for the bucket table alone: touch it so it is faulted in as one,
+    // then forbid them. Where the kernel gives every region huge pages (THP `always`), thread
+    // stacks, heaps and the half-used postings and bitmaps would otherwise each be charged 2 MiB
+    // a page; four-kilobyte pages on those cost a few extra faults and nothing more.
+    unsafe {
+        run.buckets.cast::<u8>().write_volatile(0);
+        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
     // Mapped rather than read: a few fault-arounds instead of a copy into fresh pages. The
     // 64 bytes past the end that the parser may look at are zeros, from the page's tail or
     // from the spare page `map_file` leaves.
     unsafe {
         let text = map_file(&queries, query_len);
-        parse_queries(&mut run, std::slice::from_raw_parts(text, query_len + 64));
+        parse_queries(
+            &mut run,
+            std::slice::from_raw_parts(text, query_len + 64),
+            threads,
+        );
     }
     let batches = run.queries.len().div_ceil(QUERY_BATCH);
     *run.parts.lock().unwrap() = vec![Vec::new(); batches];

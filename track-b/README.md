@@ -25,3 +25,5 @@ None.
 ## With another 24 hours
 
 Tokenising is now the largest part of the scan, so finish token ends and starts in one array. Then look at the 230 ms of CPU the BOOL queries take.
+
+**Query parsing and huge pages.** The query file is split at line starts; threads hash their share's words in parallel and the main thread interns each share in file order, prefetching buckets, because interning touches shared state and must keep query order. Transparent huge pages are forbidden from the start with `PR_SET_THP_DISABLE`, after the bucket table is touched so that table alone keeps its huge page. On a kernel with THP `always` every other region would otherwise be backed 2 MiB at a time, which charges memory for pages that are mostly empty. The effect on the scoring box is unmeasured at the time of writing; the laptop showed 3 MiB less and no slowdown.
