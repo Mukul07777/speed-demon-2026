@@ -12,6 +12,7 @@
 //!    the next hour ready writes it, so the output overlaps the work instead of following it.
 //!
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
+include!("probe.rs");
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -455,8 +456,11 @@ impl Run {
     }
 
     fn work(&self) {
+        probe::stamp(0);
         unsafe { self.parse() };
+        probe::stamp(1);
         self.finished_parsing.wait();
+        probe::stamp(2);
         let order = self.order.get_or_init(|| self.catalogue.sorted_ids());
         let size = order.len() + 2;
         let mut tables = Tables {
@@ -476,8 +480,10 @@ impl Run {
                 self.flush(&mut output);
             }
         }
+        probe::stamp(3);
         // The last worker here sees every part, whoever held the lock when it was stored.
         self.flush(&mut self.output.lock().unwrap());
+        probe::stamp(4);
     }
 }
 
@@ -534,6 +540,7 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
+    probe::begin();
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -591,4 +598,5 @@ fn main() {
         }
         run.work();
     });
+    probe::report("");
 }

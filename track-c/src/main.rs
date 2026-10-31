@@ -19,6 +19,7 @@
 //!
 //! Each record then sets its name's bit in its country's row of one shared bit matrix, and
 //! popcounts of the rows give the distinct names.
+include!("probe.rs");
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -501,9 +502,13 @@ impl Run {
     }
 
     fn work(&self) {
+        probe::stamp(0);
         unsafe { self.parse_regions() };
+        probe::stamp(1);
         self.regions_done.wait();
+        probe::stamp(2);
         unsafe { self.parse_records() };
+        probe::stamp(3);
     }
 }
 
@@ -560,6 +565,7 @@ unsafe fn zeroed<T>(count: usize) -> *mut T {
 }
 
 fn main() {
+    probe::begin();
     let records = File::open("/data/records.csv").unwrap();
     let regions = File::open("/data/regions.csv").unwrap();
     let records_len = records.metadata().unwrap().len() as usize;
@@ -594,6 +600,7 @@ fn main() {
         }
         run.work();
     });
+    probe::stamp(4);
 
     let mut totals = run.totals.lock().unwrap();
     for (group, total) in totals.iter_mut().enumerate() {
@@ -634,4 +641,5 @@ fn main() {
         .unwrap()
         .write_all(out.as_bytes())
         .unwrap();
+    probe::report("");
 }
