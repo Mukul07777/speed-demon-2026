@@ -100,3 +100,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Failed (2026-11-01, tools/wt_b22).** Lookup loop rewritten with pointer cursors after reading the assembly (34 instructions per token): 97.2/145.8 -> 101.2/151.3 and 105.3/125.1 -> 108.8/125.9 ms, slower. Counted, not built: multiply hash for tokens up to 8 bytes (80% of tokens, 1-2%), sample overlapped with query parse (0.5-1 ms, about 40 lines).
 
 **Failed (2026-11-01, tools/wt_b23): exact 8-byte keys for short tokens.** Exact, peak 43 MiB, but best/median 73.7/77.7 -> 82.3/88.6 ms: the fused loop became four passes and a second 2 MB table added cache pressure.
+
+**Failed (2026-11-01): heavy threshold 1/48 instead of 1/32.** `run-b49051bb725e` 97.7 ms against 97.4 ms for the base in the neighbouring round: no gain, 1/32 stays.

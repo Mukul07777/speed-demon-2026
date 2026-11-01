@@ -690,7 +690,7 @@ impl Run {
                 } else if !term.in_bool {
                     *action = 0;
                 // A term in 1/32 of the sample's documents is cheaper as a bitmap.
-                } else if self.sample[id].load(Relaxed) as usize * 48 >= docs {
+                } else if self.sample[id].load(Relaxed) as usize * 32 >= docs {
                     let heavy = self.setup[3].fetch_add(1, Relaxed);
                     if heavy < MAX_HEAVY {
                         *action = HEAVY | heavy as u32;
