@@ -447,7 +447,7 @@ impl Run {
         // Out of claims: what is left is hours that wait for the last claims in flight.
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            thread::yield_now();
+            thread::sleep(std::time::Duration::from_micros(20));
         }
     }
 }
