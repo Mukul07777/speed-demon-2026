@@ -64,3 +64,9 @@ Box verdict on the futex barrier: 98daaff 103.0 ms and 12a83cd 101.5 ms (`run-f6
 ## Heavy bitmaps by 64-document transpose (2026-11-01)
 
 The lookup loop now stores only each token's heavy bitmap index. Each document's heavy terms are ORed into a row of bits that stays in L1, and every 64 documents a 64x64 bit transpose moves the rows into the phase's bitmaps. Removing the pass entirely (timing probe) showed a 7% ceiling. Counts rejected two other ideas: skipping non-query tokens (79% of tokens are query terms) and a direct table for 1-3 character tokens (1-2% ceiling). Paired 30 rounds, median ms: 12 CPUs 81.1->78.5 and 76.2->72.2, cpuset 0-5 97.1->91.1 and 98.1->93.0. Peak unchanged, S +54. Run ID: pending board.
+
+## Peak memory 41 -> 26 MiB (2026-11-01)
+
+Peak breakdown of about 42 MB: rows 11.4, postings 4.9, bitmaps 4.7, malloc arenas 5.4, tallies 2.8, bucket table 2.0, terms 1.5, workspace 1.1. Anon memory grows steadily and is almost never freed, so the peak is the sum of every buffer's high-water mark, and rows, postings and bitmaps scale with 1/phases. Kept: PHASE_CLAIMS 200 -> 100, parse vectors sized once from a count, answer text in a reused per-thread buffer, pages discarded before the output is written, CHUNK 64 -> 32. Paired 30 rounds on the transpose code, median ms and peak: 12 CPUs 78.9/41 -> 83.3/26, cpuset 0-5 99.4/39 -> 101.8/25. Run ID: pending board.
+
+**Failed:** PHASE_CLAIMS 60/45/32 (each extra phase costs 0.6-0.8 ms, the gain flattens at 60-100); HEAVY_SHARE 16/12 (lists grow as bitmaps shrink); QUERY_BATCH 32/16; CHUNK 16.
