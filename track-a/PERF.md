@@ -62,3 +62,5 @@ Parse-only builds, best ms: full 12.0-12.5, newline scan alone 8.0, no hash -1.2
 Single-thread, the newline scan alone is 14.8 of 32.5 ms and memory-bound; a pure read of the file walls at about 5.6 ms (42 GB/s). The parse sat near 9.8 ms because compute and memory did not overlap in a thread. Kept: one prefetch per line of the byte one block ahead, so the next 64 KiB loads while this one parses; hash masks from a window table, constant round keys, two overlapping loads instead of a byte loop for long names; the current hour's cursor kept in registers. Paired median ms, base to new: 12 CPUs 21.7->19.6 and 19.4->18.5, cpuset 0-5 24.9->22.7 and 23.6->21.3. Peak unchanged, S +10. Run ID: pending board.
 
 **Failed:** prefetch 2 or 4 blocks ahead, or in the scan loop at 16 or 128 KiB (tie); word-wise fold for long names alone. Not built: SIMD latency decode (same instruction count), bucketed SIMD probe (+30 lines for 5% of parse compute), 3-pass 8-bit radix.
+
+**Failed (2026-11-01): pinning each worker to its own CPU.** Box 3c6a912: A 20.29 ms (`run` best 20.09), B 95.2 (94.0), C 22.34 (22.07), S +17 on each. No gain on any track; laptop medians were worse too.
