@@ -86,3 +86,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (box test, 2026-11-01): no per-claim `MADV_DONTNEED`.** Laptop best -6%. Board `run-3e9a076f5dee` 26.8 ms, 80.33 (slow round, but +4.8 ms is more than the round): exit teardown of the mapping returned. Reverted.
 
 **Failed (box test, 2026-11-01): `-align-loops=32`.** Test of whether code layout explains box swings. Run on 87ea886 inside the usual range of unchanged code; one sample. Reverted.
+
+**Failed (2026-11-01):** LLVM block alignment 32 (box 22.21 ms, `run-68f2d900e8c5`). Loop layout does not explain the slow outliers. Hyperthread pair pipeline, tools/wt_c21: laptop 50% slower; box result in the commit after it.

@@ -28,107 +28,12 @@
 //! 4. Distinct names. Each record sets its name's bit in its country's row of one shared bit
 //!    matrix (256 groups by 2^17 names, 4 MiB), and popcounts of the rows give the counts.
 use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex, OnceLock};
-use std::cell::UnsafeCell;
 use std::{arch::x86_64::*, fs::File, ops::Range, os::fd::AsRawFd, ptr::*, slice, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
-    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
-    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
-}
-
-// Hyperthread-pair pipeline. In a pair, one sibling scans and splits fields, and hands batches
-// through a small ring in the core's shared L1/L2 to the other, which does lookups, stats and bit
-// updates. Pairs come from the sysfs topology; where that is hidden (some WSL and container
-// setups), consecutive allowed CPUs are taken as pairs if this is set. Without any pairing the
-// workers all run the whole flow, as before.
-const ASSUME_CONSECUTIVE_PAIRS: bool = true;
-// Batches in flight per pair.
-const RING: usize = 4;
-
-/// What the scanner hands over for one batch of records.
-struct Batch {
-    count: usize,
-    hashes: [u64; MAX_RECORDS],
-    lengths: [u64; MAX_RECORDS],
-    signs: [i64; MAX_RECORDS],
-    numbers: [[u32; MAX_RECORDS]; 3],
-}
-
-#[repr(align(64))]
-struct Counter(AtomicUsize);
-
-/// One pair's ring: `head` counts batches published, `tail` batches consumed, `done` is set by
-/// the scanner after its last batch.
-struct Ring {
-    head: Counter,
-    tail: Counter,
-    done: Counter,
-    slots: [UnsafeCell<Batch>; RING],
-}
-unsafe impl Sync for Ring {}
-
-const fn new_batch() -> Batch {
-    Batch {
-        count: 0,
-        hashes: [0; MAX_RECORDS],
-        lengths: [0; MAX_RECORDS],
-        signs: [0; MAX_RECORDS],
-        numbers: [[0; MAX_RECORDS]; 3],
-    }
-}
-
-fn parse_cpu_list(text: &str) -> Vec<usize> {
-    let mut cpus = Vec::new();
-    for part in text.trim().split(',') {
-        match part.split_once('-') {
-            Some((a, b)) => match (a.parse::<usize>(), b.parse::<usize>()) {
-                (Ok(a), Ok(b)) => cpus.extend(a..=b),
-                _ => return vec![],
-            },
-            None => match part.parse() {
-                Ok(c) => cpus.push(c),
-                _ => return vec![],
-            },
-        }
-    }
-    cpus
-}
-
-/// The CPUs to run on, as scanner, consumer, scanner, consumer, ...; empty if the allowed CPUs
-/// do not split into sibling pairs.
-fn pairs() -> Vec<usize> {
-    let mut mask = [0u64; 16];
-    if unsafe { sched_getaffinity(0, 128, mask.as_mut_ptr()) } != 0 {
-        return vec![];
-    }
-    let allowed: Vec<usize> = (0..1024).filter(|&c| mask[c / 64] >> (c % 64) & 1 == 1).collect();
-    let mut out = Vec::new();
-    for &c in &allowed {
-        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
-        let Ok(text) = std::fs::read_to_string(path) else {
-            out.clear();
-            break;
-        };
-        let mut sib = parse_cpu_list(&text);
-        sib.sort();
-        if sib.len() != 2 || !sib.iter().all(|s| allowed.contains(s)) {
-            out.clear();
-            break;
-        }
-        if sib[0] == c {
-            out.extend(sib);
-        }
-    }
-    if out.len() == allowed.len() && !out.is_empty() {
-        return out;
-    }
-    if ASSUME_CONSECUTIVE_PAIRS && allowed.len() >= 2 && allowed.len() % 2 == 0 {
-        return allowed;
-    }
-    vec![]
 }
 // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const MAP_ANON: i32 = 0x4022;
@@ -160,7 +65,7 @@ const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
 const BIAS: i64 = 1 << 40;
 
 // Counters that hand out work: region claims, record claims, huge pages to zero, name numbers.
-static NEXT: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 // Region id to group, and country code (as base-26 digits) to group. Both start zeroed.
 static REGION_GROUP: [AtomicU8; REGION_IDS + 1] = [const { AtomicU8::new(0) }; REGION_IDS + 1];
 static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
@@ -183,7 +88,7 @@ struct Tables([[AtomicU64; 8]; BUCKETS], [AtomicU64; GROUPS * SEEN_WORDS]);
 
 /// What the workers share: 0 the records file, 1 the regions file, 2 the tables, 3 the barrier
 /// after the regions are loaded.
-struct Run(&'static [u8], &'static [u8], &'static Tables, Barrier, Vec<Ring>, Vec<usize>);
+struct Run(&'static [u8], &'static [u8], &'static Tables, Barrier);
 
 unsafe fn load(p: *const u8) -> __m256i {
     _mm256_loadu_si256(p.cast())
@@ -295,31 +200,6 @@ impl Run {
         unreachable!()
     }
 
-    /// Passes 3 and 4 for one batch: stats and name numbers, then the distinct-name bits.
-    unsafe fn consume(&self, b: &mut Batch, stats: &mut [[i64; 8]; GROUPS], spare: &mut Range<usize>) {
-        let count = b.count;
-        for at in 0..count {
-            let group = REGION_GROUP[b.numbers[2][at] as usize].load(Relaxed) as usize;
-            let amount = (b.numbers[1][at] as i64 ^ b.signs[at]) - b.signs[at];
-            let s = &mut stats[group];
-            s[0] += 1;
-            s[1] += b.numbers[0][at] as i64;
-            s[2] += amount;
-            s[3] += b.lengths[at] as i64;
-            s[4] = s[4].max(BIAS + amount);
-            s[5] = s[5].max(BIAS - amount);
-            let name = self.intern(b.hashes[at], spare);
-            let word = group * SEEN_WORDS + name / 64;
-            _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
-            // The hash is done with, so its slot carries the bit's address to the next pass.
-            b.hashes[at] = (word << 6 | name % 64) as u64;
-        }
-        for &bit in &b.hashes[..count] {
-            let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-            word.fetch_or(1 << (bit & 63), Relaxed);
-        }
-    }
-
     /// One worker's whole life. It starts `descendants` more workers as a tree, so that no thread
     /// spends a millisecond spawning them all, zeroes its huge page, parses its share of the
     /// regions, waits for the others, and parses its share of the records.
@@ -331,12 +211,6 @@ impl Run {
         }
         // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
         // it while the regions load. It must end before huge pages are disabled.
-        let ticket = NEXT[4].fetch_add(1, Relaxed);
-        if let Some(&cpu) = self.5.get(ticket) {
-            let mut mask = [0u64; 16];
-            mask[cpu / 64] = 1 << (cpu % 64);
-            sched_setaffinity(0, 128, mask.as_ptr());
-        }
         let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
         if page < size_of::<Tables>() {
             (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
@@ -371,33 +245,16 @@ impl Run {
         prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; GROUPS];
-        let mut spare = 0..0; // name numbers this worker reserved
-        let ring = self.4.get(ticket / 2);
-        if let (Some(ring), 1) = (ring, ticket % 2) {
-            // The consumer of a pair.
-            let mut tail = 0;
-            loop {
-                if ring.head.0.load(Acquire) == tail {
-                    if ring.done.0.load(Acquire) != 0 && ring.head.0.load(Acquire) == tail {
-                        break;
-                    }
-                    std::hint::spin_loop();
-                    continue;
-                }
-                self.consume(&mut *ring.slots[tail % RING].get(), &mut stats, &mut spare);
-                tail += 1;
-                ring.tail.0.store(tail, Release);
-            }
-            return self.merge(&stats);
-        }
-        let mut solo = new_batch();
-        let mut published = 0;
         let mut pos = [0u32; MAX_RECORDS * FIELDS];
         // Each 64-byte step's quote mask, and the number of quote bytes before the step.
         let mut quotes = [(0u64, 0u32); QUOTE_WORDS];
         // Per record between the passes: the name's hash (later the address of its bit), the name
         // and note lengths (`lengths` in the totals), and -1 for a negative amount, else 0.
+        let [mut hashes, mut lengths] = [[0u64; MAX_RECORDS]; 2];
+        let mut signs = [0i64; MAX_RECORDS];
+        let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; MAX_RECORDS]; 3];
+        let mut numbers = [[0u32; MAX_RECORDS]; 3];
         while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
             // Claims are 1 MiB.
             let end = (claim + (1 << 20)).min(len);
@@ -409,15 +266,6 @@ impl Run {
             let mut at = origin; // the next byte to scan
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
             while record < end {
-                let b: &mut Batch = match ring {
-                    Some(ring) => {
-                        while published - ring.tail.0.load(Acquire) >= RING {
-                            std::hint::spin_loop();
-                        }
-                        &mut *ring.slots[published % RING].get()
-                    }
-                    None => &mut solo,
-                };
                 for _ in 0..32 {
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
@@ -469,11 +317,11 @@ impl Run {
                     let cents = digits_before(input.add(stop), stop - comma4 - 1 - negative);
                     // Close the gap the point leaves: its byte is always third from the end.
                     digits[1][count] = (cents & 0xFF_FFFF_FFFF) << 8 | cents >> 48 << 48;
-                    b.signs[count] = -(negative as i64);
+                    signs[count] = -(negative as i64);
                     start = newline + 1;
                     count += 1;
                 }
-                [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut b.numbers[kind], count));
+                [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -491,24 +339,36 @@ impl Run {
                     // The top 15 bits of the hash pick the bucket.
                     _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
                     // Ids past the table share its last entry, which stays 0: unmatched.
-                    let region = (b.numbers[2][at] as usize).min(REGION_IDS);
+                    let region = (numbers[2][at] as usize).min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
-                    b.numbers[2][at] = region as u32;
-                    b.hashes[at] = hash;
-                    b.lengths[at] = name_len as u64 | (note_len as u64) << 32;
+                    numbers[2][at] = region as u32;
+                    hashes[at] = hash;
+                    lengths[at] = name_len as u64 | (note_len as u64) << 32;
                 }
                 record = start;
                 // The region table and the name table were each a cache miss on every record,
                 // half of the pass above when it read them itself. Now both are prefetched
                 // before this pass reads them. A locked update of a cold line stalls the core,
                 // so its lines are fetched here and updated in the pass after.
-                b.count = count;
-                match ring {
-                    Some(ring) => {
-                        published += 1;
-                        ring.head.0.store(published, Release);
-                    }
-                    None => self.consume(b, &mut stats, &mut spare),
+                for at in 0..count {
+                    let group = REGION_GROUP[numbers[2][at] as usize].load(Relaxed) as usize;
+                    let amount = (numbers[1][at] as i64 ^ signs[at]) - signs[at];
+                    let s = &mut stats[group];
+                    s[0] += 1;
+                    s[1] += numbers[0][at] as i64;
+                    s[2] += amount;
+                    s[3] += lengths[at] as i64;
+                    s[4] = s[4].max(BIAS + amount);
+                    s[5] = s[5].max(BIAS - amount);
+                    let name = self.intern(hashes[at], &mut spare);
+                    let word = group * SEEN_WORDS + name / 64;
+                    _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
+                    // The hash is done with, so its slot carries the bit's address to the next pass.
+                    hashes[at] = (word << 6 | name % 64) as u64;
+                }
+                for &bit in &hashes[..count] {
+                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
+                    word.fetch_or(1 << (bit & 63), Relaxed);
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
@@ -521,16 +381,8 @@ impl Run {
             // into whatever is mapped after the range, and would wipe it.
             madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
-        if let Some(ring) = ring {
-            ring.done.0.store(1, Release);
-        } else {
-            self.merge(&stats);
-        }
-    }
-
-    unsafe fn merge(&self, stats: &[[i64; 8]; GROUPS]) {
         let mut totals = TOTALS.lock().unwrap();
-        for (total, part) in totals.iter_mut().zip(stats) {
+        for (total, part) in totals.iter_mut().zip(&stats) {
             for (i, (a, &b)) in total.iter_mut().zip(part).enumerate() {
                 *a = if i < 4 { *a + b } else { (*a).max(b) };
             }
@@ -559,21 +411,9 @@ unsafe fn zeroed<T>() -> &'static T {
 }
 
 fn main() {
-    let mut n = thread::available_parallelism().map_or(12, |n| n.get());
-    let cpus = pairs();
-    if !cpus.is_empty() {
-        n = cpus.len();
-    }
-    let rings = (0..cpus.len() / 2)
-        .map(|_| Ring {
-            head: Counter(AtomicUsize::new(0)),
-            tail: Counter(AtomicUsize::new(0)),
-            done: Counter(AtomicUsize::new(0)),
-            slots: [const { UnsafeCell::new(new_batch()) }; RING],
-        })
-        .collect();
+    let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
-    let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n), rings, cpus) };
+    let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };
     thread::scope(|s| unsafe { run.start(s, n - 1) });
 
     let totals = TOTALS.lock().unwrap();

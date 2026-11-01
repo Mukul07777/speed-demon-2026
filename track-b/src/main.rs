@@ -372,14 +372,11 @@ impl Run {
     }
 
     #[cold]
-    unsafe fn claim_chunk(&self, shard: usize) -> *mut u32 {
+    unsafe fn claim_chunk(&self, shard: usize, claim: usize) -> (*mut u32, *mut u32) {
         let offset = self.claimed[shard].fetch_add(CHUNK, Relaxed);
-        self.rows.add(shard * self.stride() + offset)
-    }
-
-    /// Words between two shards' row regions: a whole number of cache lines.
-    fn stride(&self) -> usize {
-        (self.text.len() + 4096 + 15) & !15
+        let at = self.rows.add(shard * (self.text.len() + 4096) + offset);
+        *at = claim as u32 + 1;
+        (at.add(1), at.add(CHUNK))
     }
 
     /// Reads one claim. With SAMPLE set, it only counts how often each term appears.
@@ -391,10 +388,7 @@ impl Run {
         }
         let (first_doc, text) = (doc, self.text.as_ptr());
 
-        // Write combining: rows of a shard gather in one cache line here and leave it as one
-        // 64-byte store, `fill` words in, bound for `dest` in the chunk that ends at `end`.
-        let mut lines = [Line([0; 16]); SHARDS];
-        let mut cursors = [(null_mut::<u32>(), null_mut::<u32>(), 0usize); SHARDS];
+        let mut cursors = [(null_mut(), null_mut()); SHARDS];
         let (mut token_count, mut end_count, mut line_count) = (0, 0, 0);
         // `carry` is whether the previous 64 bytes ended inside a token.
         let (mut at, mut carry, mut first_token) = (start, 0u64, true);
@@ -578,19 +572,11 @@ impl Run {
                 }
                 let shard = term as usize & (SHARDS - 1);
                 let cursor = cursors.get_unchecked_mut(shard);
-                let line = lines.get_unchecked_mut(shard);
                 if cursor.0 == cursor.1 {
-                    let at = self.claim_chunk(shard);
-                    *cursor = (at, at.add(CHUNK), 1);
-                    line.0[0] = claim as u32 + 1;
+                    *cursor = self.claim_chunk(shard, claim);
                 }
-                line.0[cursor.2] = ((term >> SHARDS.trailing_zeros()) + 1) << DOC_BITS | hit as u32;
-                cursor.2 += 1;
-                if cursor.2 == 16 {
-                    store_line(cursor.0, line);
-                    cursor.0 = cursor.0.add(16);
-                    cursor.2 = 0;
-                }
+                *cursor.0 = ((term >> SHARDS.trailing_zeros()) + 1) << DOC_BITS | hit as u32;
+                cursor.0 = cursor.0.add(1);
             }
             // A newline left over belongs to a document whose id comes in the next batch.
             b.lines[0] = 0;
@@ -602,13 +588,6 @@ impl Run {
         }
         if !SAMPLE {
             self.flush_group(b.group, claim, doc as usize);
-            for (cursor, line) in cursors.iter().zip(lines.iter_mut()) {
-                if cursor.2 > 0 {
-                    line.0[cursor.2..].fill(0);
-                    store_line(cursor.0, line);
-                }
-            }
-            _mm_sfence();
         }
         // The documents this claim held, which the sample uses to scale its counts.
         doc - first_doc + 1
@@ -727,7 +706,7 @@ impl Run {
     /// of rows.
     unsafe fn build_shard(&self, shard: usize, phase: usize) {
         let base = self.phase_base[phase];
-        let region = self.rows.add(shard * self.stride());
+        let region = self.rows.add(shard * (self.text.len() + 4096));
         let claimed = self.claimed[shard].load(Relaxed);
         let mut chunks: Vec<(u32, u32)> = (0..claimed)
             .step_by(CHUNK)
@@ -985,24 +964,6 @@ impl Run {
         }
     }
 }
-
-#[derive(Clone, Copy)]
-#[repr(align(64))]
-struct Line([u32; 16]);
-
-/// One 64-byte store of a gathered line into its (aligned) place in a chunk.
-#[inline(always)]
-unsafe fn store_line(to: *mut u32, line: &Line) {
-    let from = line.0.as_ptr().cast::<__m256i>();
-    if STREAM {
-        _mm256_stream_si256(to.cast(), _mm256_load_si256(from));
-        _mm256_stream_si256(to.add(8).cast(), _mm256_load_si256(from.add(1)));
-    } else {
-        _mm256_store_si256(to.cast(), _mm256_load_si256(from));
-        _mm256_store_si256(to.add(8).cast(), _mm256_load_si256(from.add(1)));
-    }
-}
-const STREAM: bool = true;
 
 /// Visits a shard's rows in document order.
 #[inline(always)]
@@ -1265,7 +1226,7 @@ fn main() {
             round: Default::default(),
             bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, true),
             // Each shard has more rows than it can hold, `len + 4096`: only touched pages cost memory.
-            rows: reserve(SHARDS * ((text.len() + 4096 + 15) & !15), false),
+            rows: reserve(SHARDS * (text.len() + 4096), false),
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
             postings: reserve(text.len() + HUGE_PAGE, true),
             parts: (0..batches).map(|_| Mutex::default()).collect(),

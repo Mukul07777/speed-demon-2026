@@ -106,3 +106,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Failed (box test, 2026-11-01): huge pages for the dense regions.** Two huge pages each for postings and bitmaps, touched before `PR_SET_THP_DISABLE`, to cut small-page faults (laptop: 20.4k to about 16k faults with three pages each; median -5% with two, best unchanged, hash unchanged). Board `run-d18a8012c8a0` 102.0 ms in a slow round, `run-3974f3dfdb1e` 93.7 ms, 44.5 MB, S 1015, 78.56 against 78.58: the time gain was eaten by memory over the 44 MB cap and 11 more lines. Reverted.
 
 **Failed (box test, 2026-11-01): `-align-loops=32`.** Test of whether code layout explains box swings. Run on 87ea886 inside the usual range of unchanged code; one sample. Reverted.
+
+**Failed (2026-11-01, tools/wt_b27, wt_b27s):** software write-combining for list rows, laptop tie with worse best times, +35 lines.
