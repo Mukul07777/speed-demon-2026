@@ -7,7 +7,7 @@
 //!    dropped after one hash, whatever else the corpus holds.
 //! 2. Index at document level only. Terms common enough to deserve it get a bitmap, chosen
 //!    from a small sample of the corpus. The rest become lists of document ids, written as
-//!    rows that need no shared counters. Rows last one phase of 32 MiB of text, then become
+//!    rows that need no shared counters. Rows last one phase of 48 MiB of text, then become
 //!    16-bit postings, so that rows and postings never fill memory together.
 //! 3. Store no positions. A phrase is checked during the scan, when the document's tokens
 //!    are at hand: when its rarest term appears, the neighbouring tokens' hashes are compared
@@ -42,7 +42,7 @@ const MADV_POPULATE_READ: i32 = 22;
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
-const PHASE_CLAIMS: usize = 128; // 32 MiB of text between turning rows into postings
+const PHASE_CLAIMS: usize = 192; // 48 MiB of text between turning rows into postings
 const HEADER: usize = 1; // u16s before a list: a sentinel while it fills, so duplicates drop with no branch
 const CLEAR_JOBS: usize = 16; // slices of the idle bitmap set that are zeroed during a phase
 const TALLY_IDS: usize = 10;
@@ -970,9 +970,10 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             }
             finish_list(out)
         }
-        (Op::And, Set::List(a), Set::Bits(b)) | (Op::And, Set::Bits(b), Set::List(a)) => {
+        (Op::And | Op::Not, Set::List(a), Set::Bits(b)) | (Op::And, Set::Bits(b), Set::List(a)) => {
             out.reserve(a.len());
-            out.extend(a.iter().filter(|&&doc| holds(b, doc)));
+            // Keep what the bitmap holds for AND, and what it lacks for NOT.
+            out.extend(a.iter().filter(|&&doc| holds(b, doc) == (op == Op::And)));
             finish_list(out)
         }
         (Op::Not, Set::List(a), Set::List(b)) => {
@@ -980,37 +981,18 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             subtract(a, b, out);
             finish_list(out)
         }
-        (Op::Not, Set::List(a), Set::Bits(b)) => {
-            out.reserve(a.len());
-            out.extend(a.iter().filter(|&&doc| !holds(b, doc)));
-            finish_list(out)
-        }
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => {
             out.reserve(a.len() + b.len());
             union(a, b, out);
             finish_list(out)
         }
-        (Op::Not, a, Set::List(b)) => {
+        (Op::Not | Op::Or, a, Set::List(b)) | (Op::Or, Set::List(b), a) => {
             own(bits, a);
             let target = bits.as_mut_ptr();
             for &doc in b {
-                *target.add(doc as usize / 64) &= !(1 << (doc % 64));
-            }
-            finish_bits(bits)
-        }
-        (Op::Or, a, Set::List(b)) => {
-            own(bits, a);
-            let target = bits.as_mut_ptr();
-            for &doc in b {
-                *target.add(doc as usize / 64) |= 1 << (doc % 64);
-            }
-            finish_bits(bits)
-        }
-        (Op::Or, Set::List(a), b) => {
-            own(bits, b);
-            let target = bits.as_mut_ptr();
-            for &doc in a {
-                *target.add(doc as usize / 64) |= 1 << (doc % 64);
+                let bit = 1 << (doc % 64);
+                let word = &mut *target.add(doc as usize / 64);
+                *word = if op == Op::Or { *word | bit } else { *word & !bit };
             }
             finish_bits(bits)
         }
@@ -1192,6 +1174,12 @@ fn main() {
     let queries = File::open("/data/queries.txt").unwrap();
     let query_len = queries.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
+    // One counter per phase, each starting at `init`.
+    let counters = |init| {
+        (0..len.div_ceil(PHASE_CLAIMS * CLAIM))
+            .map(|_| AtomicUsize::new(init))
+            .collect()
+    };
     let mut run = unsafe {
         let text = map_file(&file, len);
         // The last line's id gives the document count.
@@ -1227,10 +1215,10 @@ fn main() {
             word_terms: Vec::with_capacity(1 << 18),
             samples: Mutex::new((Vec::new(), 0)),
             next_claim: AtomicUsize::new(0),
-            phase_claims: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
-            phase_jobs: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
-            answer_jobs: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
-            phase_postings: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(1)).collect(),
+            phase_claims: counters(0),
+            phase_jobs: counters(0),
+            answer_jobs: counters(0),
+            phase_postings: counters(1),
             phase_base: Vec::new(),
             heavy_total: AtomicUsize::new(0),
             tallies: std::ptr::null_mut(),

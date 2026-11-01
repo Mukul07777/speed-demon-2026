@@ -61,11 +61,9 @@ const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
 
-#[derive(Clone, Copy)]
-struct Cursor {
-    at: *mut u32,
-    last: *mut u32, // the final slot: a row needs two free, in case it has to escape
-}
+/// The next free row and the final slot of the chunk being filled: a row needs two free, in
+/// case it has to escape.
+type Cursor = (*mut u32, *mut u32);
 
 unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
@@ -104,10 +102,7 @@ struct Catalogue {
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     // Lane numbers 0 to 31, to keep the first or the last `short` bytes of a 32-byte load.
-    let lanes = _mm256_setr_epi8(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30, 31,
-    );
+    let lanes: __m256i = std::mem::transmute(std::array::from_fn::<u8, 32, _>(|i| i as u8));
     let short = _mm256_set1_epi8(len.min(32) as i8);
     let head = _mm256_and_si256(load(name), _mm256_cmpgt_epi8(short, lanes));
     let ahead = _mm256_cmpgt_epi8(lanes, _mm256_sub_epi8(_mm256_set1_epi8(31), short));
@@ -118,12 +113,9 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     }
     // Each pair of 8-byte lanes goes through one multiply-and-fold, with its own keys.
     let lanes: [u64; 8] = std::mem::transmute([head, tail]);
-    for (i, pair) in lanes.chunks(2).enumerate() {
-        let keys = [
-            KEY.wrapping_mul(2 * i as u64 + 1),
-            KEY.wrapping_mul(2 * i as u64 + 2),
-        ];
-        hash ^= fold_multiply(pair[0] ^ keys[0], pair[1] ^ keys[1]);
+    for i in 0..4 {
+        let key = |j: usize| KEY.wrapping_mul(2 * i as u64 + j as u64 + 1);
+        hash ^= fold_multiply(lanes[2 * i] ^ key(0), lanes[2 * i + 1] ^ key(1));
     }
     hash | 1 << ID_BITS
 }
@@ -279,19 +271,12 @@ impl Run {
     unsafe fn claim_chunk(&self, hour: usize) -> Cursor {
         let offset = self.claimed[hour].fetch_add(CHUNK, Relaxed);
         let at = self.rows.add(hour * self.stride + offset);
-        Cursor {
-            at,
-            last: at.add(CHUNK - 1),
-        }
+        (at, at.add(CHUNK - 1))
     }
 
     unsafe fn parse(&self) {
         let input = self.input;
-        let empty = std::ptr::null_mut();
-        let mut cursors = [Cursor {
-            at: empty,
-            last: empty,
-        }; HOURS];
+        let mut cursors: [Cursor; HOURS] = [(std::ptr::null_mut(), std::ptr::null_mut()); HOURS];
         let mut ends = [0u32; LINES_PER_BLOCK + 1];
         let mapped_end = self.len.div_ceil(4096) * 4096;
         loop {
@@ -340,14 +325,14 @@ impl Run {
                     let id = self.catalogue.lookup(name, len) as u32;
                     let is_error = (*status == b'5') as u32;
                     let cursor = cursors.get_unchecked_mut(hour as usize);
-                    if cursor.at >= cursor.last {
+                    if cursor.0 >= cursor.1 {
                         *cursor = self.claim_chunk(hour as usize);
                     }
-                    *cursor.at = ((id + 1) << 1 | is_error) << LATENCY_BITS | latency.min(ESCAPE);
-                    cursor.at = cursor.at.add(1);
+                    *cursor.0 = ((id + 1) << 1 | is_error) << LATENCY_BITS | latency.min(ESCAPE);
+                    cursor.0 = cursor.0.add(1);
                     if latency >= ESCAPE {
-                        *cursor.at = latency;
-                        cursor.at = cursor.at.add(1);
+                        *cursor.0 = latency;
+                        cursor.0 = cursor.0.add(1);
                     }
                     line = end.add(1);
                 }
