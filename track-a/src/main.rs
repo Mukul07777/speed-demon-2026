@@ -14,7 +14,7 @@
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
@@ -214,9 +214,8 @@ struct Run {
     finished_parsing: Barrier,
     order: OnceLock<Vec<u16>>,
     next_hour: AtomicUsize,
-    // Finished hours not yet written, the next hour to write, and its byte offset.
-    pending: Mutex<(Vec<Option<Vec<u8>>>, usize, usize)>,
-    output: File,
+    pending: Mutex<Vec<Option<Vec<u8>>>>,
+    output: Mutex<(File, usize)>, // the file and the next hour it needs
 }
 unsafe impl Sync for Run {}
 
@@ -444,27 +443,14 @@ impl Run {
         out
     }
 
-    /// Stores an hour's text, then writes every hour whose offset is now known. An hour's
-    /// offset is the total length of the hours before it, so whoever completes the next
-    /// missing hour hands out offsets to the ones waiting behind it. The writes themselves
-    /// happen outside the lock, in parallel, each at its own offset.
-    fn publish(&self, hour: usize, part: Vec<u8>) {
-        let mut ready = Vec::new();
-        {
-            let mut state = self.pending.lock().unwrap();
-            let (parts, next, offset) = &mut *state;
-            parts[hour] = Some(part);
-            while *next < HOURS {
-                let Some(part) = parts[*next].take() else {
-                    break;
-                };
-                *next += 1;
-                ready.push((*offset, part));
-                *offset += ready.last().unwrap().1.len();
-            }
-        }
-        for (offset, part) in ready {
-            self.output.write_all_at(&part, offset as u64).unwrap();
+    /// Writes every hour that is ready, in order. The caller holds the output lock.
+    fn flush(&self, output: &mut (File, usize)) {
+        while output.1 < HOURS {
+            let Some(part) = self.pending.lock().unwrap()[output.1].take() else {
+                return;
+            };
+            output.0.write_all(&part).unwrap();
+            output.1 += 1;
         }
     }
 
@@ -485,8 +471,13 @@ impl Run {
                 break;
             }
             let part = unsafe { self.summarise(hour, order, &mut tables) };
-            self.publish(hour, part);
+            self.pending.lock().unwrap()[hour] = Some(part);
+            if let Ok(mut output) = self.output.try_lock() {
+                self.flush(&mut output);
+            }
         }
+        // The last worker here sees every part, whoever held the lock when it was stored.
+        self.flush(&mut self.output.lock().unwrap());
     }
 }
 
@@ -590,8 +581,8 @@ fn main() {
         finished_parsing: Barrier::new(threads),
         order: OnceLock::new(),
         next_hour: AtomicUsize::new(0),
-        pending: Mutex::new((vec![None; HOURS], 0, 0)),
-        output: File::create("/out/summary.txt").unwrap(),
+        pending: Mutex::new(vec![None; HOURS]),
+        output: Mutex::new((File::create("/out/summary.txt").unwrap(), 0)),
     };
     thread::scope(|s| {
         for _ in 1..threads {
