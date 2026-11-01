@@ -53,3 +53,9 @@ A bucket stays one 64-byte line but holds 8 u32 tags and 8 u32 number words (14 
 ## Read-ahead prefetch (2026-11-01)
 
 The same cause as Track A's parse: compute and memory did not overlap within a thread. One prefetch per 64-byte scan step, 16 KiB ahead. Paired 20 rounds, median ms base to new: 12 CPUs 23.5->21.6 and 22.7->21.8, cpuset 0-5 27.2->25.4 and 27.3->27.2. Peak unchanged, S +1. Run ID: pending board.
+
+## Inlined name hash, unrolled position extraction (2026-11-01)
+
+`name_hash` was recursive, so rustc emitted a call plus `vzeroupper` per record: it is now `inline(always)` with a cold `long_name_hash`. `while extra < 8 || bits != 0` did not unroll (7 instructions per position): a fixed `for 0..8` then `while bits != 0` takes 4. 12 CPUs median 22.40->21.27 and 23.94->21.53, best 19.4->18.5 and 19.2->17.7; cpuset 0-5 tie over 55 rounds; single thread best 92.4->89.5. S +10. Box test. Run ID: pending board.
+
+Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name lookup -8%, `fetch_or` to a plain store -10% (unsafe, kept only as a probe). Removing the matrix write prefetch +6%, removing the read-ahead prefetch +12%. Failed or rejected: byte-wise plain `or` (lost updates), per-thread matrix (48 MiB), compact rank region table (three dependent loads), bucket plus bitmap per name (+2 MiB), 32-bit name slots (too few check bits).

@@ -127,14 +127,12 @@ unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
 /// it. Names are compared by their raw bytes: every non-empty name is quoted, so equal raw
 /// bytes mean equal values and nothing needs unescaping. Names of 32 bytes and more do not
 /// occur at seed 1 (the longest is 27), so they cost one predicted branch here.
+#[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     // 32 bytes of ones then 32 of zeros: loading at 32 - len keeps the first `len` bytes.
     static MASKS: [[u8; 32]; 2] = [[0xFF; 32], [0; 32]];
     if len >= 32 {
-        // Cold: hash the first 31 bytes and the rest apart, and combine them.
-        let (a, b) = (name_hash(name, 31), name_hash(name.add(31), len - 31));
-        let hash = (a.0.rotate_left(23) ^ b.0).wrapping_mul(0xE703_7ED1_A0B4_28DB);
-        return (hash | 1, a.1 + b.1);
+        return long_name_hash(name, len);
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
     let quotes = equal_mask(bytes, b'"').count_ones() as usize;
@@ -144,6 +142,15 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     let mixed = _mm_aesenc_si128(_mm_xor_si128(low, key), high);
     let mixed = _mm_aesenc_si128(_mm_aesenc_si128(mixed, key), key);
     (_mm_cvtsi128_si64(mixed) as u64 | 1, quotes)
+}
+
+/// Cold: hash the first 31 bytes and the rest apart, and combine them.
+#[cold]
+#[inline(never)]
+unsafe fn long_name_hash(name: *const u8, len: usize) -> (u64, usize) {
+    let (a, b) = (name_hash(name, 31), name_hash(name.add(31), len - 31));
+    let hash = (a.0.rotate_left(23) ^ b.0).wrapping_mul(0xE703_7ED1_A0B4_28DB);
+    (hash | 1, a.1 + b.1)
 }
 
 /// The next unclaimed block of `size` bytes in a file of `len` bytes, if any is left.
@@ -286,8 +293,12 @@ impl Run {
                     // Unconditional stores, so that a varying count needs no loop exit to
                     // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
+                    for extra in 0..8 {
+                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                        bits &= bits.wrapping_sub(1);
+                    }
+                    let mut extra = 8;
+                    while bits != 0 {
                         *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
                         extra += 1;
