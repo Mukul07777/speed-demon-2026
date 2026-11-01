@@ -61,6 +61,7 @@ const SEARCH_RATIO: usize = 16; // lists this much shorter are searched for, not
 const LINES: usize = 6; // cache lines of a list requested before a query reads it
 const PLAN_JOBS: usize = 16;
 const SAMPLE_CLAIMS: usize = 12; // claims read to choose the terms that get bitmaps
+const WORKSPACE: usize = 32 << 20; // a worker's share of the one reservation for batch space
 
 /// One cache line. The last action answers for a hash found in no slot, so that a miss
 /// takes the same path as a hit.
@@ -252,6 +253,7 @@ struct Run {
     claimed: Vec<AtomicUsize>,
     postings: *mut u16,
     parts: Mutex<Vec<Vec<u8>>>,
+    workspace: *mut u8,
 }
 unsafe impl Sync for Run {}
 
@@ -266,6 +268,20 @@ unsafe fn reserve(bytes: usize, advice: i32) -> *mut u8 {
 unsafe fn space<T>(count: usize) -> &'static mut [T] {
     let region = reserve(count * size_of::<T>(), MADV_NOHUGEPAGE);
     std::slice::from_raw_parts_mut(region.cast(), count)
+}
+
+/// Hands out the parts of one worker's share of a reservation made before the threads start.
+/// One `mmap` for all the workers, instead of eight each: every `mmap` and `madvise` takes the
+/// address-space lock for writing, which stalls the page faults of the threads already running.
+struct Carve(*mut u8, *mut u8);
+
+impl Carve {
+    unsafe fn take<T>(&mut self, count: usize) -> &'static mut [T] {
+        let at = self.0;
+        self.0 = at.add((count * size_of::<T>()).next_multiple_of(4096));
+        assert!(self.0 <= self.1);
+        std::slice::from_raw_parts_mut(at.cast(), count)
+    }
 }
 
 unsafe fn map_file(file: &File, len: usize) -> *const u8 {
@@ -304,6 +320,20 @@ unsafe fn hash_of(token: *const u8, len: usize) -> u64 {
     // Two AES rounds spread every byte over the whole block, in fewer uops than a multiply.
     let mixed = _mm_aesenc_si128(_mm_aesenc_si128(key, _mm_set1_epi64x(KEY)), key);
     (_mm_cvtsi128_si64(mixed) ^ _mm_extract_epi64(mixed, 1)) as u64 | 1
+}
+
+/// A token's action, with no branch on whether a query uses it.
+#[inline(always)]
+unsafe fn action_in(buckets: *const Bucket, hash: u64) -> u32 {
+    let bucket = buckets.add(bucket_of(hash));
+    let wanted = _mm256_set1_epi32(hash as i32);
+    let same = _mm256_cmpeq_epi32(_mm256_load_si256(bucket.cast()), wanted);
+    let found = _mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32 | 1 << BUCKET_SLOTS;
+    let action = (*bucket).actions[found.trailing_zeros() as usize];
+    if action == OVERFLOW {
+        return Run::action_past(buckets, hash);
+    }
+    action
 }
 
 #[inline(always)]
@@ -347,26 +377,12 @@ impl Run {
         None
     }
 
-    /// A token's action, with no branch on whether a query uses it.
-    #[inline(always)]
-    unsafe fn action_of(&self, hash: u64) -> u32 {
-        let bucket = self.buckets.add(bucket_of(hash));
-        let wanted = _mm256_set1_epi32(hash as i32);
-        let same = _mm256_cmpeq_epi32(_mm256_load_si256(bucket.cast()), wanted);
-        let found = _mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32 | 1 << BUCKET_SLOTS;
-        let action = (*bucket).actions[found.trailing_zeros() as usize];
-        if action == OVERFLOW {
-            return self.action_past(hash);
-        }
-        action
-    }
-
     /// The action of a token whose bucket is full, so that its term may be in a later one.
     #[cold]
-    unsafe fn action_past(&self, hash: u64) -> u32 {
+    unsafe fn action_past(buckets: *const Bucket, hash: u64) -> u32 {
         let mut index = bucket_of(hash);
         loop {
-            let bucket = &*self.buckets.add(index);
+            let bucket = &*buckets.add(index);
             for slot in 0..BUCKET_SLOTS {
                 if bucket.tags[slot] == hash as u32 {
                     return bucket.actions[slot];
@@ -537,18 +553,22 @@ impl Run {
                 *b.hashes.get_unchecked_mut(i) = hash_of(text.add(from), to - from);
             }
             let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
+            // Local copies of the pointers: through `self` and `b` the compiler reloads them
+            // after every store, as a store might have changed them.
+            let (buckets, hashes) = (self.buckets, b.hashes.as_ptr());
+            let (heavy_hits, list_hits) = (b.heavy_hits.as_mut_ptr(), b.list_hits.as_mut_ptr());
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
                 while token < to {
-                    let ahead = bucket_of(*b.hashes.get_unchecked(token + AHEAD));
-                    _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(ahead).cast());
-                    let action = self.action_of(*b.hashes.get_unchecked(token));
+                    let ahead = bucket_of(*hashes.add(token + AHEAD));
+                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
+                    let action = action_in(buckets, *hashes.add(token));
                     // All three stores happen, and only the right counts move.
-                    *b.heavy_hits.get_unchecked_mut(heavy_count) = action << DOC_BITS | doc as u32;
+                    *heavy_hits.add(heavy_count) = action << DOC_BITS | doc as u32;
                     heavy_count += (action >> 31) as usize;
-                    *b.list_hits.get_unchecked_mut(list_count) = (action as u64) << 32 | doc as u64;
+                    *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
                     list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
-                    // Rare enough to predict: about 1 token in 150 b.starts a phrase check.
+                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
                     if action & ANCHOR != 0 {
                         *b.anchor_hits.get_unchecked_mut(anchor_count) =
                             (action as u64) << 40 | (doc as u64) << 20 | token as u64;
@@ -780,6 +800,10 @@ impl Run {
     unsafe fn answer_bool(&self, steps: &[(Op, u32)], phase: usize, scratch: &mut Scratch) -> Set {
         let mut current = self.set_of(steps[0].1, phase);
         for &(op, term) in &steps[1..] {
+            // Nothing is left to AND with or to take away from, so skip the term's lookup.
+            if op != Op::Or && matches!(current, Set::List([])) {
+                continue;
+            }
             current = apply(op, current, self.set_of(term, phase), scratch);
         }
         current
@@ -881,15 +905,17 @@ impl Run {
 
     unsafe fn work(&self, id: usize) {
         let tokens = MAX_TOKENS + 32;
+        let share = self.workspace.add(id * WORKSPACE);
+        let mut carve = Carve(share, share.add(WORKSPACE));
         let mut buffers = Buffers {
-            starts: space(tokens),
-            ends: space(tokens),
-            lines: space(BATCH / 2 + 64),
-            hashes: space(tokens + AHEAD),
-            heavy_hits: space(tokens),
-            list_hits: space(tokens),
-            anchor_hits: space(tokens),
-            counts: space(MAX_TERMS),
+            starts: carve.take(tokens),
+            ends: carve.take(tokens),
+            lines: carve.take(BATCH / 2 + 64),
+            hashes: carve.take(tokens + AHEAD),
+            heavy_hits: carve.take(tokens),
+            list_hits: carve.take(tokens),
+            anchor_hits: carve.take(tokens),
+            counts: carve.take(MAX_TERMS),
         };
         *self.parsed[id].lock().unwrap() = self.parse_share(id);
         if self.step.wait().is_leader() {
@@ -1309,6 +1335,7 @@ fn main() {
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
             postings: reserve(len * 2 + HUGE_PAGE, MADV_HUGEPAGE).cast(),
             parts: Mutex::new(Vec::new()),
+            workspace: reserve(threads * WORKSPACE, MADV_NOHUGEPAGE),
         }
     };
     // Phases start on documents that are multiples of 64, and a bitmap covers one phase.
