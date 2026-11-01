@@ -82,3 +82,5 @@ Peak breakdown of about 42 MB: rows 11.4, postings 4.9, bitmaps 4.7, malloc aren
 ## Line cut 1145 -> about 1004 (2026-11-01)
 
 Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the merge step, two vectors and one barrier are gone. Threads write their own phrases and query share directly. Setup helpers merged (`reserve<T>`, `map_file` returning a slice, the barrier as a method on `Run`), transpose masks computed as `u64::MAX / (2^w + 1)`, four constants folded away, bitmap clearing done inside each build job. Scan, lookup, row writes and the answer inner loops are unchanged. Paired medians: 12 CPUs 79.99 vs 80.00 ms and -0.65 ms over 30 rounds; cpuset 0-5 -0.3 to +2.6 ms, inside noise. Hash f86973c21022, peak unchanged. Run ID: pending board.
+
+**Measured (2026-11-01, tools/wt_b19_floor): stage floor on 12 CPUs, ms.** Read 6.3, tokenise 8.9, hash 14.2, lookup about 25, against a real scan of 42 or more. Beyond lookup, heavy bits, rows and anchors cost only 2-3 ms per phase. Gather-based two-choice lookup was no faster than the bucket probe.
