@@ -69,3 +69,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (2026-11-01): bit updates deferred one batch** (box 22.90 ms, 81.82) **and bucket prefetch for write while the table fills** (23.50 ms, 81.60). Code back at the best-scored version.
 
 **Failed (2026-11-01, tools/wt_c15):** region barrier moved behind the first record batch (box 22.61 ms, S 301, 81.93); 16 KiB region claims and per-claim `MAP_POPULATE` remap (laptop slower, not boxed).
+
+**Failed (2026-11-01, tools/wt_c17): bit matrix indexed by name.** Exact, same 4 MiB, but about 3x slower (73.9 vs 26.2 ms best): all threads' updates for one name share a line. A per-thread repeat filter was rejected by count: only 10.2% of updates repeat, and a 16 KB filter catches 0.13%.
