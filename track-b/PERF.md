@@ -39,3 +39,16 @@ How to read the table: each row is one step, in order. Run ID, T, M and points a
 | 22 | **Failed.** The answer batches of phase k - 1 spread evenly through the claims of stage k on one shared counter (instead of left to threads that run out of claims), with the last 24 claims, or the last half, kept free of answers. Paired, 25 rounds: 12 CPUs median +2.2 / -1.0 ms, cpuset 0-5 +1.3 / +2.5 ms, CPU +8 to +16 ms in every set (scan and answers evict each other's cache lines). The answer tail already runs on all threads at once, so it is CPU, not idle wait; reverted. Hash f86973c21022, worked and mixed pass. |  |  |  |  |
 | next | **Failed**: trailing-OR shortcut. 8,776 of about 31k BOOL queries end in `OR term`. Once a query's tally already holds its 10 smallest ids, the last `OR` adds A to the tally and then B minus A through one `filter_by` NOT pass instead of building the union (count, sum and 10 smallest are identical). 25 paired rounds: 12 CPUs wall median +2.4 ms (mean +0.6), CPU -1 ms; cpuset 0-5 +0.7 ms (mean -1.5), CPU -1 ms. CPU did not move, so the union merge is not where the OR cost is. **Failed**: SAMPLE_CLAIMS 12 to 6 and 4: wall -0.46 and +0.69 ms (noise); with 12 claims on 12 threads each thread samples one claim, so fewer claims do not shorten the critical path. Not tried: four phases need phase boundaries cut by document count (a 250-claim phase holds past the u16 offset limit of 65,535 documents), a redesign, and the memory cap is a second blocker. Hash f86973c21022, 41 MiB. | | | | |
 | next | **Failed**: profile-guided optimisation (allowed by the harness allowlist; three seed-1 full-data runs merged with llvm-profdata, rebuilt with `-C profile-use`, Dockerfile unchanged, offline). All checks pass; 12 CPUs paired median +0.5%, cpuset 0-5 -1.9% (mean +0.9 ms), noise. Rejected: the bar was 3% on both settings, and the profile comes from seed 1 only. | | | | |
+
+## Round of 2026-11-01: profile and failed ideas
+
+Kept: page release moved from every claim to one sliced `MADV_DONTNEED` per thread after the last scan (12 CPUs paired, best about -3 ms; cpuset gain unproven). Profile: scan is 60-65% of wall time.
+
+**Failed** (paired, median before -> after, ms):
+- 4 phases of 243 claims: 83.6 -> 84.1 (12 CPUs), 102.7 -> 102.7 (cpuset), peak +4-5 MiB.
+- `BATCH` 8/4/32 KiB: 101.7 -> 104.3, 101.7 -> 106.1, 101.3 -> 100.1 (noise).
+- `BUCKET_BITS` 14: 101.7 -> 107.2. `SAMPLE_CLAIMS` 6: 101.3 -> 104.7.
+- `HEAVY_SHARE` 16/64 and `CHUNK` 32/128: noise.
+- `writev` output: 105.2 -> 105.3 (writing is only 0.7 ms).
+- Spinning barrier: 83-87 -> 102-103, spinners take cores from scanners.
+- No `madvise` at all: same on the laptop, but the box pays exit teardown on one thread.

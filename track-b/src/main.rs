@@ -662,16 +662,6 @@ impl Run {
             b.ends.copy_within(ready..end_count, 0);
             end_count -= ready;
         }
-        // Drop the scanned pages from this process's page tables now, on every thread, instead
-        // of one thread tearing down the whole mapping at exit. The mapping is a read-only
-        // private file, so a later touch (a neighbour's line search) just maps the page again.
-        // The sample's claims are read again by the main pass, so they are kept.
-        if !SAMPLE {
-            let (from, to) = (start.div_ceil(4096) * 4096, end / 4096 * 4096);
-            if from < to {
-                madvise(text.add(from) as *mut u8, to - from, MADV_DONTNEED);
-            }
-        }
         // The documents this claim held, which the sample uses to scale its counts.
         doc - first_doc + 1
     }
@@ -989,6 +979,17 @@ impl Run {
                 break;
             }
             self.step.wait();
+            if stage + 1 == phases {
+                // The scan is over: drop the text from the page tables in one slice per thread,
+                // instead of one thread tearing the whole mapping down at exit.
+                let threads = self.parsed.len();
+                let page = |n: usize| (self.len * n / threads).div_ceil(4096) * 4096;
+                madvise(
+                    self.text.add(page(id)) as *mut u8,
+                    page(id + 1).min(self.len.div_ceil(4096) * 4096) - page(id),
+                    MADV_DONTNEED,
+                );
+            }
             // Postings are u16 offsets from the phase's first document, with u16::MAX the sentinel.
             assert!(self.phase_base[stage + 1] - self.phase_base[stage] < u16::MAX as u32);
             self.each_job(&self.phase_jobs[stage], SHARDS + CLEAR_JOBS, |job| {
