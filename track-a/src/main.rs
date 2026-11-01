@@ -68,35 +68,36 @@ fn spaces_in(word: u64) -> u64 {
     z.wrapping_sub(0x0101_0101_0101_0101) & !z & 0x8080_8080_8080_8080
 }
 
-/// A hash of the whole name without a length-dependent loop: the masked first and last 32
-/// bytes cover any name up to 64 bytes, and the few longer ones also fold in the middle.
-/// Never leaves the id bits zero, so a live slot is never 0.
+/// A hash of the whole name without a length-dependent loop: the first and last 32 bytes, with
+/// the bytes outside the name masked off, cover any name up to 64 bytes; a longer name also
+/// mixes two loads that overlap its middle. Never leaves the id bits zero, so a live slot is
+/// never 0.
 ///
-/// Both loads may stray outside the name, which is safe: the tail load starts at most 32 bytes
+/// Loads may stray outside the name, which is safe: the tail load starts at most 32 bytes
 /// before the name's end, still inside the line (a name starts at byte 32 or later), and the
 /// head load runs at most 32 bytes past the end of the file, into the spare zero page.
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    // Lane numbers 0 to 31, to keep the first or the last `short` bytes of a 32-byte load.
-    let lanes: __m256i = std::mem::transmute(std::array::from_fn::<u8, 32, _>(|i| i as u8));
+    // Loading at `WINDOW + 64 - n` keeps the first n bytes, and at `WINDOW + n` the last n.
+    const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
     let load = |at: *const u8| _mm256_loadu_si256(at.cast());
-    let short = _mm256_set1_epi8(len.min(32) as i8);
-    let head = _mm256_and_si256(load(name), _mm256_cmpgt_epi8(short, lanes));
-    let ahead = _mm256_cmpgt_epi8(lanes, _mm256_sub_epi8(_mm256_set1_epi8(31), short));
-    let tail = _mm256_and_si256(load(name.add(len).sub(32)), ahead);
-    // Names over 64 bytes also fold in their middle, byte by byte. Shorter ones have none.
-    let middle = std::slice::from_raw_parts(name.add(32), len.saturating_sub(64));
-    let hash = middle.iter().fold(len as u64, |hash, &byte| {
-        (hash.rotate_left(5) ^ byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
-    });
-    // Three AES rounds (`vaesenc` does both 16-byte halves at once) mix head and tail far
-    // better than one multiply, at about the same cost. The round keys are the tail, then the
-    // length with a constant, then the output of the first round.
-    let key = _mm256_set_epi64x(KEY as i64, !KEY as i64, len as i64, -(len as i64));
-    let mixed = _mm256_aesenc_epi128(head, tail);
+    let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
+    let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
+    let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(window.add(n)));
+    let mut mixed = _mm256_aesenc_epi128(head, tail);
+    if len > 64 {
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
+    }
+    // Two more AES rounds (`vaesenc` does both 16-byte halves at once) mix far better than a
+    // multiply, at about the same cost.
+    let key = _mm256_set1_epi64x(KEY as i64);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
-    let [a, b, c, d]: [u64; 4] = std::mem::transmute(mixed);
-    (hash ^ a ^ b ^ c ^ d) | 1 << ID_BITS
+    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
+        _mm256_castsi256_si128(mixed),
+        _mm256_extracti128_si256(mixed, 1),
+    ));
+    (a ^ b) | 1 << ID_BITS
 }
 
 const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -156,6 +157,8 @@ impl Run {
         // Per hour, the next free row and the final slot of the chunk being filled: a row needs
         // two free, in case it has to escape.
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
+        let (mut key, mut hour, mut cursor) =
+            (u64::MAX, 0, (std::ptr::null_mut(), std::ptr::null_mut()));
         let mut ends = [0u32; BLOCK / MIN_LINE + 1];
         loop {
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
@@ -187,13 +190,22 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
+                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
                     // `clock` is "DDTHH:MM" (bytes 8 to 15 of the timestamp). Oct 30, Oct 31,
                     // Nov 1 and Nov 2 are day 0 to 3 of the span: the day's units digit plus
                     // one, less one in October, whose tens digit '3' (0x33) has bit 1 set
                     // where '0' (0x30) does not.
                     let clock = read(line.add(8));
-                    let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
-                    let hour = day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18;
+                    if clock << 24 != key {
+                        // Hours change rarely along the file, so the cursor of the current
+                        // hour stays in registers until the day and hour digits differ.
+                        cursors[hour] = cursor;
+                        key = clock << 24;
+                        let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
+                        hour =
+                            (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
+                        cursor = cursors[hour];
+                    }
                     // The method starts at byte 28 and is 3 to 6 letters, so the first space
                     // in that word gives its length, and the name follows it.
                     let method = spaces_in(read(line.add(28))).trailing_zeros() as usize / 8;
@@ -225,10 +237,9 @@ impl Run {
                     let is_error = (*status == b'5') as u32;
                     // Each worker fills its own chunk of each hour, so storing a row needs no
                     // atomics; only taking a new chunk touches the shared counter.
-                    let (hour, cursor) = (hour as usize, cursors.get_unchecked_mut(hour as usize));
                     if cursor.0 >= cursor.1 {
                         let at = self.claimed[hour].fetch_add(CHUNK, Relaxed) + hour * self.stride;
-                        *cursor = (self.rows.add(at), self.rows.add(at + CHUNK - 1));
+                        cursor = (self.rows.add(at), self.rows.add(at + CHUNK - 1));
                     }
                     *cursor.0 = ((id + 1) << 1 | is_error) << LATENCY_BITS | latency.min(ESCAPE);
                     cursor.0 = cursor.0.add(1);

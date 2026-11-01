@@ -56,3 +56,9 @@ Parse-only builds, best ms: full 12.0-12.5, newline scan alone 8.0, no hash -1.2
 **Failed (2026-11-01): futex barrier from Track B.** B gained ~5 ms by replacing `std::sync::Barrier` (1-4 ms wake latency, many barriers per run). This track has only one or two barriers, so the saving is about 0-3% and only on all cores (0% on cpuset 0-5), while the barrier adds ~35 lines. Net negative on the keep rule; not kept. SPIN 1000 vs 3000 made no consistent difference.
 
 **Failed (2026-11-01): file pages released in large slices.** Each 1 MiB claim calls `madvise(DONTNEED)` during the parse, which could interrupt every parsing thread with a TLB flush. Tried 16 MiB slices shared by the workers, right after the parse (v1) or after the summaries (v2). Paired 30 rounds, best/median µs: 12 CPUs base 17488/19478, v1 16920/19711, v2 17105/19974; cpuset 0-5 base 20454/22105, v1 20568/21655, v2 20320/21780. No clear gain for about 9 more lines, so not kept. Hash 495ca09682, worked example and empty file pass.
+
+## Prefetch, leaner hash, hour cursor in registers (2026-11-01)
+
+Single-thread, the newline scan alone is 14.8 of 32.5 ms and memory-bound; a pure read of the file walls at about 5.6 ms (42 GB/s). The parse sat near 9.8 ms because compute and memory did not overlap in a thread. Kept: one prefetch per line of the byte one block ahead, so the next 64 KiB loads while this one parses; hash masks from a window table, constant round keys, two overlapping loads instead of a byte loop for long names; the current hour's cursor kept in registers. Paired median ms, base to new: 12 CPUs 21.7->19.6 and 19.4->18.5, cpuset 0-5 24.9->22.7 and 23.6->21.3. Peak unchanged, S +10. Run ID: pending board.
+
+**Failed:** prefetch 2 or 4 blocks ahead, or in the scan loop at 16 or 128 KiB (tie); word-wise fold for long names alone. Not built: SIMD latency decode (same instruction count), bucketed SIMD probe (+30 lines for 5% of parse compute), 3-pass 8-bit radix.

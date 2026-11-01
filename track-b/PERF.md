@@ -72,3 +72,5 @@ Peak breakdown of about 42 MB: rows 11.4, postings 4.9, bitmaps 4.7, malloc aren
 **Failed:** PHASE_CLAIMS 60/45/32 (each extra phase costs 0.6-0.8 ms, the gain flattens at 60-100); HEAVY_SHARE 16/12 (lists grow as bitmaps shrink); QUERY_BATCH 32/16; CHUNK 16.
 
 **Reverted (2026-11-01): the 26 MiB memory work above.** Box `run-004a611bfcd9`: 102.8 ms, 28.2 MB, S 1169, 77.15, against `run-3296c9e23550` 94.0 ms, 43.2 MB, S 1145, 78.18. The score caps M_ref/M at 50, and for this track that is 44 MB, so memory below 44 MB earns nothing and only the time and line costs remained. It lives in history at 8c5e51e.
+
+**Failed (2026-11-01): tally add.** Removing the add alone saves 4.8 ms of 77.5 (and drops tally page touches), removing all answers 14.3 ms. Skip-empty (60% of list results are empty): median 75.6->73.7, 85.3->85.5, 75.4->78.6 on 12 CPUs, 92.6->91.6 on cpuset 0-5, inside noise. Prefetching the tally 4 queries ahead was worse. Batched or range-owned tallies are capped near 2 ms, so not built. Query caching is useless (49,651 distinct of 50,000).
