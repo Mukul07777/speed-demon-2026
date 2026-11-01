@@ -248,14 +248,6 @@ impl Run {
         let [mut hashes, mut lengths] = [[0u64; MAX_RECORDS]; 2];
         let mut signs = [0i64; MAX_RECORDS];
         let mut spare = 0..0; // name numbers this worker reserved
-        let mut late = [0u64; MAX_RECORDS]; // the bits of the previous batch, not yet set
-        let mut late_count = 0;
-        let set_bits = |bits: &[u64]| {
-            for &bit in bits {
-                let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                word.fetch_or(1 << (bit & 63), Relaxed);
-            }
-        };
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
         while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
@@ -340,7 +332,15 @@ impl Run {
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     // The top 15 bits of the hash pick the bucket.
-                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
+                    let bucket = self.2 .0[(hash >> 49) as usize].as_ptr().cast();
+                    // While the table fills (about 3/4 of the 100,000 first appearances come in the
+                    // first 16 MiB), a lookup is often followed by a compare-and-swap on the same
+                    // line, so take the line for write at once.
+                    if claim < 16 << 20 {
+                        _mm_prefetch::<_MM_HINT_ET0>(bucket);
+                    } else {
+                        _mm_prefetch::<_MM_HINT_T0>(bucket);
+                    }
                     // Ids past the table share its last entry, which stays 0: unmatched.
                     let region = (numbers[2][at] as usize).min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
@@ -369,11 +369,10 @@ impl Run {
                     // The hash is done with, so its slot carries the bit's address to the next pass.
                     hashes[at] = (word << 6 | name % 64) as u64;
                 }
-                // Last batch's bits, whose lines were prefetched a whole batch ago, then this batch's
-                // bits wait for the next round.
-                set_bits(&late[..late_count]);
-                late[..count].copy_from_slice(&hashes[..count]);
-                late_count = count;
+                for &bit in &hashes[..count] {
+                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
+                    word.fetch_or(1 << (bit & 63), Relaxed);
+                }
 
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
@@ -385,7 +384,6 @@ impl Run {
             // into whatever is mapped after the range, and would wipe it.
             madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
-        set_bits(&late[..late_count]);
         let mut totals = TOTALS.lock().unwrap();
         let merged = totals.as_flattened_mut().iter_mut();
         for (i, (a, &b)) in merged.zip(stats.as_flattened()).enumerate() {
