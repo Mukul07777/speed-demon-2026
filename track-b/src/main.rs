@@ -832,15 +832,18 @@ impl Run {
         };
         let mut spaces = [Vec::new(), Vec::new()];
         let phases = self.phase_base.len() - 1;
-        for phase in 0..phases {
+        let scan = |phase: usize, buffers: &mut Buffers| {
             let limit = (phase + 1) * PHASE_CLAIMS;
             loop {
                 let claim = phase * PHASE_CLAIMS + self.phase_claims[phase].fetch_add(1, Relaxed);
                 if claim >= limit || claim * CLAIM >= self.len {
                     break;
                 }
-                self.index_claim::<false>(claim, &mut [], &mut buffers);
+                self.index_claim::<false>(claim, &mut [], buffers);
             }
+        };
+        scan(0, &mut buffers);
+        for phase in 0..phases {
             self.step.wait();
             assert!(self.phase_base[phase + 1] - self.phase_base[phase] < u16::MAX as u32);
             self.each_job(&self.phase_jobs[phase], SHARDS + CLEAR_JOBS, |job| {
@@ -852,13 +855,16 @@ impl Run {
             });
             self.step.wait();
             // Each phase is answered while its lists are at hand and then forgotten, so
-            // memory holds one phase of postings and no more.
+            // memory holds one phase of postings and no more. The next phase is scanned
+            // meanwhile: the scan touches only the rows and the other bitmap set, which the
+            // build has just freed, so a thread out of answers moves on to scanning instead of
+            // waiting. The next build, after the barrier, is what overwrites these postings.
+            if phase + 1 < phases {
+                scan(phase + 1, &mut buffers);
+            }
             self.each_job(&self.answer_jobs[phase], batches, |batch| {
                 self.answer_batch(batch, phase, &mut scratch, &mut spaces)
             });
-            if phase + 1 < phases {
-                self.step.wait();
-            }
         }
     }
 }
