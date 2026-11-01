@@ -238,7 +238,6 @@ impl Run {
                 // Past the id, its comma, the three-letter code and the LF.
                 line += at + 5;
             }
-            madvise(self.1.as_ptr().add(claim) as *mut u8, (claim + (1 << 16)).min(self.1.len()) - claim, 4);
         }
         self.3.wait();
         // Records follow. PR_SET_THP_DISABLE is
