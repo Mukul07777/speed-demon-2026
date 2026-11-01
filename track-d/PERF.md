@@ -28,3 +28,7 @@ How to read the table: each row is one step, in order. Run ID, T, M and points a
 | next | **Failed**: profile-guided optimisation (allowed by the harness allowlist; three seed-1 full-data runs merged with llvm-profdata, rebuilt with `-C profile-use`, Dockerfile unchanged, offline). All checks pass; all cores median -2.3 to -3.2%, cpuset 0-5 -1.8 to -1.9%, under the 3% bar on both settings. Rejected: the bar was 3% on both settings, and the profile comes from seed 1 only. | | | | |
 
 **Failed (2026-11-01): futex barrier from Track B.** B gained ~5 ms by replacing `std::sync::Barrier` (1-4 ms wake latency, many barriers per run). This track has only one or two barriers, so the saving is about 0-3% and only on all cores (0% on cpuset 0-5), while the barrier adds ~35 lines. Net negative on the keep rule; not kept. SPIN 1000 vs 3000 made no consistent difference.
+
+## Backward search on the forward graph (2026-11-01)
+
+Roads are almost all two-way, so the backward graph repeated the forward one. Removed: backward arrays, in-degrees, scatter loop. A u16 `rev` array parallel to `forward.edges` holds the weight of the arc back, filled by a pull pass; one-way arcs go to a sorted list, flagged on the node. Distance blocks are u16, with larger labels in the `wide` map. Laptop peak 65->55 MiB (the grow phase now sets the floor at about 56), best +2%, median -3%. Hash, worked example and six generated seeds match. Run ID: pending board.
