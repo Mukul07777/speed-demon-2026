@@ -107,26 +107,21 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     let head = _mm256_and_si256(load(name), _mm256_cmpgt_epi8(short, lanes));
     let ahead = _mm256_cmpgt_epi8(lanes, _mm256_sub_epi8(_mm256_set1_epi8(31), short));
     let tail = _mm256_and_si256(load(name.add(len).sub(32)), ahead);
-    let mut hash = (len as u64).wrapping_mul(KEY);
-    if len > 64 {
-        hash = middle_hash(name, len);
-    }
-    // Each pair of 8-byte lanes goes through one multiply-and-fold, with its own keys.
-    let lanes: [u64; 8] = std::mem::transmute([head, tail]);
-    for i in 0..4 {
-        let key = |j: usize| KEY.wrapping_mul(2 * i as u64 + j as u64 + 1);
-        hash ^= fold_multiply(lanes[2 * i] ^ key(0), lanes[2 * i + 1] ^ key(1));
-    }
-    hash | 1 << ID_BITS
+    let hash = if len > 64 {
+        middle_hash(name, len)
+    } else {
+        len as u64
+    };
+    // Three AES rounds mix each 16-byte half. The tail is the first round key, and the
+    // length and constants go in as the later ones.
+    let key = _mm256_set_epi64x(KEY as i64, !KEY as i64, len as i64, -(len as i64));
+    let mixed = _mm256_aesenc_epi128(head, tail);
+    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
+    let [a, b, c, d]: [u64; 4] = std::mem::transmute(mixed);
+    (hash ^ a ^ b ^ c ^ d) | 1 << ID_BITS
 }
 
 const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// Multiplies to 128 bits and folds, the mixing step of wyhash.
-fn fold_multiply(a: u64, b: u64) -> u64 {
-    let product = a as u128 * b as u128;
-    product as u64 ^ (product >> 64) as u64
-}
 
 #[cold]
 unsafe fn middle_hash(name: *const u8, len: usize) -> u64 {
