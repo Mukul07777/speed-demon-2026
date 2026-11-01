@@ -35,8 +35,6 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
-// MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-const MAP_ANON: i32 = 0x4022;
 
 const HUGE_PAGE: usize = 1 << 21;
 // Structural bytes per record: four commas and an LF.
@@ -50,7 +48,6 @@ const MAX_RECORDS: usize = 32 * 64 / 11 + 5;
 // id, amount and region.
 // Quote masks kept for the rank query, more than one batch.
 const QUOTE_WORDS: usize = 1 << 10;
-const BUCKETS: usize = 1 << 15;
 // A name's dense number has 17 bits; the generator draws from 100,000 names.
 const NUMBER_BITS: i32 = 17;
 const NAME_MASK: u64 = (1 << NUMBER_BITS) - 1;
@@ -64,9 +61,11 @@ const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
 // that a zeroed group is a valid empty one and merging two needs only sums and maxima.
 const BIAS: i64 = 1 << 40;
 
-// Counters that hand out work: region claims, record claims, huge pages to zero, name numbers.
-static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-// Region id to group, and country code (as base-26 digits) to group. Both start zeroed.
+// Counters that hand out work: region claims, record claims, bytes of tables to zero, name
+// numbers, and country groups.
+static NEXT: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+// Region id to group, and country code (as base-26 digits) to group. Groups are numbered from 1
+// in order of first appearance; 0 is for unmatched records. Both start zeroed.
 static REGION_GROUP: [AtomicU8; REGION_IDS + 1] = [const { AtomicU8::new(0) }; REGION_IDS + 1];
 static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
 // The sums of all workers, in groups. A group's slots, for a worker and for these totals alike:
@@ -75,16 +74,14 @@ static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 
 // updates both), 4 the largest `BIAS + amount`, 5 the largest `BIAS - amount`. The last two
 // slots only pad a group to one cache line.
 static TOTALS: Mutex<[[i64; 8]; GROUPS]> = Mutex::new([[0; 8]; GROUPS]);
-// Group to country code, with the unmatched group first.
-static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The two shared tables, zeroed. Together they are exactly three huge pages.
-/// 0: the name buckets. A bucket is one cache line of eight slots. A slot holds a 47-bit name
+/// 0: the name buckets, 2^15 of them. A bucket is one cache line of eight slots. A slot holds a 47-bit name
 /// tag above the name's dense number, so one compare-and-swap claims a slot with its number.
 /// Numbers keep the bit matrix small.
 /// 1: the name bit matrix, `SEEN_WORDS` words per group.
 #[repr(C)]
-struct Tables([[AtomicU64; 8]; BUCKETS], [AtomicU64; GROUPS * SEEN_WORDS]);
+struct Tables([[AtomicU64; 8]; 1 << 15], [AtomicU64; GROUPS * SEEN_WORDS]);
 
 /// What the workers share: 0 the records file, 1 the regions file, 2 the tables, 3 the barrier
 /// after the regions are loaded.
@@ -186,18 +183,40 @@ impl Run {
         for slot in slots[index * 8..].iter().chain(slots) {
             // Read first: a compare-and-swap on a taken slot would only pull its line away from
             // the other cores.
-            match slot.load(Relaxed) {
-                // On failure the slot holds another name, or this one if a worker just added it.
-                0 => match slot.compare_exchange(0, claimed, Relaxed, Relaxed) {
-                    Ok(_) => return spare.next().unwrap(),
-                    Err(held) if held >> NUMBER_BITS == tag => return (held & NAME_MASK) as usize,
-                    Err(_) => {}
-                },
-                held if held >> NUMBER_BITS == tag => return (held & NAME_MASK) as usize,
-                _ => {}
+            let free = slot.load(Relaxed) == 0;
+            if free && slot.compare_exchange(0, claimed, Relaxed, Relaxed).is_ok() {
+                return spare.next().unwrap();
+            }
+            // A slot never changes once taken. If we lost the race for it, it holds another name,
+            // or this one if a worker just added it.
+            let held = slot.load(Relaxed);
+            if held >> NUMBER_BITS == tag {
+                return (held & NAME_MASK) as usize;
             }
         }
         unreachable!()
+    }
+
+    /// Reads this worker's share of `regions.csv` (ASCII, `id,CODE` lines) in 64 KiB claims. A
+    /// claim starts after the first LF at or past its start, so the header goes to nobody, and
+    /// owns the lines that begin within its bytes.
+    unsafe fn load_regions(&self) {
+        let new_group = || NEXT[4].fetch_add(1, Relaxed) as u8 + 1;
+        while let Some(claim) = take_block(&NEXT[0], 1 << 16, self.1.len()) {
+            let rest = &self.1[claim..];
+            let mut line = rest.iter().position(|&c| c == b'\n').unwrap() + 1;
+            while line <= 1 << 16 && line < rest.len() {
+                let row = &rest[line..];
+                let at = row.iter().position(|&c| c == b',').unwrap();
+                // (ASCII 48 is `0`.)
+                let id = row[..at].iter().fold(0, |n, &c| n * 10 + c as usize - 48);
+                let code = &row[at + 1..][..3];
+                let letters = code.iter().fold(0, |n, &c| n * 26 + (c - b'A') as usize);
+                REGION_GROUP[id].store(*LETTERS[letters].get_or_init(new_group), Relaxed);
+                // Past the id, its comma, the three-letter code and the LF.
+                line += at + 5;
+            }
+        }
     }
 
     /// One worker's whole life. It starts `descendants` more workers as a tree, so that no thread
@@ -211,34 +230,10 @@ impl Run {
         }
         // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
         // it while the regions load. It must end before huge pages are disabled.
-        let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
-        if page < size_of::<Tables>() {
+        if let Some(page) = take_block(&NEXT[2], HUGE_PAGE, size_of::<Tables>()) {
             (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
-        // Region claims are 64 KiB. Each starts after the first LF at or past its start, so the
-        // header goes to nobody and a line belongs to the claim holding the LF before it.
-        while let Some(claim) = take_block(&NEXT[0], 1 << 16, self.1.len()) {
-            let rest = &self.1[claim..];
-            let mut line = rest.iter().position(|&c| c == b'\n').unwrap() + 1;
-            while line <= 1 << 16 && line < rest.len() {
-                let row = &rest[line..];
-                let at = row.iter().position(|&c| c == b',').unwrap();
-                // (ASCII 48 is `0`.)
-                let id = row[..at].iter().fold(0, |n, &c| n * 10 + c as usize - 48);
-                // Groups are numbered from 1 in order of first appearance of the country.
-                let code = &row[at + 1..][..3];
-                let cell = &LETTERS[code.iter().fold(0, |n, &c| n * 26 + (c - b'A') as usize)];
-                // Only 240 lines get this far, so a lock is fine.
-                let group = cell.get_or_init(|| {
-                    let mut countries = COUNTRIES.lock().unwrap();
-                    countries.push(String::from_utf8_lossy(code).into_owned());
-                    countries.len() as u8 - 1
-                });
-                REGION_GROUP[id].store(*group, Relaxed);
-                // Past the id, its comma, the three-letter code and the LF.
-                line += at + 5;
-            }
-        }
+        self.load_regions();
         self.3.wait();
         // Records follow. PR_SET_THP_DISABLE is
         // idempotent, and set before the worker allocates anything for them.
@@ -253,6 +248,14 @@ impl Run {
         let [mut hashes, mut lengths] = [[0u64; MAX_RECORDS]; 2];
         let mut signs = [0i64; MAX_RECORDS];
         let mut spare = 0..0; // name numbers this worker reserved
+        let mut late = [0u64; MAX_RECORDS]; // the bits of the previous batch, not yet set
+        let mut late_count = 0;
+        let set_bits = |bits: &[u64]| {
+            for &bit in bits {
+                let word = self.2 .1.get_unchecked((bit >> 6) as usize);
+                word.fetch_or(1 << (bit & 63), Relaxed);
+            }
+        };
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
         while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
@@ -262,8 +265,8 @@ impl Run {
             let from = claim.saturating_sub(1);
             let begins = |pair: &[u8]| pair[0] == b'\n' && matches!(pair[1], b'0'..=b'9' | 0xEF);
             let origin = (self.0[from..].windows(2).position(begins)).map_or(len, |p| from + p + 1);
-            let mut record = origin; // the next record to read
-            let mut at = origin; // the next byte to scan
+            // The next record to read, and the next byte to scan.
+            let (mut record, mut at) = (origin, origin);
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
             while record < end {
                 for _ in 0..32 {
@@ -366,10 +369,11 @@ impl Run {
                     // The hash is done with, so its slot carries the bit's address to the next pass.
                     hashes[at] = (word << 6 | name % 64) as u64;
                 }
-                for &bit in &hashes[..count] {
-                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
-                }
+                // Last batch's bits, whose lines were prefetched a whole batch ago, then this batch's
+                // bits wait for the next round.
+                set_bits(&late[..late_count]);
+                late[..count].copy_from_slice(&hashes[..count]);
+                late_count = count;
 
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
@@ -381,11 +385,11 @@ impl Run {
             // into whatever is mapped after the range, and would wipe it.
             madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
+        set_bits(&late[..late_count]);
         let mut totals = TOTALS.lock().unwrap();
-        for (total, part) in totals.iter_mut().zip(&stats) {
-            for (i, (a, &b)) in total.iter_mut().zip(part).enumerate() {
-                *a = if i < 4 { *a + b } else { (*a).max(b) };
-            }
+        let merged = totals.as_flattened_mut().iter_mut();
+        for (i, (a, &b)) in merged.zip(stats.as_flattened()).enumerate() {
+            *a = if i % 8 < 4 { *a + b } else { (*a).max(b) };
         }
     }
 }
@@ -393,10 +397,10 @@ impl Run {
 /// Maps a file for reading, with a spare zero page after it so wide loads may run past the end.
 unsafe fn map(name: &str) -> &'static [u8] {
     let file = File::open(format!("/data/{name}.csv")).unwrap();
-    let (fd, len) = (file.as_raw_fd(), file.metadata().unwrap().len() as usize);
+    let len = file.metadata().unwrap().len() as usize;
     let size = len.next_multiple_of(4096) + 4096;
-    let base = mmap(null_mut(), size, 1, MAP_ANON, -1, 0); // PROT_READ
-    mmap(base, len, 1, 0x12, fd, 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
+    let base = mmap(null_mut(), size, 1, 0x4022, -1, 0); // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+    mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
     slice::from_raw_parts(base, len)
 }
 
@@ -404,7 +408,7 @@ unsafe fn map(name: &str) -> &'static [u8] {
 /// pages are touched later by the workers, because huge pages are disabled for everything else
 /// before the records start.
 unsafe fn zeroed<T>() -> &'static T {
-    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
+    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, 0x4022, -1, 0); // read, write, as above
     let aligned = region.add(region.align_offset(HUGE_PAGE));
     madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
     &*aligned.cast()
@@ -412,16 +416,18 @@ unsafe fn zeroed<T>() -> &'static T {
 
 fn main() {
     let n = thread::available_parallelism().map_or(12, |n| n.get());
-    COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };
     thread::scope(|s| unsafe { run.start(s, n - 1) });
 
+    // The table is indexed by base-26 code, so walking it lists the countries in sorted order.
+    // `_UNMATCHED` (group 0) sorts after every country code.
+    let countries = LETTERS.iter().enumerate().filter_map(|(code, group)| {
+        let letters = [code / 676, code / 26 % 26, code % 26].map(|d| (b'A' + d as u8) as char);
+        Some((letters.iter().collect::<String>(), *group.get()? as usize))
+    });
     let totals = TOTALS.lock().unwrap();
-    // `_UNMATCHED` sorts after every country code.
-    let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
-    keys.sort_unstable();
     let mut out = String::new();
-    for (key, group) in keys {
+    for (key, group) in countries.chain([("_UNMATCHED".into(), 0)]) {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
