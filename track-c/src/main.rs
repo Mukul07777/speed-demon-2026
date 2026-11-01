@@ -239,10 +239,7 @@ impl Run {
                 line += at + 5;
             }
         }
-        self.3.wait();
-        // Records follow. PR_SET_THP_DISABLE is
-        // idempotent, and set before the worker allocates anything for them.
-        prctl(41, 1usize, 0usize, 0usize, 0usize);
+        let mut waited = false;
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; GROUPS];
         let mut pos = [0u32; MAX_RECORDS * FIELDS];
@@ -346,6 +343,12 @@ impl Run {
                     lengths[at] = name_len as u64 | (note_len as u64) << 32;
                 }
                 record = start;
+                if !waited {
+                    // Regions and huge-page zeroing are done once everyone is here; THP off only then.
+                    self.3.wait();
+                    prctl(41, 1usize, 0usize, 0usize, 0usize);
+                    waited = true;
+                }
                 // The region table and the name table were each a cache miss on every record,
                 // half of the pass above when it read them itself. Now both are prefetched
                 // before this pass reads them. A locked update of a cold line stalls the core,
@@ -380,6 +383,9 @@ impl Run {
             // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
             // into whatever is mapped after the range, and would wipe it.
             madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
+        }
+        if !waited {
+            self.3.wait();
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
