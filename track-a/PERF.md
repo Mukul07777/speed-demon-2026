@@ -76,3 +76,5 @@ Single-thread, the newline scan alone is 14.8 of 32.5 ms and memory-bound; a pur
 Line cut on the streaming code (2026-11-01): rustfmt S 363 -> 346, text and placement under one mutex, `sealed` field removed, single-use closures folded. Medians 19.78->19.13, 21.02->19.76 on 12 CPUs, 23.24->22.99, 23.08->22.63 on cpuset 0-5. Hash, worked example, empty file and 10 adversarial files pass.
 
 **Reverted (2026-11-01): the line cut to S 353.** Box 19.49, 19.67, 19.79 ms (85.94, 85.70, 85.76) against 19.17, 19.27, 18.67 ms (85.95, 85.88, 86.17) at S 370. About 3% slower, which outweighs the lines.
+
+**Not kept (2026-11-01): idle threads share writing ready hours.** `run-4bcc3237cdf1` 19.15 ms, 15.9 MB, S 377, 85.94: a tie with the 85.88-86.17 band for 7 more lines. Sealing at h+1 is unsafe: hour-h lines arrive up to 1.38 MiB after the first h+1 line, and claims are 1 MiB.
