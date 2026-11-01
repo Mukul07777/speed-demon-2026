@@ -88,3 +88,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Failed (2026-11-01, tools/wt_b20).** Skipping zero counts in the sample merge, flat spawn and a 4-way spawn tree: ties or worse. Dropping the sample: correct but 2.9 s, heavy terms become giant lists. Rejected at counting: cheaper heavy-term guess or sample reuse (about 1 ms, and phrase anchors need the sample), hashing during tokenising (about 0.4 ms wall), build overlap (+11 MiB, over the 44 MB cap).
 
 **Failed (2026-11-01, tools/wt_b21):** AHEAD 12 and 8 (medians 95.4, 103.6 against 92.7); a 1024-entry hot table in the lookup loop (126.9, the branch is near 50/50). Frequency-ordered slots cannot help a single vector compare, and smaller buckets cost overflow chains.
+
+**Failed (2026-11-01, tools/wt_b22).** Lookup loop rewritten with pointer cursors after reading the assembly (34 instructions per token): 97.2/145.8 -> 101.2/151.3 and 105.3/125.1 -> 108.8/125.9 ms, slower. Counted, not built: multiply hash for tokens up to 8 bytes (80% of tokens, 1-2%), sample overlapped with query parse (0.5-1 ms, about 40 lines).
