@@ -70,3 +70,5 @@ Single-thread, the newline scan alone is 14.8 of 32.5 ms and memory-bound; a pur
 ## Hours summarised during the parse (2026-11-01)
 
 `run-5ae91af2706b`: 19.17 ms, 16.1 MB, S 370, 85.95 (was 20.09 ms, 20.3 MB, S 329, 84.80). After each claim a worker records the lowest and highest hour it held; hour h is sealed once the parsed prefix of the file holds a line of hour h+2. Any worker then summarises, writes and frees it, so the barrier is gone and rows die early. A line from a sealed hour sets `dirty` and the whole job reruns with no early sealing, so any ordering stays exact (tested on shuffled, late-line, swapped and reversed files; seeds 1-9 never rerun, margin 0.78-0.83 MiB). The earlier attempt at step 23 gained little because it kept more hours in flight. Caps on concurrent hours and smaller claims failed.
+
+**Not kept (2026-11-01): 20 us sleep instead of yielding at the end of the parse.** `run-0a2da0f0982f` 20.8 ms, 15.2 MB, 85.29: memory -0.9 MB but time +8% in a slowish round.
