@@ -49,3 +49,7 @@ A bucket stays one 64-byte line but holds 8 u32 tags and 8 u32 number words (14 
 **Rejected at counting:** name-major bitmap (+6-8 MB), sorted staged bit updates (lines stay random), group-partitioned lists (10-13 MB), smaller name table (overflows).
 
 **Reverted (2026-11-01): the 32-bit tag buckets above.** Box 22.19 ms (`run-3cb96f167de2`, 82.10) and 22.22 ms (`run-76252468fe28`, 81.72) against 22.0 ms (`run-b7163ec15e9a`, 82.40). The laptop's -9 to -14% came from a session running 2.7x slow, and it did not reach the box. It lives in history at 6798244.
+
+## Read-ahead prefetch (2026-11-01)
+
+The same cause as Track A's parse: compute and memory did not overlap within a thread. One prefetch per 64-byte scan step, 16 KiB ahead. Paired 20 rounds, median ms base to new: 12 CPUs 23.5->21.6 and 22.7->21.8, cpuset 0-5 27.2->25.4 and 27.3->27.2. Peak unchanged, S +1. Run ID: pending board.

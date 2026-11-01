@@ -267,6 +267,8 @@ impl Run {
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
             while record < end {
                 for _ in 0..32 {
+                    // Load the text ahead so memory and parsing overlap within this thread.
+                    _mm_prefetch::<_MM_HINT_T0>(input.add(at + (1 << 14)).cast());
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
                     let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
