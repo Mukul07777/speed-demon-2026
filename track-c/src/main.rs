@@ -19,30 +19,17 @@
 //!
 //! Each record then sets its name's bit in its country's row of one shared bit matrix, and
 //! popcounts of the rows give the distinct names.
-use std::arch::x86_64::*;
-use std::fs::File;
-use std::ops::Range;
-use std::os::fd::AsRawFd;
-use std::ptr::{null_mut, read_unaligned};
-use std::slice::from_raw_parts;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex};
-use std::thread;
+use std::{arch::x86_64::*, fs::File, ops::Range, os::fd::AsRawFd, ptr::*, slice::from_raw_parts};
+use std::{sync::Barrier, sync::Mutex, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
-const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
-// MAP_PRIVATE | MAP_FIXED
-const MAP_FILE: i32 = 0x12;
 // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const MAP_ANON: i32 = 0x4022;
-const MADV_HUGEPAGE: i32 = 14;
-const MADV_DONTNEED: i32 = 4;
-const PR_SET_THP_DISABLE: i32 = 41;
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 20;
@@ -367,7 +354,7 @@ impl Run {
             // record running into the next claim just faults its few pages back in.
             // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
             // into whatever is mapped after the range, and would wipe it.
-            madvise(input.add(claim), end - claim, MADV_DONTNEED);
+            madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -445,15 +432,9 @@ impl Run {
         self.parse_regions();
         self.regions_done.wait();
         // Idempotent, and set before this worker allocates anything for the records.
-        unsafe { prctl(PR_SET_THP_DISABLE, 1usize, 0usize, 0usize, 0usize) };
+        unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) }; // PR_SET_THP_DISABLE
         unsafe { self.parse_records() };
     }
-}
-
-/// Cents as text: a sign if negative, the units, a point and exactly two digits.
-fn money(cents: i64) -> String {
-    let (sign, abs) = (if cents < 0 { "-" } else { "" }, cents.unsigned_abs());
-    format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }
 
 /// Maps a file for reading, with a spare zero page after it so wide loads may run past the end.
@@ -461,8 +442,8 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap();
     let (fd, len) = (file.as_raw_fd(), file.metadata().unwrap().len() as usize);
     let size = len.next_multiple_of(4096) + 4096;
-    let base = mmap(null_mut(), size, PROT_READ, MAP_ANON, -1, 0);
-    mmap(base, len, PROT_READ, MAP_FILE, fd, 0);
+    let base = mmap(null_mut(), size, 1, MAP_ANON, -1, 0); // PROT_READ
+    mmap(base, len, 1, 0x12, fd, 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
     from_raw_parts(base, len)
 }
 
@@ -470,10 +451,9 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 /// pages are touched later by the workers, because huge pages are disabled for everything else
 /// before the records start.
 unsafe fn zeroed_huge<T>() -> &'static T {
-    let (len, prot) = (size_of::<T>() + HUGE_PAGE, PROT_READ | PROT_WRITE);
-    let region = mmap(null_mut(), len, prot, MAP_ANON, -1, 0);
+    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
     let aligned = region.add(region.align_offset(HUGE_PAGE));
-    madvise(aligned, size_of::<T>(), MADV_HUGEPAGE);
+    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
     &*aligned.cast()
 }
 
@@ -499,7 +479,11 @@ fn main() {
         let s = &totals[group];
         let row = &run.tables.seen[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        let [sum, min, max] = [s.amount_sum, BIAS - s.amount_lo, s.amount_hi - BIAS].map(money);
+        let [sum, min, max] = [s.amount_sum, BIAS - s.amount_lo, s.amount_hi - BIAS].map(|cents| {
+            // Cents as text: a sign if negative, the units, a point and exactly two digits.
+            let (sign, abs) = (if cents < 0 { "-" } else { "" }, cents.unsigned_abs());
+            format!("{sign}{}.{:02}", abs / 100, abs % 100)
+        });
         let (count, id_sum) = (s.count, s.id_sum);
         let (name_bytes, note_bytes) = (s.lengths & 0xFFFF_FFFF, s.lengths >> 32);
         if count > 0 {
