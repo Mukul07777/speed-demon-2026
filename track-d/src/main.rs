@@ -19,7 +19,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread;
 
@@ -27,6 +27,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn prctl(option: i32, arg: u64, a: u64, b: u64, c: u64) -> i32;
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -56,7 +57,8 @@ const REWRITE_BATCH: usize = 64; // edges translated together, after prefetching
 const BLOCK_SHIFT: u32 = 6; // distances live in blocks of this many neighbouring nodes
 const BLOCK_NODES: usize = 1 << BLOCK_SHIFT;
 const WINDOW: usize = 1 << WEIGHT_BITS; // edges with weights that fit reach less far ahead
-const LABEL_SHIFT: u32 = 26; // a claimed node is (worker + 1) << 26 | position in its order
+const LABEL_SHIFT: u32 = 26; // a claimed node is CLAIMED | worker << 26 | position in its order
+const CLAIMED: u32 = 1 << 31; // above every raw node entry, which is below 2^28
 const UNREACHED: u64 = u64::MAX;
 const NONE: u32 = u32::MAX; // a distance slot nothing has reached, or whose distance is in `Side::wide`
 const ZEROS: u64 = 0x3030_3030_3030_3030;
@@ -93,9 +95,9 @@ impl Rows {
             .flat_map(|chunk| chunk.iter().copied().take_while(|row| row.packed != 0))
     }
 
-    unsafe fn release(&self) {
-        let bytes = self.claimed.len() * SHARD_ROWS * size_of::<Row>();
-        madvise(self.rows.cast(), bytes, MADV_DONTNEED);
+    unsafe fn release(&self, shard: usize) {
+        let rows = self.rows.add(shard * SHARD_ROWS);
+        madvise(rows.cast(), SHARD_ROWS * size_of::<Row>(), MADV_DONTNEED);
     }
 
     /// Appends a row to its node's shard, at the worker's own `cursors` (the next free row and
@@ -143,18 +145,17 @@ impl Graph {
 
     #[inline(always)]
     unsafe fn edges_of(&self, node: usize) -> &[u32] {
-        let entry = *self.nodes.add(node);
+        self.edges_at(*self.nodes.add(node))
+    }
+
+    #[inline(always)]
+    unsafe fn edges_at(&self, entry: u32) -> &[u32] {
         let start = (entry >> START_SHIFT) as usize;
         std::slice::from_raw_parts(self.edges.add(start), (entry & DEGREE_MASK) as usize)
     }
 
-    unsafe fn release(&self) {
-        madvise(self.nodes.cast(), self.node_count * 4, MADV_DONTNEED);
-        madvise(self.edges.cast(), self.edge_bytes, MADV_DONTNEED);
-    }
-
-    /// Fills in one shard of nodes from its rows. This graph's node count is a whole number
-    /// of shards.
+    /// Fills in one shard of nodes from its rows, then frees them. This graph's node count is
+    /// a whole number of shards.
     unsafe fn build_shard(&self, rows: &Rows, shard: usize) {
         // Each node's degree, then the slot for its next edge.
         let mut cursor = [0u32; SHARD_NODES];
@@ -173,6 +174,7 @@ impl Graph {
             *self.edges.add(*slot as usize) = row.packed - (1 << WEIGHT_BITS);
             *slot += 1;
         }
+        rows.release(shard);
     }
 }
 
@@ -227,7 +229,6 @@ struct Run {
     forward: Graph,
     backward: Graph,
     in_degrees: *mut AtomicU8,
-    labels: *mut AtomicU32,
     heavy: Mutex<Vec<(u32, u32, u32)>>,  // tail, head and weight
     claimed: Mutex<Vec<(usize, usize)>>, // worker, nodes
     layout: OnceLock<Layout>,
@@ -313,7 +314,7 @@ impl Run {
         let share = |worker: usize| (worker * self.nodes / self.threads) as u32;
         let mut scan = share(worker)..share(worker + 1);
         while let Some(seed) = seeds.pop().or_else(|| scan.next()) {
-            if (*self.labels.add(seed as usize)).load(Relaxed) != 0 {
+            if *self.raw.nodes.add(seed as usize) & CLAIMED != 0 {
                 continue;
             }
             queue.clear();
@@ -322,23 +323,26 @@ impl Run {
             while head < queue.len() && size < CELL {
                 if let Some(&ahead) = queue.get(head + FAR_AHEAD) {
                     _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(ahead as usize).cast());
-                    _mm_prefetch::<_MM_HINT_T0>(self.labels.add(ahead as usize).cast());
                 }
                 if let Some(&ahead) = queue.get(head + NEAR_AHEAD) {
+                    // A label here makes a junk address, which a prefetch ignores.
                     let start = *self.raw.nodes.add(ahead as usize) >> START_SHIFT;
-                    _mm_prefetch::<_MM_HINT_T0>(self.raw.edges.add(start as usize).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(self.raw.edges.wrapping_add(start as usize).cast());
                 }
                 let node = queue[head] as usize;
                 head += 1;
-                let label = &*self.labels.add(node);
-                let value = ((worker as u32 + 1) << LABEL_SHIFT) | entries.len() as u32;
-                if label.load(Relaxed) != 0
-                    || label.compare_exchange(0, value, Relaxed, Relaxed).is_err()
+                // The raw entry gives way to the node's label, so claiming a node costs no
+                // cache miss beyond reading its entry.
+                let at = &*self.raw.nodes.add(node).cast::<AtomicU32>();
+                let entry = at.load(Relaxed);
+                let value = CLAIMED | (worker as u32) << LABEL_SHIFT | entries.len() as u32;
+                if entry & CLAIMED != 0
+                    || at.compare_exchange(entry, value, Relaxed, Relaxed).is_err()
                 {
                     continue;
                 }
                 size += 1;
-                let neighbours = self.raw.edges_of(node);
+                let neighbours = self.raw.edges_at(entry);
                 if cursor + neighbours.len() > limit {
                     chunks.push((from, cursor));
                     from = self.forward.next_edge.fetch_add(EDGE_CLAIM, Relaxed);
@@ -359,8 +363,8 @@ impl Run {
 
     #[inline(always)]
     unsafe fn new_id(&self, base: &[u32], old: usize) -> u32 {
-        let label = (*self.labels.add(old)).load(Relaxed);
-        let worker = (label >> LABEL_SHIFT) as usize - 1;
+        let label = *self.raw.nodes.add(old) & !CLAIMED;
+        let worker = (label >> LABEL_SHIFT) as usize;
         *base.get_unchecked(worker) + (label & ((1 << LABEL_SHIFT) - 1))
     }
 
@@ -400,7 +404,7 @@ impl Run {
             for batch in edges.chunks_mut(REWRITE_BATCH) {
                 for edge in batch.iter() {
                     let head = (edge >> WEIGHT_BITS) as usize;
-                    _mm_prefetch::<_MM_HINT_T0>(self.labels.add(head).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(head).cast());
                 }
                 for edge in batch {
                     let head = self.new_id(&layout.node_base, (*edge >> WEIGHT_BITS) as usize);
@@ -440,12 +444,12 @@ impl Run {
         self.parse();
         self.next_step(|| {});
         self.each_job(self.shards, |shard| self.raw.build_shard(&self.rows, shard));
-        self.next_step(|| self.rows.release());
+        self.next_step(|| {});
         let (entries, chunks) = self.grow_cells(worker);
         self.claimed.lock().unwrap().push((worker, entries.len()));
         self.next_step(|| {
             let _ = self.layout.set(self.plan_layout());
-            self.raw.release();
+            madvise(self.raw.edges.cast(), self.raw.edge_bytes, MADV_DONTNEED);
         });
         let layout = self.layout.get().unwrap();
         let first_id = layout.node_base[worker] as usize;
@@ -455,7 +459,7 @@ impl Run {
         drop(entries);
         self.rewrite_forward(&chunks, layout);
         self.next_step(|| {
-            madvise(self.labels.cast(), self.nodes * 4, MADV_DONTNEED);
+            madvise(self.raw.nodes.cast(), self.nodes * 4, MADV_DONTNEED);
             self.lay_out_backward();
         });
         self.fill_backward(own_nodes);
@@ -604,6 +608,11 @@ impl<'a> Side<'a> {
         }
         self.touched.clear();
         self.distances.clear();
+        // A long search's blocks go back to the system, so that memory follows the searches
+        // under way, not the longest one each thread has run.
+        if self.distances.capacity() > 1 << 16 {
+            self.distances = Vec::new();
+        }
         self.wide.clear();
         self.queue.clear();
     }
@@ -735,6 +744,9 @@ fn read_queries() -> Vec<(u32, u32)> {
 fn main() {
     // Huge pages would round the per-thread buffers up to 2 MiB each.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    // A fixed threshold, so that big blocks always come from and go back to mmap (-3 is
+    // M_MMAP_THRESHOLD; glibc would otherwise raise it after the first big free).
+    unsafe { mallopt(-3, 1 << 17) };
     let file = File::open("/data/graph.txt").unwrap();
     let text_len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -757,7 +769,6 @@ fn main() {
             forward: Graph::new(nodes, edges + (edges >> 3) + (1 << 20)),
             backward: Graph::new(nodes, edges),
             in_degrees: reserve(nodes).cast(),
-            labels: reserve(nodes * 4).cast(),
             heavy: Mutex::new(Vec::new()),
             claimed: Mutex::new(Vec::new()),
             layout: OnceLock::new(),
