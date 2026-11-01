@@ -411,7 +411,7 @@ unsafe fn zeroed<T>() -> &'static T {
 }
 
 fn main() {
-    let n = thread::available_parallelism().map_or(12, |n| n.get());
+    let n = thread::available_parallelism().map_or(12, |n| n.get()).min(10);
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };
     thread::scope(|s| unsafe { run.start(s, n - 1) });
