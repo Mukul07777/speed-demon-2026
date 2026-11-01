@@ -33,7 +33,6 @@ const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MADV_DONTNEED: i32 = 4;
-const MADV_POPULATE_READ: i32 = 22;
 const PR_SET_THP_DISABLE: i32 = 41;
 
 const CLAIM: usize = 1 << 20;
@@ -279,11 +278,6 @@ impl Run {
             if claim >= self.len {
                 return;
             }
-            madvise(
-                input.add(claim) as *mut u8,
-                CLAIM.min(mapped_end - claim),
-                MADV_POPULATE_READ,
-            );
             // A line belongs to the claim holding its newline. The first one starts after
             // the previous claim's last newline, at most one line back.
             let mut line = input.add(claim);

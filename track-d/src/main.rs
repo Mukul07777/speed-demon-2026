@@ -38,7 +38,6 @@ const PR_SET_THP_DISABLE: i32 = 41;
 const MADV_DONTNEED: i32 = 4;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
-const MADV_POPULATE_READ: i32 = 22;
 
 const CLAIM: usize = 1 << 20;
 const SHARD_SHIFT: u32 = 13; // few enough shards that a worker's write positions stay in L1
@@ -290,7 +289,6 @@ unsafe impl Sync for Run {}
 impl Run {
     unsafe fn parse(&self, writer: &mut Writer) {
         let text = self.text;
-        let mapped_end = self.text_len.div_ceil(4096) * 4096;
         let digit_floor = _mm256_set1_epi8(b'0' as i8);
         let mut heavy = Vec::new();
         loop {
@@ -298,11 +296,6 @@ impl Run {
             if claim >= self.text_len {
                 break;
             }
-            madvise(
-                text.add(claim) as *mut u8,
-                CLAIM.min(mapped_end - claim),
-                MADV_POPULATE_READ,
-            );
             // A line belongs to the claim it starts in. The header belongs to nobody.
             let mut at = claim;
             if claim == 0 || *text.add(claim - 1) != b'\n' {

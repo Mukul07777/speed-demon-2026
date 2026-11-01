@@ -38,7 +38,6 @@ const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
 const MADV_DONTNEED: i32 = 4;
 const PR_SET_THP_DISABLE: i32 = 41;
-const MADV_POPULATE_READ: i32 = 22;
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
@@ -455,8 +454,6 @@ impl Run {
         }
         let first_doc = doc;
         let text = self.text;
-        let page = start / 4096 * 4096;
-        madvise(text.add(page) as *mut u8, end - page, MADV_POPULATE_READ);
 
         let empty = std::ptr::null_mut();
         let mut cursors = [(empty, empty); SHARDS];
