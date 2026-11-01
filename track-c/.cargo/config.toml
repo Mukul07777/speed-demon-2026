@@ -1,2 +1,2 @@
 [build]
-rustflags = ["-C", "target-cpu=raptorlake"]
+rustflags = ["-C", "llvm-args=-align-loops=32", "-C", "target-cpu=raptorlake"]
