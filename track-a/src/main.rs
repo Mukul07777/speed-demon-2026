@@ -33,7 +33,7 @@
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
-use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
+use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex};
 use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
@@ -98,16 +98,12 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     }
     // Two more AES rounds (`vaesenc` does both 16-byte halves at once) mix far better than a
     // multiply, at about the same cost.
-    let key = _mm256_set1_epi64x(KEY as i64);
+    let key = _mm256_set1_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
-    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
-        _mm256_castsi256_si128(mixed),
-        _mm256_extracti128_si256(mixed, 1),
-    ));
-    (a ^ b) | 1 << ID_BITS
+    let [a, b, c, d]: [u64; 4] = std::mem::transmute(mixed);
+    (a ^ b ^ c ^ d) | 1 << ID_BITS
 }
 
-const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Run {
     input: *mut u8,
@@ -119,22 +115,19 @@ struct Run {
     // deliberate shortcut Tracks B and C take: with 1,842 names the chance of any two
     // colliding is about 2e-10.
     slots: [AtomicU64; SLOTS], // hash >> 11 << 11 | id + 1; 0 is an empty slot
-    names: Mutex<Vec<&'static [u8]>>, // by id
-    // The names in output order with their ids, as of the last time anyone asked.
-    order: Mutex<Arc<Vec<(&'static [u8], usize)>>>,
+    // The names by id, and in output order with their ids as of the last time anyone asked.
+    names: Mutex<(Vec<&'static [u8]>, Arc<Vec<(&'static [u8], usize)>>)>,
     rows: *mut u32,
     stride: usize,
     claimed: [AtomicUsize; HOURS], // rows of each hour's region given out in chunks
     // Per claim: 0 until parsed, then 1 << 16 | lowest hour << 8 | highest hour of its lines.
     parsed: Vec<AtomicU32>,
-    // Hours below this have all their rows. Early sealing is a bet on the input's order (see `advance`).
-    sealed: AtomicUsize,
     early: bool,
     dirty: AtomicBool, // a line turned up in an hour that was already sealed
     next_hour: AtomicUsize,
-    texts: [OnceLock<&'static [u8]>; HOURS], // each hour's text, until it is written
     output: File,
-    placed: Mutex<(usize, u64)>, // the next hour to place in the file, and its offset
+    // Each hour's text until it is written, the next hour to place in the file, and its offset.
+    placed: Mutex<([Option<&'static [u8]>; HOURS], usize, u64)>,
 }
 unsafe impl Sync for Run {}
 
@@ -144,21 +137,21 @@ impl Run {
     /// name is new and goes there. The name is written before the Release store publishes the
     /// slot, so a reader that sees the slot sees the name.
     #[inline(always)]
-    unsafe fn lookup(&self, name: *const u8, len: usize) -> usize {
+    unsafe fn lookup(&self, name: *const u8, len: usize) -> u32 {
         let hash = name_hash(name, len);
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
             let slot = self.slots[i].load(Acquire);
             if slot >> ID_BITS == hash >> ID_BITS {
-                return (slot & ID_MASK) as usize - 1;
+                return (slot & ID_MASK) as u32;
             } else if slot == 0 {
-                let mut names = self.names.lock().unwrap();
+                let names = &mut self.names.lock().unwrap().0;
                 if self.slots[i].load(Acquire) == 0 {
                     let id = names.len();
                     assert!(id < ID_MASK as usize); // id + 1 must fit the low bits of a slot
                     names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
                     self.slots[i].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
-                    return id;
+                    return id as u32 + 1;
                 }
                 continue; // another worker filled this slot meanwhile: look at it again
             }
@@ -217,9 +210,9 @@ impl Run {
                         // hour stays in registers until the day and hour digits differ.
                         cursors[hour] = cursor;
                         key = clock << 24;
-                        let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
-                        hour =
-                            (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
+                        let digit = |shift: u32| clock >> shift & 15;
+                        let day = digit(8) + 1 - (clock >> 1 & 1);
+                        hour = (day * 24 + digit(24) * 10 + digit(32) - 18) as usize;
                         cursor = cursors[hour];
                         (low, high) = (low.min(hour), high.max(hour));
                     }
@@ -250,15 +243,15 @@ impl Run {
                     // The line ends "<name> <status> <latency>\n", with a 3-digit status.
                     let status = end.sub(digits + 4);
                     let len = status.sub(1).offset_from(name) as usize;
-                    let id = self.lookup(name, len) as u32;
-                    let is_error = (*status == b'5') as u32;
+                    let group = self.lookup(name, len); // id + 1
+                    let error = (*status == b'5') as u32;
                     // Each worker fills its own chunk of each hour, so storing a row needs no
                     // atomics; only taking a new chunk touches the shared counter.
                     if cursor.0 >= cursor.1 {
                         let at = self.claimed[hour].fetch_add(CHUNK, Relaxed) + hour * self.stride;
                         cursor = (self.rows.add(at), self.rows.add(at + CHUNK - 1));
                     }
-                    *cursor.0 = ((id + 1) << 1 | is_error) << LATENCY_BITS | latency.min(ESCAPE);
+                    *cursor.0 = (group << 1 | error) << LATENCY_BITS | latency.min(ESCAPE);
                     cursor.0 = cursor.0.add(1);
                     if latency >= ESCAPE {
                         *cursor.0 = latency;
@@ -298,15 +291,13 @@ impl Run {
             self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
             top = top.max((info & 255) * self.early as usize);
         }
-        self.sealed.fetch_max(sealed, Release);
-        let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
-        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
-            return;
-        };
+        // Hours below `sealed` have all their rows. Each thread works from its own snapshot of
+        // the claims, which only ever lags behind the truth, so it seals too little, never too much.
+        let take = |hour| (hour < sealed).then_some(hour + 1);
+        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, take) else { return };
         // The names may have grown since the last hour was summarised.
         let order = {
-            let names = self.names.lock().unwrap();
-            let mut order = self.order.lock().unwrap();
+            let (names, order) = &mut *self.names.lock().unwrap();
             if order.len() != names.len() {
                 let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
                 sorted.sort_unstable();
@@ -315,10 +306,7 @@ impl Run {
             order.clone()
         };
         let part = unsafe { self.summarise(hour, &order) };
-        self.texts[hour].set(part).unwrap();
-        // Whoever takes the lock after an hour's text is set sees it, so every hour is
-        // written exactly once, by the thread that finds it ready.
-        self.write_ready();
+        self.write_ready(hour, part);
     }
 
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
@@ -382,17 +370,14 @@ impl Run {
         for start in starts.iter_mut() {
             (total, *start) = (total + *start, total);
         }
-        let mut deal = |row: u32, latency: u32| {
+        let short = (0..count).map(|i| (*rows.add(i), *rows.add(i) & ESCAPE));
+        for (row, latency) in short.chain(long.iter().map(|&(latency, row)| (row, latency))) {
             let start = starts.get_unchecked_mut((row >> (LATENCY_BITS + 1)) as usize);
             *spare.add(*start as usize) = latency;
             // Group id + 1 advances from its start to its end, which is where the next group
             // started, so starts[id]..starts[id + 1] ends up as the span of `id`.
             *start += 1;
-        };
-        for i in 0..count {
-            deal(*rows.add(i), *rows.add(i) & ESCAPE);
         }
-        long.iter().for_each(|&(latency, row)| deal(row, latency));
 
         // The hour as text with a trailing space (21 bytes), copied in front of every line.
         let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
@@ -409,10 +394,10 @@ impl Run {
             copy_nonoverlapping(label.as_ptr(), w, 21);
             copy_nonoverlapping(name.as_ptr(), w.add(21), name.len());
             w = w.add(21 + name.len());
-            for number in [n, at_rank(50), at_rank(95), at_rank(99), bad] {
+            let permille = (bad as u64 * 1_000_000 / n as u64) as u32;
+            for number in [n, at_rank(50), at_rank(95), at_rank(99), bad, permille] {
                 w = put_number(w, number);
             }
-            w = put_number(w, (bad as u64 * 1_000_000 / n as u64) as u32);
             *w = b'\n';
             w = w.add(1);
         }
@@ -424,21 +409,22 @@ impl Run {
     /// Gives every ready hour whose predecessors are placed its offset in the file, then
     /// writes those hours outside the lock. Writers in different threads run at once, which
     /// matters: one thread writing 10 MB to tmpfs fell up to 2 ms behind the summaries.
-    fn write_ready(&self) {
+    fn write_ready(&self, done: usize, part: &'static [u8]) {
         let mut ready = Vec::new();
         {
-            let mut placed = self.placed.lock().unwrap();
-            let (next, offset) = &mut *placed;
-            while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
-                ready.push((*next, *offset, *text));
+            // Whoever takes the lock after an hour's text is stored sees it, so every hour is
+            // written exactly once, by the thread that finds it ready.
+            let (texts, next, offset) = &mut *self.placed.lock().unwrap();
+            texts[done] = Some(part);
+            while let Some(&Some(text)) = texts.get(*next) {
+                ready.push((*next, *offset, text));
                 (*next, *offset) = (*next + 1, *offset + text.len() as u64);
             }
         }
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back.
-            let rows = unsafe { self.rows.add(hour * self.stride) };
-            unsafe { madvise(rows.cast(), self.stride * 4, 4) };
+            unsafe { madvise(self.rows.add(hour * self.stride).cast(), self.stride * 4, 4) };
         }
     }
 
@@ -516,19 +502,16 @@ fn solve(early: bool) -> bool {
         len,
         next_claim: AtomicUsize::new(0),
         slots: [const { AtomicU64::new(0) }; SLOTS],
-        names: Mutex::new(Vec::new()),
+        names: Mutex::default(),
         rows,
         stride,
         claimed: [const { AtomicUsize::new(0) }; HOURS],
-        order: Mutex::default(),
         parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
-        sealed: AtomicUsize::new(0),
         early,
         dirty: AtomicBool::new(false),
         next_hour: AtomicUsize::new(0),
-        texts: [const { OnceLock::new() }; HOURS],
         output: File::create("/out/summary.txt").unwrap(),
-        placed: Mutex::new((0, 0)),
+        placed: Mutex::new(([None; HOURS], 0, 0)),
     };
     thread::scope(|s| {
         for _ in 1..threads {
