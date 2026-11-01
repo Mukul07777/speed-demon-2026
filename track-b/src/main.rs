@@ -45,7 +45,6 @@ extern "C" {
 const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 
 const HUGE_PAGE: usize = 1 << 21;
-const HUGE_ARENA: usize = 2;
 const CLAIM: usize = 1 << 18;
 // 50 MiB of text between turning rows into postings.
 const PHASE_CLAIMS: usize = 200;
@@ -1238,12 +1237,6 @@ fn main() {
         // stacks, heaps and the half-used postings and bitmaps would otherwise each be charged
         // 2 MiB a page; four-kilobyte pages on those cost a few extra faults and nothing more.
         run.buckets.cast::<u8>().write_volatile(0);
-        // The postings and one phase of bitmaps are dense and reused every phase, so they pay
-        // for whole huge pages: fewer page faults and TLB misses.
-        for page in 0..HUGE_ARENA {
-            run.postings.cast::<u8>().add(page * HUGE_PAGE).write_volatile(0);
-            run.bitmaps.cast::<u8>().add(page * HUGE_PAGE).write_volatile(0);
-        }
         prctl(41, 1, 0, 0, 0);
 
         thread::scope(|s| spawn_tree(s, &run, 0));

@@ -102,3 +102,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Failed (2026-11-01, tools/wt_b23): exact 8-byte keys for short tokens.** Exact, peak 43 MiB, but best/median 73.7/77.7 -> 82.3/88.6 ms: the fused loop became four passes and a second 2 MB table added cache pressure.
 
 **Failed (2026-11-01): heavy threshold 1/48 instead of 1/32.** `run-b49051bb725e` 97.7 ms against 97.4 ms for the base in the neighbouring round: no gain, 1/32 stays.
+
+**Failed (box test, 2026-11-01): huge pages for the dense regions.** Two huge pages each for postings and bitmaps, touched before `PR_SET_THP_DISABLE`, to cut small-page faults (laptop: 20.4k to about 16k faults with three pages each; median -5% with two, best unchanged, hash unchanged). Board `run-d18a8012c8a0` 102.0 ms in a slow round, `run-3974f3dfdb1e` 93.7 ms, 44.5 MB, S 1015, 78.56 against 78.58: the time gain was eaten by memory over the 44 MB cap and 11 more lines. Reverted.
