@@ -78,3 +78,7 @@ Peak breakdown of about 42 MB: rows 11.4, postings 4.9, bitmaps 4.7, malloc aren
 **Failed (2026-11-01): read-ahead prefetch of the text, one batch ahead.** Median ms: 96.8->98.3, 92.3->90.3 on 12 CPUs, 101.4->100.7, 103.8->103.4 on cpuset 0-5. Tie.
 
 **Failed (2026-11-01): answer phase.** SIMD AND of two lists (pcmpestrm blocks, +45 lines): cpuset medians 100.7->105.4, 98.2->99.2, tie, the AND cost is not ALU-bound. Prefetching 24 or 64 lines of a list instead of 6, or deeper query distance: sign flips across runs. Two-way interleaved OR union: OR ticks -25% but whole answer -3 to -8%, about 1.3% of wall, full run tie. Counted, not built: cheapest-first AND (549 of 3,800 sampled queries have two leading ANDs), early exit on empty term (4.6% of ANDs). Pinning workers to CPUs: box 95.2 ms against 94.0.
+
+## Line cut 1145 -> about 1004 (2026-11-01)
+
+Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the merge step, two vectors and one barrier are gone. Threads write their own phrases and query share directly. Setup helpers merged (`reserve<T>`, `map_file` returning a slice, the barrier as a method on `Run`), transpose masks computed as `u64::MAX / (2^w + 1)`, four constants folded away, bitmap clearing done inside each build job. Scan, lookup, row writes and the answer inner loops are unchanged. Paired medians: 12 CPUs 79.99 vs 80.00 ms and -0.65 ms over 30 rounds; cpuset 0-5 -0.3 to +2.6 ms, inside noise. Hash f86973c21022, peak unchanged. Run ID: pending board.
