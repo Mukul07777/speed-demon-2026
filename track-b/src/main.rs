@@ -7,7 +7,7 @@
 //!    dropped after one hash, whatever else the corpus holds.
 //! 2. Index at document level only. Terms common enough to deserve it get a bitmap, chosen
 //!    from a small sample of the corpus. The rest become lists of document ids, written as
-//!    rows that need no shared counters. Rows last one phase of 48 MiB of text, then become
+//!    rows that need no shared counters. Rows last one phase of 50 MiB of text, then become
 //!    16-bit postings, so that rows and postings never fill memory together.
 //! 3. Store no positions. A phrase is checked during the scan, when the document's tokens
 //!    are at hand: when its rarest term appears, the neighbouring tokens' hashes are compared
@@ -41,7 +41,7 @@ const PR_SET_THP_DISABLE: i32 = 41;
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
-const PHASE_CLAIMS: usize = 192; // 48 MiB of text between turning rows into postings
+const PHASE_CLAIMS: usize = 200; // 50 MiB of text between turning rows into postings
 const HEADER: usize = 1; // u16s before a list: a sentinel while it fills, so duplicates drop with no branch
 const CLEAR_JOBS: usize = 16; // slices of the idle bitmap set that are zeroed during a phase
 const TALLY_IDS: usize = 10;
@@ -63,6 +63,8 @@ const SHARD_BITS: u32 = 6;
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
+const SEARCH_RATIO: usize = 16; // lists this much shorter are searched for, not marked
+const LINES: usize = 6; // cache lines of a list requested before a query reads it
 const PLAN_JOBS: usize = 16;
 const SAMPLE_CLAIMS: usize = 12; // claims read to choose the terms that get bitmaps
 
@@ -128,6 +130,7 @@ struct Scratch {
     lists: [Vec<u16>; 2],
     active: usize, // which list the next result goes into
     bits: Vec<u64>,
+    marks: Vec<u64>, // all zeros between uses
 }
 
 /// What the phases so far found for one query. All zeros is the empty answer, so the array
@@ -870,7 +873,27 @@ impl Run {
         let tallies = share.tallies.as_ptr() as *mut Tally;
         let steps_of =
             |query: &Query| &share.steps[query.first as usize..(query.first + query.len) as usize];
+        // Term records and postings are scattered, so a query's records are requested two
+        // queries before they are read and the start of its lists one query before.
+        let prefetch = |at: usize, lists: bool| {
+            let query = share.queries.get(at).filter(|_| at < end);
+            for &(_, term) in query.map_or(&[][..], steps_of) {
+                let info = &*self.terms.add(term as usize);
+                if !lists {
+                    _mm_prefetch::<_MM_HINT_T0>((info as *const Term).cast());
+                } else if !info.heavy {
+                    let list = self.postings.add(info.first as usize);
+                    for line in 0..(info.count as usize).div_ceil(32).min(LINES) {
+                        _mm_prefetch::<_MM_HINT_T0>(list.add(line * 32).cast());
+                    }
+                }
+            }
+        };
+        prefetch(first, false);
+        prefetch(first + 1, false);
         for (query, index) in share.queries[first..end].iter().zip(first..) {
+            prefetch(index + 2, false);
+            prefetch(index + 1, true);
             let steps = steps_of(query);
             let tally = &mut *tallies.add(index);
             match self.answer_bool(steps, phase, scratch) {
@@ -1015,35 +1038,42 @@ impl Run {
             lists: [Vec::new(), Vec::new()],
             active: 0,
             bits: vec![0; self.words_per_bitmap],
+            marks: vec![0; self.words_per_bitmap],
         };
         let phases = self.phase_base.len() - 1;
-        for phase in 0..phases {
-            let limit = (phase + 1) * PHASE_CLAIMS;
-            loop {
-                let claim = phase * PHASE_CLAIMS + self.phase_claims[phase].fetch_add(1, Relaxed);
-                if claim >= limit || claim * CLAIM >= self.len {
-                    break;
+        // Stage k scans phase k, and a thread that runs out of claims answers phase k - 1
+        // while the others finish scanning: the postings and bitmaps of k - 1 are still
+        // there, because the build of k comes after the barrier that ends every answer.
+        for stage in 0..=phases {
+            if stage < phases {
+                let limit = (stage + 1) * PHASE_CLAIMS;
+                loop {
+                    let claim =
+                        stage * PHASE_CLAIMS + self.phase_claims[stage].fetch_add(1, Relaxed);
+                    if claim >= limit || claim * CLAIM >= self.len {
+                        break;
+                    }
+                    self.index_claim::<false>(claim, &mut [], &mut buffers);
                 }
-                self.index_claim::<false>(claim, &mut [], &mut buffers);
+            }
+            if stage > 0 {
+                self.each_job(&self.answer_jobs[stage - 1], batches, |batch| {
+                    self.answer_batch(batch, stage - 1, &mut scratch)
+                });
+            }
+            if stage == phases {
+                break;
             }
             self.step.wait();
-            assert!(self.phase_base[phase + 1] - self.phase_base[phase] < u16::MAX as u32);
-            self.each_job(&self.phase_jobs[phase], SHARDS + CLEAR_JOBS, |job| {
+            assert!(self.phase_base[stage + 1] - self.phase_base[stage] < u16::MAX as u32);
+            self.each_job(&self.phase_jobs[stage], SHARDS + CLEAR_JOBS, |job| {
                 if job < SHARDS {
-                    self.build_shard(job, phase)
+                    self.build_shard(job, stage)
                 } else {
-                    self.clear_bitmaps(phase, job - SHARDS)
+                    self.clear_bitmaps(stage, job - SHARDS)
                 }
             });
             self.step.wait();
-            // Each phase is answered while its lists are at hand and then forgotten, so
-            // memory holds one phase of postings and no more.
-            self.each_job(&self.answer_jobs[phase], batches, |batch| {
-                self.answer_batch(batch, phase, &mut scratch)
-            });
-            if phase + 1 < phases {
-                self.step.wait();
-            }
         }
     }
 }
@@ -1077,12 +1107,21 @@ unsafe fn below(list: &[u16], value: u16) -> usize {
 }
 
 /// Appends the values of `from` that are in `other` (or, with `keep` false, are not). A list
-/// much shorter than the other is searched for in it, and similar lists are merged. Both write
-/// every value and move the count only for a kept one, so neither branches on the data.
-unsafe fn filter_by(from: &[u16], other: &[u16], keep: bool, out: &mut Vec<u16>) {
+/// much shorter than the other is searched for in it. Otherwise one list is marked in `marks`,
+/// which is all zeros between calls, and the other is tested against the marks and the marks
+/// cleared again. Both write every value and move the count only for a kept one, so neither
+/// branches on the data.
+unsafe fn filter_by(
+    from: &[u16],
+    other: &[u16],
+    keep: bool,
+    out: &mut Vec<u16>,
+    marks: &mut [u64],
+) {
+    out.reserve(from.len().max(other.len()));
     let target = out.as_mut_ptr();
     let mut found = 0;
-    if from.len() * 8 <= other.len() {
+    if from.len() * SEARCH_RATIO <= other.len() {
         for &doc in from {
             let at = below(other, doc);
             let present = at < other.len() && *other.get_unchecked(at) == doc;
@@ -1090,18 +1129,17 @@ unsafe fn filter_by(from: &[u16], other: &[u16], keep: bool, out: &mut Vec<u16>)
             found += (present == keep) as usize;
         }
     } else {
-        let (mut i, mut j) = (0, 0);
-        while i < from.len() && j < other.len() {
-            let (x, y) = (*from.get_unchecked(i), *other.get_unchecked(j));
-            *target.add(found) = x;
-            found += if keep { x == y } else { x < y } as usize;
-            i += (x <= y) as usize;
-            j += (y <= x) as usize;
+        let (marked, tested) = if keep { (from, other) } else { (other, from) };
+        for &doc in marked {
+            *marks.get_unchecked_mut(doc as usize / 64) |= 1 << (doc % 64);
         }
-        if !keep {
-            let rest = &from[i..];
-            std::ptr::copy_nonoverlapping(rest.as_ptr(), target.add(found), rest.len());
-            found += rest.len();
+        for &doc in tested {
+            let present = *marks.get_unchecked(doc as usize / 64) >> (doc % 64) & 1;
+            *target.add(found) = doc;
+            found += (present == keep as u64) as usize;
+        }
+        for &doc in marked {
+            *marks.get_unchecked_mut(doc as usize / 64) = 0;
         }
     }
     out.set_len(found);
@@ -1129,6 +1167,7 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
         lists,
         active,
         bits,
+        marks,
     } = scratch;
     let words = bits.len();
     *active ^= 1;
@@ -1155,11 +1194,10 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     let finish_bits = |bits: &Vec<u64>| Set::Bits(std::slice::from_raw_parts(bits.as_ptr(), words));
     match (op, current, term) {
         (Op::And, Set::List(a), Set::List(b)) => {
-            out.reserve(a.len().min(b.len()));
             if a.len() <= b.len() {
-                filter_by(a, b, true, out);
+                filter_by(a, b, true, out, marks);
             } else {
-                filter_by(b, a, true, out);
+                filter_by(b, a, true, out, marks);
             }
             finish_list(out)
         }
@@ -1170,8 +1208,7 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             finish_list(out)
         }
         (Op::Not, Set::List(a), Set::List(b)) => {
-            out.reserve(a.len());
-            filter_by(a, b, false, out);
+            filter_by(a, b, false, out, marks);
             finish_list(out)
         }
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => {
