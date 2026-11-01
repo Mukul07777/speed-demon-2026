@@ -134,6 +134,7 @@ struct Run {
     next_hour: AtomicUsize,
     texts: [OnceLock<&'static [u8]>; HOURS], // each hour's text, until it is written
     output: File,
+    jobs: Mutex<Vec<(usize, u64, &'static [u8])>>, // placed hours waiting for a writer
     placed: Mutex<(usize, u64)>, // the next hour to place in the file, and its offset
 }
 unsafe impl Sync for Run {}
@@ -425,16 +426,23 @@ impl Run {
     /// writes those hours outside the lock. Writers in different threads run at once, which
     /// matters: one thread writing 10 MB to tmpfs fell up to 2 ms behind the summaries.
     fn write_ready(&self) {
-        let mut ready = Vec::new();
         {
             let mut placed = self.placed.lock().unwrap();
+            let mut jobs = self.jobs.lock().unwrap();
             let (next, offset) = &mut *placed;
             while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
-                ready.push((*next, *offset, *text));
+                jobs.push((*next, *offset, *text));
                 (*next, *offset) = (*next + 1, *offset + text.len() as u64);
             }
+            jobs.reverse(); // lowest hour last: popped first
         }
-        for (hour, offset, text) in ready {
+        self.drain();
+    }
+
+    /// Writes placed hours, one at a time from a shared list, so that threads with nothing
+    /// else to do help a thread that found several ready behind a straggler.
+    fn drain(&self) {
+        while let Some((hour, offset, text)) = self.jobs.lock().unwrap().pop() {
             self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back.
             let rows = unsafe { self.rows.add(hour * self.stride) };
@@ -445,8 +453,9 @@ impl Run {
     fn work(&self) {
         unsafe { self.parse() };
         // Out of claims: what is left is hours that wait for the last claims in flight.
-        while self.next_hour.load(Relaxed) < HOURS {
+        while self.next_hour.load(Relaxed) < HOURS || !self.jobs.lock().unwrap().is_empty() {
             self.advance();
+            self.drain();
             thread::yield_now();
         }
     }
@@ -528,6 +537,7 @@ fn solve(early: bool) -> bool {
         next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
         output: File::create("/out/summary.txt").unwrap(),
+        jobs: Mutex::new(Vec::new()),
         placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
