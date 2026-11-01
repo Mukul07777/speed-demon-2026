@@ -63,11 +63,8 @@ const BLOCK_SHIFT: u32 = 6; // distances live in blocks of this many neighbourin
 const BLOCK_NODES: usize = 1 << BLOCK_SHIFT;
 const WINDOW: usize = 1 << WEIGHT_BITS; // edges with weights that fit reach less far ahead
 const CLAIMED: u32 = 1 << 31; // a claimed node's entry is CLAIMED | its new id, above every raw entry (below 2^28)
-const FLAG: u32 = 1 << 31; // a forward node entry's top bit: some arcs into the node have no reverse arc
-const NO_REV: u16 = u16::MAX; // a reverse weight slot with no arc behind it
-type Extras = Vec<(u32, u32, u32)>; // head, tail and weight of an arc whose head has no arc back
 const UNREACHED: u64 = u64::MAX;
-const NONE: u16 = u16::MAX; // a distance slot nothing has reached, or whose distance is in `Side::wide`
+const NONE: u32 = u32::MAX; // a distance slot nothing has reached, or whose distance is in `Side::wide`
 
 /// An edge on its way to an adjacency array: `other + 1` and weight, plus the low bits of
 /// the node it belongs to, whose high bits are its shard. A packed value of 0 marks the
@@ -126,7 +123,7 @@ impl Graph {
 
     #[inline(always)]
     unsafe fn edges_at(&self, entry: u32) -> &[u32] {
-        let start = ((entry << 1) >> (START_SHIFT + 1)) as usize;
+        let start = (entry >> START_SHIFT) as usize;
         std::slice::from_raw_parts(self.edges.add(start), (entry & DEGREE_MASK) as usize)
     }
 
@@ -200,11 +197,10 @@ struct Run {
     rows: Rows,
     raw: Graph,
     forward: Graph,
-    rev: *mut u16, // parallel to forward.edges: the lightest arc back along each edge, or NO_REV
-    extras_raw: Mutex<Extras>,
-    extras: OnceLock<Extras>, // arcs with no arc back, sorted by head
-    heavy: Mutex<Vec<(u32, u32, u32)>>, // tail, head and weight
-    next_id: AtomicU32,       // the first new id no worker has been given
+    backward: Graph,
+    in_degrees: *mut AtomicU8,
+    heavy: Mutex<Vec<(u32, u32, u32)>>,  // tail, head and weight
+    next_id: AtomicU32, // the first new id no worker has been given
     chunks: Mutex<Vec<(usize, usize)>>, // spans of forward edges that hold nodes' edges
     layout: OnceLock<Layout>,
     raw_queries: Vec<(u32, u32)>,
@@ -363,7 +359,10 @@ impl Run {
             let known = heavy.entry((map(u), map(v))).or_insert(w);
             *known = (*known).min(w);
         }
-        Layout { queries, heavy }
+        Layout {
+            queries,
+            heavy,
+        }
     }
 
     /// Translates every edge head, in place, to its new id, which is a random lookup per edge.
@@ -378,6 +377,7 @@ impl Run {
             for edge in batch {
                 let head = self.new_id((*edge >> WEIGHT_BITS) as usize);
                 *edge = head << WEIGHT_BITS | (*edge & WEIGHT_MASK);
+                (*self.in_degrees.add(head as usize)).fetch_add(1, Relaxed);
             }
         }
     }
@@ -406,44 +406,36 @@ impl Run {
         self.each_job(chunks.len(), |job| self.rewrite_forward(chunks[job]));
         self.next_step(|| {});
         self.release(self.raw.nodes.cast(), self.nodes * 4, worker);
-        // Pull the weight of each edge's arc back into its slot; arcs with no arc back are set aside.
-        let mut extra = Extras::new();
+        // Turn the in-degree counts of this worker's stretch of nodes into entries that point
+        // just past each node's edges. The stretches before it say where its first one ends.
+        let counts = std::slice::from_raw_parts(self.in_degrees.cast::<u8>(), ids);
+        let stretch = ids.div_ceil(self.threads);
+        let (from, to) = ((worker * stretch).min(ids), ((worker + 1) * stretch).min(ids));
+        let mut end = counts[..from].iter().map(|&count| count as u32).sum::<u32>();
+        for node in from..to {
+            let degree = counts[node] as u32;
+            assert!(degree <= DEGREE_MASK);
+            end += degree;
+            *self.backward.nodes.add(node) = end << START_SHIFT | degree;
+        }
+        self.next_step(|| {});
+        self.release(self.in_degrees.cast(), ids, worker);
+        // Each edge takes the slot below its head's end, and the entry ends up at its start.
         self.each_job(ids.div_ceil(CELL), |cell| {
-            for x in cell * CELL..((cell + 1) * CELL).min(ids) {
-                let entry = *self.forward.nodes.add(x);
-                let start = ((entry << 1) >> (START_SHIFT + 1)) as usize;
-                for (i, &edge) in self.forward.edges_at(entry).iter().enumerate() {
-                    let y = (edge >> WEIGHT_BITS) as usize;
-                    let mut back = NO_REV;
-                    for &f in self.forward.edges_at(*self.forward.nodes.add(y)) {
-                        if (f >> WEIGHT_BITS) as usize == x {
-                            back = back.min((f & WEIGHT_MASK) as u16);
-                        }
-                    }
-                    *self.rev.add(start + i) = back;
-                    if back == NO_REV {
-                        let mut w = edge & WEIGHT_MASK;
-                        if w == WEIGHT_MASK {
-                            w = layout.heavy[&(x as u32, y as u32)];
-                        }
-                        extra.push((y as u32, x as u32, w));
-                    }
+            for node in cell * CELL..((cell + 1) * CELL).min(ids) {
+                for &edge in self.forward.edges_at(*self.forward.nodes.add(node)) {
+                    let head = (edge >> WEIGHT_BITS) as usize;
+                    let entry = &*self.backward.nodes.add(head).cast::<AtomicU32>();
+                    let slot = (entry.fetch_sub(1 << START_SHIFT, Relaxed) >> START_SHIFT) - 1;
+                    *self.backward.edges.add(slot as usize) =
+                        (node as u32) << WEIGHT_BITS | (edge & WEIGHT_MASK);
                 }
             }
         });
-        self.extras_raw.lock().unwrap().append(&mut extra);
-        self.next_step(|| {
-            let mut all = std::mem::take(&mut *self.extras_raw.lock().unwrap());
-            all.sort_unstable_by_key(|e| e.0);
-            for e in &all {
-                *self.forward.nodes.add(e.0 as usize) |= FLAG;
-            }
-            drop(self.extras.set(all));
-        });
-        let extras = self.extras.get().unwrap();
+        self.next_step(|| {});
 
-        let mut forward = Side::new(&self.forward, &layout.heavy, self.rev, extras);
-        let mut backward = Side::new(&self.forward, &layout.heavy, self.rev, extras);
+        let mut forward = Side::new(&self.forward, &layout.heavy, false);
+        let mut backward = Side::new(&self.backward, &layout.heavy, true);
         self.each_job(layout.queries.len(), |index| {
             let (s, t) = layout.queries[index];
             let distance = answer(s as usize, t as usize, &mut forward, &mut backward);
@@ -528,28 +520,21 @@ impl Queue {
 /// order keeps that small.
 struct Side<'a> {
     graph: &'a Graph,
-    heavy: &'a Heavy, // the weights that do not fit in an edge
-    rev: *const u16,  // see Run::rev
-    extras: &'a [(u32, u32, u32)],
-    blocks: Vec<u32>, // block index + 1, per stretch of nodes
-    distances: Vec<u16>,
+    heavy: &'a Heavy,          // the weights that do not fit in an edge
+    reversed: bool,            // whether this side follows edges backward
+    blocks: Vec<u32>,          // block index + 1, per stretch of nodes
+    distances: Vec<u32>, // the blocks in turn; NONE is no distance, or one too big for 32 bits
     wide: HashMap<usize, u64>, // the distances that are too big
     touched: Vec<u32>,
     queue: Queue,
 }
 
 impl<'a> Side<'a> {
-    fn new(
-        graph: &'a Graph,
-        heavy: &'a Heavy,
-        rev: *const u16,
-        extras: &'a [(u32, u32, u32)],
-    ) -> Side<'a> {
+    fn new(graph: &'a Graph, heavy: &'a Heavy, reversed: bool) -> Side<'a> {
         Side {
             graph,
             heavy,
-            rev,
-            extras,
+            reversed,
             blocks: vec![0; (graph.node_count >> BLOCK_SHIFT) + 1],
             distances: Vec::new(),
             wide: HashMap::new(),
@@ -611,10 +596,10 @@ impl<'a> Side<'a> {
             if distance >= NONE as u64 {
                 self.wide.insert(node, distance);
             }
-            *self.distances.get_unchecked_mut(at) = distance.min(NONE as u64) as u16;
+            *self.distances.get_unchecked_mut(at) = distance.min(NONE as u64) as u32;
             self.queue.push(distance, node);
             // The edges of a new label are read soon, and the graph is too big for the cache.
-            let start = (*self.graph.nodes.add(node) << 1) >> (START_SHIFT + 1);
+            let start = *self.graph.nodes.add(node) >> START_SHIFT;
             _mm_prefetch::<_MM_HINT_T1>(self.graph.edges.add(start as usize).cast());
         }
     }
@@ -635,7 +620,7 @@ impl<'a> Side<'a> {
     /// Settles the nearest node of this side: it may complete a path with the other side, and
     /// its edges give labels to its neighbours.
     #[inline(always)]
-    unsafe fn settle<const BACK: bool>(&mut self, other: &Side, best: &mut u64) {
+    unsafe fn settle(&mut self, other: &Side, best: &mut u64) {
         // Take a node from the bucket `advance` found.
         let queue = &mut self.queue;
         let bucket = queue.now as usize & (WINDOW - 1);
@@ -651,37 +636,14 @@ impl<'a> Side<'a> {
         }
         *best = (*best).min(distance.saturating_add(other.get(node)));
         let graph = self.graph;
-        let entry = *graph.nodes.add(node);
-        if !BACK {
-            for &edge in graph.edges_at(entry) {
-                let head = (edge >> WEIGHT_BITS) as usize;
-                let mut weight = edge & WEIGHT_MASK;
-                if weight == WEIGHT_MASK {
-                    weight = self.heavy[&(node as u32, head as u32)];
-                }
-                self.reach(head, weight as u64, other, best);
-            }
-            return;
-        }
-        let start = ((entry << 1) >> (START_SHIFT + 1)) as usize;
-        for (i, &edge) in graph.edges_at(entry).iter().enumerate() {
+        for &edge in graph.edges_at(*graph.nodes.add(node)) {
             let head = (edge >> WEIGHT_BITS) as usize;
-            let back = *self.rev.add(start + i);
-            if back == NO_REV {
-                continue;
-            }
-            let mut weight = back as u32;
+            let mut weight = edge & WEIGHT_MASK;
             if weight == WEIGHT_MASK {
-                weight = self.heavy[&(head as u32, node as u32)];
+                let key = (node as u32, head as u32);
+                weight = self.heavy[&if self.reversed { (key.1, key.0) } else { key }];
             }
             self.reach(head, weight as u64, other, best);
-        }
-        if entry & FLAG != 0 {
-            let list = self.extras;
-            let from = list.partition_point(|e| (e.0 as usize) < node);
-            for &(_, tail, weight) in list[from..].iter().take_while(|e| e.0 as usize == node) {
-                self.reach(tail as usize, weight as u64, other, best);
-            }
         }
     }
 
@@ -710,9 +672,9 @@ unsafe fn answer(s: usize, t: usize, forward: &mut Side, backward: &mut Side) ->
             break;
         }
         if forward.queue.live <= backward.queue.live {
-            forward.settle::<false>(backward, &mut best);
+            forward.settle(backward, &mut best);
         } else {
-            backward.settle::<true>(forward, &mut best);
+            backward.settle(forward, &mut best);
         }
     }
     forward.finish();
@@ -755,9 +717,9 @@ fn main() {
             raw: Graph::new(shards << SHARD_SHIFT, edges),
             // Room for the unused tails of every worker's EDGE_CLAIM spans.
             forward: Graph::new(ids, edges + (edges >> 3) + (1 << 20)),
-            rev: reserve((edges + (edges >> 3) + (1 << 20)) * 2 + 4096).cast(),
-            extras_raw: Mutex::new(Vec::new()),
-            extras: OnceLock::new(),
+            backward: Graph::new(ids, edges),
+            // One byte per node is enough: degrees are at most DEGREE_MASK.
+            in_degrees: reserve(ids).cast(),
             heavy: Mutex::new(Vec::new()),
             next_id: AtomicU32::new(0),
             chunks: Mutex::new(Vec::new()),

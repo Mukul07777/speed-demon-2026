@@ -88,3 +88,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (box test, 2026-11-01): `-align-loops=32`.** Test of whether code layout explains box swings. Run on 87ea886 inside the usual range of unchanged code; one sample. Reverted.
 
 **Failed (2026-11-01):** LLVM block alignment 32 (box 22.21 ms, `run-68f2d900e8c5`). Loop layout does not explain the slow outliers. Hyperthread pair pipeline, tools/wt_c21: laptop 50% slower; box result in the commit after it.
+
+**Not kept (2026-11-02): at most 10 worker threads.** Laptop 15 alternating rounds, median 22.3 (12 threads), 22.7 (10), 23.8 (8). Box `run-51e8cd3bc33d` 23.40 ms, 10.7 MB, 81.85 and `run-dd3c3a0bb464` 23.39 ms, 10.6 MB, 81.89; unchanged code the next round `run-8a9f225a0f61` 23.72 ms, 11.8 MB, 81.30. Memory 1 MB lower, time no better, never near the 82.40 best.
