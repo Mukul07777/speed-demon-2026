@@ -9,15 +9,17 @@
 //! 2. Summarise. Workers claim one hour each and radix sort its rows by latency, inside the
 //!    hour's own pages. Dealing the sorted rows out by endpoint keeps them in order, so every
 //!    endpoint's latencies come out sorted and a percentile is one array read. The hour's text
-//!    is built over its rows, in the same pages. Whoever finds the next hour ready writes it
-//!    and gives its pages back, so the output overlaps the work, and memory is released as
-//!    fast as the tmpfs output file grows (which counts against the memory limit too).
+//!    is built over its rows, in the same pages. Once every earlier hour's text exists, an
+//!    hour's offset in the file is known, and the thread that finds it ready writes it there
+//!    with `pwrite` and gives its pages back. So writes run in several threads at once and
+//!    overlap the work, and memory is released as fast as the tmpfs output file grows (which
+//!    counts against the memory limit too).
 //!
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
@@ -157,10 +159,11 @@ impl Catalogue {
     }
 
     /// Names in output order, with their ids. A &[u8] orders as unsigned bytes with a proper
-    /// prefix first.
+    /// prefix first. Every worker sorts its own copy at once, so only the copy is under the
+    /// lock (sorted under it, the twelve sorts ran one after another).
     fn sorted(&self) -> Vec<(&'static [u8], usize)> {
-        let names = self.names.lock().unwrap();
-        let mut order: Vec<_> = names.iter().copied().zip(0..).collect();
+        let names = self.names.lock().unwrap().clone();
+        let mut order: Vec<_> = names.into_iter().zip(0..).collect();
         order.sort_unstable();
         order
     }
@@ -177,7 +180,8 @@ struct Run {
     finished_parsing: Barrier,
     next_hour: AtomicUsize,
     texts: [OnceLock<&'static [u8]>; HOURS], // each hour's text, until it is written
-    output: Mutex<(File, usize)>,            // the file and the next hour it needs
+    output: File,
+    placed: Mutex<(usize, u64)>, // the next hour to place in the file, and its offset
 }
 unsafe impl Sync for Run {}
 
@@ -280,7 +284,7 @@ impl Run {
 
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
     /// area of `rows`: the rows first, then the text over them, and the sort scratch further
-    /// on. Nothing is allocated per hour, and `flush` gives the whole area back in one call.
+    /// on. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
     /// (Text in malloc'd buffers was the bulk of the memory peak: the allocator kept every
     /// buffer it had grown while the writer, which is serial, fell behind.)
     unsafe fn summarise(&self, hour: usize, order: &[(&[u8], usize)]) -> &'static [u8] {
@@ -374,13 +378,24 @@ impl Run {
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
-    /// Writes every hour that is ready, in order. The caller holds the output lock.
-    fn flush(&self, output: &mut (File, usize)) {
-        while let Some(part) = self.texts.get(output.1).and_then(|text| text.get()) {
-            output.0.write_all(part).unwrap();
+    /// Gives every ready hour whose predecessors are placed its offset in the file, then
+    /// writes those hours outside the lock. Writers in different threads run at once, which
+    /// matters: one thread writing 10 MB to tmpfs fell up to 2 ms behind the summaries.
+    fn write_ready(&self) {
+        let mut ready = Vec::new();
+        {
+            let mut placed = self.placed.lock().unwrap();
+            let (next, offset) = &mut *placed;
+            while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
+                ready.push((*next, *offset, *text));
+                (*next, *offset) = (*next + 1, *offset + text.len() as u64);
+            }
+        }
+        for (hour, offset, text) in ready {
+            self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back.
-            unsafe { madvise(part.as_ptr() as *mut u8, self.stride * 4, MADV_DONTNEED) };
-            output.1 += 1;
+            let rows = unsafe { self.rows.add(hour * self.stride) };
+            unsafe { madvise(rows.cast(), self.stride * 4, MADV_DONTNEED) };
         }
     }
 
@@ -395,12 +410,10 @@ impl Run {
             }
             let part = unsafe { self.summarise(hour, &order) };
             self.texts[hour].set(part).unwrap();
-            if let Ok(mut output) = self.output.try_lock() {
-                self.flush(&mut output);
-            }
+            // Whoever takes the lock after an hour's text is set sees it, so every hour is
+            // written exactly once, by the thread that finds it ready.
+            self.write_ready();
         }
-        // The last worker here sees every part, whoever held the lock when it was stored.
-        self.flush(&mut self.output.lock().unwrap());
     }
 }
 
@@ -477,7 +490,8 @@ fn main() {
         finished_parsing: Barrier::new(threads),
         next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
-        output: Mutex::new((File::create("/out/summary.txt").unwrap(), 0)),
+        output: File::create("/out/summary.txt").unwrap(),
+        placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
         for _ in 1..threads {
