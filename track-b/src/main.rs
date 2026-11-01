@@ -39,6 +39,7 @@ const MADV_NOHUGEPAGE: i32 = 15;
 const MADV_DONTNEED: i32 = 4;
 const PR_SET_THP_DISABLE: i32 = 41;
 const MADV_POPULATE_READ: i32 = 22;
+const MADV_POPULATE_WRITE: i32 = 23;
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
@@ -59,6 +60,8 @@ const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its
 const HEAVY_SHARE: usize = 32; // a term in 1/32 of documents is cheaper as a bitmap
 const MAX_HEAVY: usize = 4096;
 const SHARDS: usize = 64;
+const PRE_ROWS: usize = 52_000;
+const PRE_POSTINGS: usize = 2_400_000;
 const SHARD_BITS: u32 = 6;
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
@@ -214,6 +217,7 @@ struct Run {
     word_terms: Vec<u32>,
     samples: Mutex<(Vec<u32>, usize)>,
     next_claim: AtomicUsize,
+    pre_jobs: AtomicUsize,
     // One counter of claims and one of jobs per phase, so that no phase needs resetting.
     phase_claims: Vec<AtomicUsize>,
     phase_jobs: Vec<AtomicUsize>,
@@ -388,7 +392,7 @@ impl Run {
 
     #[cold]
     unsafe fn claim_chunk(&self, shard: usize, claim: usize) -> (*mut u32, *mut u32) {
-        let offset = self.claimed[shard].fetch_add(CHUNK, Relaxed);
+        let offset = self.claimed[shard * 8].fetch_add(CHUNK, Relaxed);
         let at = self.rows.add(shard * self.stride + offset);
         *at = claim as u32 + 1;
         (at.add(1), at.add(CHUNK))
@@ -721,7 +725,7 @@ impl Run {
     unsafe fn build_shard(&self, shard: usize, phase: usize) {
         let base = self.phase_base[phase];
         let region = self.rows.add(shard * self.stride);
-        let claimed = self.claimed[shard].load(Relaxed);
+        let claimed = self.claimed[shard * 8].load(Relaxed);
         let mut chunks: Vec<(u32, u32)> = (0..claimed)
             .step_by(CHUNK)
             .map(|at| (*region.add(at), at as u32))
@@ -767,7 +771,7 @@ impl Run {
             info.count = cursors[low] - firsts[low];
         }
         std::ptr::write_bytes(region, 0, claimed);
-        self.claimed[shard].store(0, Relaxed);
+        self.claimed[shard * 8].store(0, Relaxed);
     }
 
     /// Zeroes a slice of the bitmap set that the next phase will fill.
@@ -874,6 +878,29 @@ impl Run {
             self.plan_terms();
         }
         self.step.wait();
+        // Every thread first-touches the same fresh regions in phase 0; fault them in bulk.
+        self.each_job(&self.pre_jobs, SHARDS + 24, |job| {
+            let populate = |from: *mut u8, bytes: usize| {
+                let start = from as usize / 4096 * 4096;
+                madvise(
+                    start as *mut u8,
+                    from as usize + bytes - start,
+                    MADV_POPULATE_WRITE,
+                );
+            };
+            if job < SHARDS {
+                populate(self.rows.add(job * self.stride).cast(), PRE_ROWS * 4);
+            } else if job < SHARDS + 8 {
+                let part = PRE_POSTINGS / 8 * 2;
+                populate(self.postings.cast::<u8>().add((job - SHARDS) * part), part);
+            } else {
+                let job = job - SHARDS - 8;
+                let heavy = self.heavy_total.load(Relaxed);
+                let per = (heavy * self.words_per_bitmap * 8).div_ceil(12);
+                let set = job / 12 * MAX_HEAVY * self.words_per_bitmap * 8;
+                populate(self.bitmaps.cast::<u8>().add(set + job % 12 * per), per);
+            }
+        });
 
         let batches = self.queries.len().div_ceil(QUERY_BATCH);
         let mut scratch = Scratch {
@@ -1270,6 +1297,7 @@ fn main() {
             word_terms: Vec::with_capacity(1 << 18),
             samples: Mutex::new((Vec::new(), 0)),
             next_claim: AtomicUsize::new(0),
+            pre_jobs: AtomicUsize::new(0),
             phase_claims: counters(0),
             phase_jobs: counters(0),
             answer_jobs: counters(0),
@@ -1281,7 +1309,7 @@ fn main() {
             bitmaps: std::ptr::null_mut(),
             rows: reserve(SHARDS * stride * 4, MADV_NOHUGEPAGE).cast(),
             stride,
-            claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
+            claimed: (0..SHARDS * 8).map(|_| AtomicUsize::new(0)).collect(),
             postings: reserve(len * 2 + HUGE_PAGE, MADV_HUGEPAGE).cast(),
             parts: Mutex::new(Vec::new()),
         }
