@@ -41,7 +41,6 @@ const MAP_FIXED: i32 = 0x10;
 const MAP_ANON: i32 = 0x4022;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_DONTNEED: i32 = 4;
-const MADV_POPULATE_READ: i32 = 22;
 const PR_SET_THP_DISABLE: i32 = 41;
 
 const HUGE_PAGE: usize = 1 << 21;

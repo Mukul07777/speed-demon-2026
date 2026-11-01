@@ -14,17 +14,18 @@
 //! weights need more, so those edges live in a side list and their tails carry a flag.
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::ptr::read_unaligned;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn prctl(option: i32, arg: u64, a: u64, b: u64, c: u64) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
@@ -33,6 +34,7 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
+const PR_SET_THP_DISABLE: i32 = 41;
 const MADV_DONTNEED: i32 = 4;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
@@ -59,6 +61,8 @@ const WINDOW: usize = 1 << WEIGHT_BITS; // light edges reach at most this far ah
 const WINDOW_WORDS: usize = WINDOW / 64;
 const LABEL_SHIFT: u32 = 26; // a claimed node is (worker + 1) << 26 | position in its order
 const UNREACHED: u64 = u64::MAX;
+const NONE: u32 = u32::MAX; // a distance slot nothing has reached
+const WIDE: u32 = u32::MAX - 1; // a slot whose distance does not fit, and is in `Side::wide`
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 /// An edge on its way to an adjacency array: `other + 1` and weight, plus the low bits of
@@ -273,6 +277,7 @@ struct Run {
     raw: Graph,
     forward: Graph,
     backward: Graph,
+    in_degrees: *mut AtomicU8,
     labels: *mut AtomicU32,
     heavy: Mutex<Vec<Heavy>>,
     claimed: Mutex<Vec<(usize, usize, usize)>>, // worker, nodes, edges
@@ -456,10 +461,21 @@ impl Run {
 
     /// Translates every edge head to its new id, which is a random lookup per edge. Working
     /// in small batches lets each one prefetch all it will touch before it touches it.
-    unsafe fn rewrite_forward(&self, worker: usize, order: &[u32], layout: &Layout) {
-        let mut id = layout.node_base[worker] as usize;
+    ///
+    /// The worker's old ids wait in the slots of `forward.nodes` that it is about to fill, and
+    /// each batch is copied out before its slots are overwritten.
+    unsafe fn rewrite_forward(&self, worker: usize, count: usize, layout: &Layout) {
+        let first = layout.node_base[worker] as usize;
+        let mut id = first;
         let mut at = layout.edge_base[worker];
-        for batch in order.chunks(REWRITE_BATCH) {
+        for done in (0..count).step_by(REWRITE_BATCH) {
+            let size = REWRITE_BATCH.min(count - done);
+            let mut copy = [0; REWRITE_BATCH];
+            copy[..size].copy_from_slice(std::slice::from_raw_parts(
+                self.forward.nodes.add(first + done),
+                size,
+            ));
+            let batch = &copy[..size];
             for &old in batch {
                 _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(old as usize).cast());
             }
@@ -481,8 +497,7 @@ impl Run {
                     let head = self.new_id(&layout.node_base, (edge >> WEIGHT_BITS) as usize);
                     *self.forward.edges.add(at) = head << WEIGHT_BITS | (edge & (LIGHT as u32 - 1));
                     at += 1;
-                    (*self.backward.nodes.add(head as usize).cast::<AtomicU32>())
-                        .fetch_add(1, Relaxed);
+                    (*self.in_degrees.add(head as usize)).fetch_add(1, Relaxed);
                 }
             }
         }
@@ -492,11 +507,12 @@ impl Run {
     unsafe fn lay_out_backward(&self) {
         let mut end = 0u32;
         for node in 0..self.nodes {
-            let entry = self.backward.nodes.add(node);
-            assert!(*entry <= DEGREE_MASK);
-            end += *entry;
-            *entry |= end << START_SHIFT;
+            let degree = (*self.in_degrees.add(node)).load(Relaxed) as u32;
+            assert!(degree <= DEGREE_MASK);
+            end += degree;
+            *self.backward.nodes.add(node) = end << START_SHIFT | degree;
         }
+        madvise(self.in_degrees.cast(), self.nodes, MADV_DONTNEED);
     }
 
     /// Each edge takes the slot below its head's end, and the entry ends up at its start.
@@ -533,10 +549,16 @@ impl Run {
             let _ = self.layout.set(self.plan_layout());
         });
         let layout = self.layout.get().unwrap();
-        self.rewrite_forward(worker, &order, layout);
-        let first_id = layout.node_base[worker] as usize;
-        let own_nodes = first_id..first_id + order.len();
+        std::ptr::copy_nonoverlapping(
+            order.as_ptr(),
+            self.forward.nodes.add(layout.node_base[worker] as usize),
+            order.len(),
+        );
+        let count = order.len();
         drop(order);
+        self.rewrite_forward(worker, count, layout);
+        let first_id = layout.node_base[worker] as usize;
+        let own_nodes = first_id..first_id + count;
         self.next_step(|| {
             self.raw.release();
             madvise(self.labels.cast(), self.nodes * 4, MADV_DONTNEED);
@@ -640,7 +662,8 @@ impl Run {
 struct Queue {
     heads: Vec<u32>, // item index + 1, per bucket
     occupied: [u64; WINDOW_WORDS],
-    items: Vec<(u32, u32)>, // node, and the next item in its bucket
+    items: Vec<(u32, u32)>, // node, and the next item in its bucket or in the free list
+    free: u32,              // item index + 1, of the most recently popped item
     far: BinaryHeap<Reverse<(u64, u32)>>,
     now: u64,
     live: usize,
@@ -652,6 +675,7 @@ impl Queue {
             heads: vec![0; WINDOW],
             occupied: [0; WINDOW_WORDS],
             items: Vec::new(),
+            free: 0,
             far: BinaryHeap::new(),
             now: 0,
             live: 0,
@@ -666,8 +690,17 @@ impl Queue {
             return;
         }
         let bucket = distance as usize & (WINDOW - 1);
-        self.items.push((node as u32, self.heads[bucket]));
-        self.heads[bucket] = self.items.len() as u32;
+        let item = (node as u32, self.heads[bucket]);
+        // Popped items are reused, so memory follows the queue's size, not the pushes.
+        if self.free == 0 {
+            self.items.push(item);
+            self.heads[bucket] = self.items.len() as u32;
+        } else {
+            let slot = self.free as usize - 1;
+            self.free = self.items[slot].1;
+            self.items[slot] = item;
+            self.heads[bucket] = slot as u32 + 1;
+        }
         self.occupied[bucket / 64] |= 1 << (bucket % 64);
     }
 
@@ -736,6 +769,8 @@ impl Queue {
         let bucket = self.now as usize & (WINDOW - 1);
         let item = self.heads[bucket] as usize - 1;
         let (node, next) = self.items[item];
+        self.items[item].1 = self.free;
+        self.free = item as u32 + 1;
         self.heads[bucket] = next;
         if next == 0 {
             self.occupied[bucket / 64] &= !(1 << (bucket % 64));
@@ -753,6 +788,7 @@ impl Queue {
             }
         }
         self.items.clear();
+        self.free = 0;
         self.far.clear();
         self.now = 0;
         self.live = 0;
@@ -764,7 +800,8 @@ impl Queue {
 /// order keeps that small.
 struct Side {
     blocks: Vec<u32>, // block index + 1, per stretch of nodes
-    distances: Vec<u64>,
+    distances: Vec<u32>,
+    wide: HashMap<usize, u64>,
     used: usize,
     touched: Vec<u32>,
     queue: Queue,
@@ -777,6 +814,7 @@ impl Side {
         Side {
             blocks: vec![0; (graph.node_count >> BLOCK_SHIFT) + 1],
             distances: Vec::new(),
+            wide: HashMap::new(),
             used: 0,
             touched: Vec::new(),
             queue: Queue::new(),
@@ -790,6 +828,7 @@ impl Side {
             self.blocks[stretch as usize] = 0;
         }
         self.touched.clear();
+        self.wide.clear();
         self.used = 0;
         self.queue.clear();
     }
@@ -800,7 +839,11 @@ impl Side {
             0 => UNREACHED,
             block => unsafe {
                 let at = (block as usize - 1) * BLOCK_NODES + (node & (BLOCK_NODES - 1));
-                *self.distances.get_unchecked(at)
+                match *self.distances.get_unchecked(at) {
+                    NONE => UNREACHED,
+                    WIDE => self.wide[&node],
+                    distance => distance as u64,
+                }
             },
         }
     }
@@ -813,9 +856,13 @@ impl Side {
             block = self.new_block(stretch);
         }
         let at = (block as usize - 1) * BLOCK_NODES + (node & (BLOCK_NODES - 1));
-        let known = unsafe { self.distances.get_unchecked_mut(at) };
-        if distance < *known {
-            *known = distance;
+        let known = unsafe { *self.distances.get_unchecked(at) };
+        // Only the two marks are not below every distance that fits, so only they need a look.
+        if distance < known as u64 || (known >= WIDE && self.beats_wide(node, known, distance)) {
+            if distance >= WIDE as u64 {
+                self.wide.insert(node, distance);
+            }
+            unsafe { *self.distances.get_unchecked_mut(at) = distance.min(WIDE as u64) as u32 };
             self.queue.push(distance, node);
             // The edges of a new label are read soon, and the graph is too big for the cache.
             unsafe {
@@ -838,12 +885,17 @@ impl Side {
     }
 
     #[cold]
+    fn beats_wide(&self, node: usize, known: u32, distance: u64) -> bool {
+        known == NONE || distance < self.wide[&node]
+    }
+
+    #[cold]
     fn new_block(&mut self, stretch: usize) -> u32 {
         let start = self.used * BLOCK_NODES;
         if self.distances.len() < start + BLOCK_NODES {
-            self.distances.resize(start + BLOCK_NODES, UNREACHED);
+            self.distances.resize(start + BLOCK_NODES, NONE);
         }
-        self.distances[start..start + BLOCK_NODES].fill(UNREACHED);
+        self.distances[start..start + BLOCK_NODES].fill(NONE);
         self.used += 1;
         self.blocks[stretch] = self.used as u32;
         self.touched.push(stretch as u32);
@@ -867,6 +919,8 @@ fn read_queries() -> Vec<(u32, u32)> {
 }
 
 fn main() {
+    // Huge pages would round the per-thread buffers up to 2 MiB each.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     let file = File::open("/data/graph.txt").unwrap();
     let text_len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -898,6 +952,7 @@ fn main() {
             raw: Graph::new(nodes, edges),
             forward: Graph::new(nodes, edges),
             backward: Graph::new(nodes, edges),
+            in_degrees: reserve(nodes, MADV_NOHUGEPAGE).cast(),
             labels: reserve(nodes * 4, MADV_HUGEPAGE).cast(),
             heavy: Mutex::new(Vec::new()),
             claimed: Mutex::new(Vec::new()),
