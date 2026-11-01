@@ -160,7 +160,7 @@ fn eight_digits(digits: u64) -> u64 {
 /// The number written in the `len` bytes before `end`, for lengths 1 to 8. Shifting the
 /// digits to the top makes the bytes below them read as leading zeros.
 unsafe fn number_before(end: *const u8, len: usize) -> u64 {
-    eight_digits((read(end.sub(8)) ^ ZEROS) >> (64 - 8 * len) << (64 - 8 * len))
+    eight_digits(digits_before(end, len))
 }
 
 /// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
@@ -209,18 +209,10 @@ unsafe fn prefix_xor(bits: u64) -> u64 {
     )) as u64
 }
 
-/// Multiplies to 128 bits and folds, the mixing step of wyhash.
-#[inline(always)]
-fn fold_multiply(a: u64, b: u64) -> u64 {
-    let product = a as u128 * b as u128;
-    product as u64 ^ (product >> 64) as u64
-}
-
 /// The hash of a name, never 0, which marks an unused slot, and the number of quote bytes in
 /// it. Names are compared by their raw bytes: every non-empty name is quoted, so equal raw
 /// bytes mean equal values and nothing needs unescaping. Names of 32 bytes and more do not
 /// occur at seed 1 (the longest is 27), so they cost one predicted branch here.
-#[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     // 32 bytes of ones then 32 of zeros: loading at 32 - len keeps the first `len` bytes.
     static MASKS: [[u8; 32]; 2] = [[0xFF; 32], [0; 32]];
@@ -243,7 +235,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
 unsafe fn long_name_hash(name: *const u8, len: usize) -> (u64, usize) {
     let bytes = std::slice::from_raw_parts(name, len);
     let hash = bytes.iter().fold(len as u64, |hash, &byte| {
-        fold_multiply(hash ^ byte as u64, 0xE703_7ED1_A0B4_28DB)
+        (hash.rotate_left(23) ^ byte as u64).wrapping_mul(0xE703_7ED1_A0B4_28DB)
     });
     (hash | 1, bytes.iter().filter(|&&byte| byte == b'"').count())
 }
@@ -474,7 +466,6 @@ impl Run {
     }
 
     /// The number of a name, new if this is its first appearance.
-    #[inline(always)]
     unsafe fn intern(&self, name: &Pending) -> u32 {
         let index = (name.hash >> (64 - BUCKETS.trailing_zeros())) as usize;
         let slots = self.buckets.add(index).cast::<__m256i>();
@@ -501,9 +492,8 @@ impl Run {
         loop {
             let bucket = &*self.buckets.add(index);
             for (tag, cell) in bucket.tags.iter().zip(&bucket.numbers) {
-                let current = tag.load(Relaxed);
-                let won = current == 0 && tag.compare_exchange(0, hash, Relaxed, Relaxed).is_ok();
-                if won {
+                if tag.load(Relaxed) == 0 && tag.compare_exchange(0, hash, Relaxed, Relaxed).is_ok()
+                {
                     let number = self.next_name.fetch_add(1, Relaxed) as u32 + 1;
                     assert!((number as usize) <= MAX_NAMES);
                     cell.store(number, Relaxed);
