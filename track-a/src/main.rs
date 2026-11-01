@@ -34,7 +34,7 @@
 use std::arch::x86_64::*;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
-use std::{fs::File, os::unix::fs::FileExt, thread};
+use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -44,8 +44,7 @@ extern "C" {
 }
 
 const CLAIM: usize = 1 << 20;
-const BLOCK: usize = 1 << 15; // fits in L2 between the newline pass and the line pass
-const PRE: usize = 1 << 16; // longest line supported
+const BLOCK: usize = 1 << 16; // fits in L2 between the newline pass and the line pass
 const MIN_LINE: usize = 40; // ts 27, method 3, endpoint 1, status 3, latency 1, 4 spaces, LF
 const HOURS: usize = 72; // the span is fixed for every seed: 2026-10-30T18 to 2026-11-02T17
 const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
@@ -111,7 +110,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
 const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Run {
-    file: File,
+    input: *mut u8,
     len: usize,
     next_claim: AtomicUsize,
     // The catalogue: every endpoint seen so far. Workers share it: it fills in the first
@@ -168,13 +167,7 @@ impl Run {
     }
 
     unsafe fn parse(&self) {
-        // Per-thread read buffer: PRE bytes for the unfinished line carried in front of each
-        // block, then the block and 64 bytes of the next one (name loads stray past a line).
-        // 64-byte aligned so the 32-byte newline loads are aligned.
-        let mut raw = vec![0u8; PRE + BLOCK + 256];
-        let data = raw.as_mut_ptr().map_addr(|a| (a + PRE + 63) & !63) as *mut u8;
-        let data = data.sub(0);
-        let fd = &self.file;
+        let input = self.input;
         // Per hour, the next free row and the final slot of the chunk being filled: a row needs
         // two free, in case it has to escape.
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
@@ -186,31 +179,15 @@ impl Run {
             if claim >= self.len {
                 return;
             }
-            // A line belongs to the claim holding its newline. The first one starts after the
-            // previous claim's last newline: read back until a newline shows up.
-            let mut carry = 0usize; // bytes of the unfinished line, kept just before `data`
-            if claim > 0 {
-                let mut back = 512usize;
-                loop {
-                    let back_now = back.min(claim);
-                    let tmp = std::slice::from_raw_parts_mut(data.sub(back_now), back_now);
-                    fd.read_exact_at(tmp, (claim - back_now) as u64).unwrap();
-                    match tmp.iter().rposition(|&c| c == b'\n') {
-                        Some(p) => { carry = back_now - 1 - p; break; }
-                        None if back_now == claim => { carry = back_now; break; }
-                        None => { back *= 2; assert!(back <= PRE); }
-                    }
-                }
+            // A line belongs to the claim holding its newline. The first one starts after
+            // the previous claim's last newline, at most one line back.
+            let mut line = input.add(claim);
+            while claim > 0 && *line.sub(1) != b'\n' {
+                line = line.sub(1);
             }
             // Every claim starts by reading its first hour, so it notes the hours it holds.
             let (mut key, mut low, mut high) = (u64::MAX, HOURS, 0);
             for start in (claim..(claim + CLAIM).min(self.len)).step_by(BLOCK) {
-                let n = (BLOCK + 64).min(self.len - start);
-                fd.read_exact_at(std::slice::from_raw_parts_mut(data, n), start as u64).unwrap();
-                std::ptr::write_bytes(data.add(n), 0, BLOCK + 64 - n);
-                // `input` maps file offsets of this block (and the carry before it) to memory.
-                let input = data.wrapping_sub(start);
-                let mut line = data.sub(carry);
                 // Find the newlines of the block first. Lines are longer than the 32-byte step, so
                 // a step holds at most one newline, and one unconditional store records it (a
                 // step with none writes a junk entry that the next store overwrites). Each pass
@@ -229,6 +206,7 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
+                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
                     // `clock` is "DDTHH:MM" (bytes 8 to 15 of the timestamp). Oct 30, Oct 31,
                     // Nov 1 and Nov 2 are day 0 to 3 of the span: the day's units digit plus
                     // one, less one in October, whose tens digit '3' (0x33) has bit 1 set
@@ -288,16 +266,12 @@ impl Run {
                     }
                     line = end.add(1);
                 }
-                // The unfinished line moves in front of the next block's data.
-                let blk_end = data.add((BLOCK).min(self.len - start));
-                carry = blk_end.offset_from(line) as usize;
-                assert!(carry <= PRE);
-                std::ptr::copy(line, data.sub(carry), carry);
             }
             // Drop the claim's pages now, while every thread is busy. Left mapped, they are
             // torn down by one thread at exit, which cost about 7 ms on the scoring kernel.
             // A later read of this range, by the next claim's first line, refaults the same
             // bytes, because the mapping is a read-only private file mapping.
+            madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
         }
     }
@@ -516,12 +490,15 @@ fn solve(early: bool) -> bool {
     // Huge pages would turn each hour's first touch into 2 MB of memory.
     // Name lookups read a little past a line, so a spare zero page follows the file.
     // Each hour reserves room for every line, and only the pages it touches cost anything.
-    let (rows, stride) = unsafe {
+    let (input, rows, stride) = unsafe {
         // Linux constants: prctl 41 is PR_SET_THP_DISABLE; mmap protections 1 (read) and 3
         // (read and write); flags 0x4022 (private, anonymous, no reserve) and 0x12 (private, fixed).
         prctl(41, 1usize, 0usize, 0usize, 0usize);
         let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
         let null = std::ptr::null_mut();
+        let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
+        // For an empty file this fails, and the zero page stays.
+        map(input, len, 1, 0x12, file.as_raw_fd());
         // An hour has room for its rows (two per line, if every line escaped), then for the
         // scratch (one value per line) after them, or after SPARE_AT rows if that is further,
         // plus the unused ends of one partly filled chunk per thread.
@@ -531,11 +508,11 @@ fn solve(early: bool) -> bool {
         // hour's pages share one page table instead of spilling into the next.
         let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);
         let rows = rows.map_addr(|a| a.next_multiple_of(2 << 20));
-        (rows.cast(), stride)
+        (input, rows.cast(), stride)
     };
 
     let run = Run {
-        file: file.try_clone().unwrap(),
+        input,
         len,
         next_claim: AtomicUsize::new(0),
         slots: [const { AtomicU64::new(0) }; SLOTS],

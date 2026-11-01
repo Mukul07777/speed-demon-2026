@@ -99,3 +99,5 @@ Line cut on the streaming code (2026-11-01): rustfmt S 363 -> 346, text and plac
 Failed: sealing hours by timestamp; ceiling about 0.2 ms by measurement, hour 71 cannot seal before EOF.
 
 Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 MiB, no time gain), rank walk instead of deal (slower). Summary is only 130-170 Mticks, about 5 ms; 72% of rows sit in groups over 32, so small-group sorts cannot replace the radix.
+
+**Failed (2026-11-01, tools/wt_a21):** `pread` into per-thread buffers instead of mmap: box 19.75 ms, 16.5 MB, S 399, 85.27, `run-df1a964b4c80`. Smaller claims in the last 16-24 MiB: tie or worse. Thread start stagger costs about 0.4-0.6 ms of CPU.
