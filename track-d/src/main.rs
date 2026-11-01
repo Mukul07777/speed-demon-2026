@@ -62,8 +62,7 @@ const REWRITE_BATCH: usize = 64; // edges translated together, after prefetching
 const BLOCK_SHIFT: u32 = 6; // distances live in blocks of this many neighbouring nodes
 const BLOCK_NODES: usize = 1 << BLOCK_SHIFT;
 const WINDOW: usize = 1 << WEIGHT_BITS; // edges with weights that fit reach less far ahead
-const LABEL_SHIFT: u32 = 26; // a claimed node is CLAIMED | worker << 26 | position in its order
-const CLAIMED: u32 = 1 << 31; // above every raw node entry, which is below 2^28
+const CLAIMED: u32 = 1 << 31; // a claimed node's entry is CLAIMED | its new id, above every raw entry (below 2^28)
 const UNREACHED: u64 = u64::MAX;
 const NONE: u32 = u32::MAX; // a distance slot nothing has reached, or whose distance is in `Side::wide`
 
@@ -161,10 +160,10 @@ unsafe fn reserve(bytes: usize) -> *mut u8 {
 
 /// Maps a file over the start of an anonymous region that ends a page later, so that a load
 /// that starts inside the file's last line may run past its end.
-unsafe fn map_file(file: &File, len: usize) -> *const u8 {
+unsafe fn map_file(file: &File, len: usize) -> &'static [u8] {
     let base = reserve(len.div_ceil(4096) * 4096 + 4096);
     mmap(base, len, 1, MAP_FILE, file.as_raw_fd(), 0);
-    base
+    std::slice::from_raw_parts(base, len)
 }
 
 /// The number in the `len` bytes before `end`. Up to eight digits take the same few
@@ -185,14 +184,12 @@ unsafe fn number_before(end: *const u8, len: usize) -> u64 {
 type Heavy = HashMap<(u32, u32), u32>;
 
 struct Layout {
-    node_base: Vec<u32>, // the first new id of each worker's nodes
     queries: Vec<(u32, u32)>,
     heavy: Heavy, // by (tail, head); the backward side looks up (head, tail)
 }
 
 struct Run {
-    text: *const u8,
-    text_len: usize,
+    text: &'static [u8], // the graph file, mapped with a page of slack after it
     nodes: usize,
     threads: usize,
     next_job: AtomicUsize,
@@ -203,7 +200,8 @@ struct Run {
     backward: Graph,
     in_degrees: *mut AtomicU8,
     heavy: Mutex<Vec<(u32, u32, u32)>>,  // tail, head and weight
-    claimed: Mutex<Vec<(usize, usize)>>, // worker, nodes
+    next_id: AtomicU32, // the first new id no worker has been given
+    chunks: Mutex<Vec<(usize, usize)>>, // spans of forward edges that hold nodes' edges
     layout: OnceLock<Layout>,
     raw_queries: Vec<(u32, u32)>,
     answers: Mutex<Vec<u64>>,
@@ -213,20 +211,17 @@ unsafe impl Sync for Run {}
 impl Run {
     unsafe fn parse(&self) {
         let mut cursors = vec![(null_mut(), null_mut()); self.rows.claimed.len()];
-        let text = self.text;
+        let text = self.text.as_ptr();
         let digit_floor = _mm256_set1_epi8(b'0' as i8);
         let mut heavy = Vec::new();
-        self.each_job(self.text_len.div_ceil(CLAIM), |job| {
+        self.each_job(self.text.len().div_ceil(CLAIM), |job| {
             let claim = job * CLAIM;
-            let end = (claim + CLAIM).min(self.text_len);
+            let end = (claim + CLAIM).min(self.text.len());
             madvise(text.add(claim), end - claim, MADV_POPULATE_READ);
             // A line belongs to the claim it starts in, so skip to the first newline from the
             // byte before the claim. The header belongs to nobody.
             let mut at = claim.saturating_sub(1);
-            while *text.add(at) != b'\n' {
-                at += 1;
-            }
-            at += 1;
+            at += self.text[at..].iter().position(|&b| b == b'\n').unwrap() + 1;
             while at < end {
                 // A line is at most 27 bytes, so one load holds all three of its separators.
                 let line = text.add(at);
@@ -264,13 +259,10 @@ impl Run {
     }
 
     /// Claims jobs 0..count, one at a time, until none are left.
-    fn each_job(&self, count: usize, mut job: impl FnMut(usize)) {
-        loop {
-            match self.next_job.fetch_add(1, Relaxed) {
-                next if next < count => job(next),
-                _ => return,
-            }
-        }
+    fn each_job(&self, count: usize, job: impl FnMut(usize)) {
+        (std::iter::repeat_with(|| self.next_job.fetch_add(1, Relaxed)))
+            .take_while(|&next| next < count)
+            .for_each(job);
     }
 
     /// Everyone waits; one worker does `alone` and resets the shared job counter.
@@ -289,10 +281,11 @@ impl Run {
     /// With random ids a node's entry and its edges are two cache misses (the label lives in
     /// the entry). The queue says what comes next, so each is prefetched in turn before it is
     /// needed. A claimed node's edges are copied, still with old head ids, into this worker's
-    /// own spans of the forward array, listed in the chunks returned with its entries.
-    unsafe fn grow_cells(&self, worker: usize) -> (Vec<u32>, Vec<(usize, usize)>) {
-        let mut entries: Vec<u32> = Vec::with_capacity(2 * self.nodes / self.threads);
-        let (mut chunks, mut cursor, mut limit, mut from) = (Vec::new(), 0, 0, 0);
+    /// own spans of the forward array, listed in the chunks returned. New ids come in windows
+    /// of CELL, so a worker's cells are numbered together and its nodes need no later sorting.
+    unsafe fn grow_cells(&self, worker: usize) {
+        let (mut cursor, mut limit, mut from) = (0, 0, 0);
+        let (mut id, mut window_end) = (0, 0);
         let (mut seeds, mut queue) = (Vec::<u32>::new(), Vec::<u32>::new());
         // The seeds that cells leave behind come first, then the worker's share of the nodes.
         let share = |worker: usize| (worker * self.nodes / self.threads) as u32;
@@ -319,22 +312,28 @@ impl Run {
                 // cache miss beyond reading its entry.
                 let at = &*self.raw.nodes.add(node).cast::<AtomicU32>();
                 let entry = at.load(Relaxed);
-                let value = CLAIMED | (worker as u32) << LABEL_SHIFT | entries.len() as u32;
+                if id == window_end {
+                    id = self.next_id.fetch_add(CELL as u32, Relaxed);
+                    window_end = id + CELL as u32;
+                }
+                let value = CLAIMED | id;
                 if entry & CLAIMED != 0
                     || at.compare_exchange(entry, value, Relaxed, Relaxed).is_err()
                 {
                     continue;
                 }
                 size += 1;
+                id += 1;
                 let neighbours = self.raw.edges_at(entry);
                 if cursor + neighbours.len() > limit {
-                    chunks.push((from, cursor));
+                    self.chunks.lock().unwrap().push((from, cursor));
                     from = self.forward.next_edge.fetch_add(EDGE_CLAIM, Relaxed);
                     (cursor, limit) = (from, from + EDGE_CLAIM);
                 }
                 let to = self.forward.edges.add(cursor);
                 std::ptr::copy_nonoverlapping(neighbours.as_ptr(), to, neighbours.len());
-                entries.push((cursor as u32) << START_SHIFT | neighbours.len() as u32);
+                *self.forward.nodes.add(value as usize & !(CLAIMED as usize)) =
+                    (cursor as u32) << START_SHIFT | neighbours.len() as u32;
                 cursor += neighbours.len();
                 queue.extend(neighbours.iter().map(|&edge| edge >> WEIGHT_BITS));
             }
@@ -342,28 +341,17 @@ impl Run {
             let kept = queue.len().saturating_sub(SEEDS_KEPT).max(head);
             seeds.extend_from_slice(&queue[kept..]);
         }
-        chunks.push((from, cursor));
-        (entries, chunks)
+        self.chunks.lock().unwrap().push((from, cursor));
     }
 
+    /// A node's new id, which growing the cells left in its raw entry.
     #[inline(always)]
-    unsafe fn new_id(&self, base: &[u32], old: usize) -> u32 {
-        let label = *self.raw.nodes.add(old) & !CLAIMED;
-        let worker = (label >> LABEL_SHIFT) as usize;
-        *base.get_unchecked(worker) + (label & ((1 << LABEL_SHIFT) - 1))
+    unsafe fn new_id(&self, old: usize) -> u32 {
+        *self.raw.nodes.add(old) & !CLAIMED
     }
 
     fn plan_layout(&self) -> Layout {
-        let mut claimed = self.claimed.lock().unwrap();
-        claimed.sort_unstable();
-        let mut nodes = 0;
-        let node_base: Vec<u32> = (claimed.iter())
-            .map(|&(_, count)| {
-                nodes += count;
-                (nodes - count) as u32
-            })
-            .collect();
-        let map = |old: u32| unsafe { self.new_id(&node_base, old as usize) };
+        let map = |old: u32| unsafe { self.new_id(old as usize) };
         let pair = |&(s, t): &(u32, u32)| (map(s), map(t));
         let queries = self.raw_queries.iter().map(pair).collect();
         let mut heavy = Heavy::new();
@@ -372,7 +360,6 @@ impl Run {
             *known = (*known).min(w);
         }
         Layout {
-            node_base,
             queries,
             heavy,
         }
@@ -380,65 +367,71 @@ impl Run {
 
     /// Translates every edge head, in place, to its new id, which is a random lookup per edge.
     /// Working in small batches lets each one prefetch all it will touch before it touches it.
-    unsafe fn rewrite_forward(&self, chunks: &[(usize, usize)], layout: &Layout) {
-        for &(from, to) in chunks {
-            let edges = std::slice::from_raw_parts_mut(self.forward.edges.add(from), to - from);
-            for batch in edges.chunks_mut(REWRITE_BATCH) {
-                for edge in batch.iter() {
-                    let head = (edge >> WEIGHT_BITS) as usize;
-                    _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(head).cast());
-                }
-                for edge in batch {
-                    let head = self.new_id(&layout.node_base, (*edge >> WEIGHT_BITS) as usize);
-                    *edge = head << WEIGHT_BITS | (*edge & WEIGHT_MASK);
-                    (*self.in_degrees.add(head as usize)).fetch_add(1, Relaxed);
-                }
+    unsafe fn rewrite_forward(&self, (from, to): (usize, usize)) {
+        let edges = std::slice::from_raw_parts_mut(self.forward.edges.add(from), to - from);
+        for batch in edges.chunks_mut(REWRITE_BATCH) {
+            for edge in batch.iter() {
+                let head = (edge >> WEIGHT_BITS) as usize;
+                _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(head).cast());
+            }
+            for edge in batch {
+                let head = self.new_id((*edge >> WEIGHT_BITS) as usize);
+                *edge = head << WEIGHT_BITS | (*edge & WEIGHT_MASK);
+                (*self.in_degrees.add(head as usize)).fetch_add(1, Relaxed);
             }
         }
     }
 
+    /// Gives back this worker's stretch of a region nobody needs any more; all workers doing
+    /// it together beat one worker doing it all while the rest wait.
+    unsafe fn release(&self, region: *mut u8, bytes: usize, worker: usize) {
+        let stretch = bytes.div_ceil(self.threads).next_multiple_of(4096);
+        let from = (worker * stretch).min(bytes);
+        madvise(region.add(from), (bytes - from).min(stretch), MADV_DONTNEED);
+    }
+
     unsafe fn work(&self, worker: usize) {
+        let ids = self.forward.node_count;
         self.parse();
         self.next_step(|| {});
         self.each_job(self.rows.claimed.len(), |shard| {
             self.raw.build_shard(&self.rows, shard)
         });
         self.next_step(|| {});
-        let (entries, chunks) = self.grow_cells(worker);
-        self.claimed.lock().unwrap().push((worker, entries.len()));
-        self.next_step(|| {
-            let _ = self.layout.set(self.plan_layout());
-            madvise(self.raw.edges.cast(), self.raw.edge_bytes, MADV_DONTNEED);
-        });
+        self.grow_cells(worker);
+        self.next_step(|| drop(self.layout.set(self.plan_layout())));
         let layout = self.layout.get().unwrap();
-        let first_id = layout.node_base[worker] as usize;
-        let count = entries.len();
-        let to = self.forward.nodes.add(first_id);
-        std::ptr::copy_nonoverlapping(entries.as_ptr(), to, entries.len());
-        drop(entries);
-        self.rewrite_forward(&chunks, layout);
-        self.next_step(|| {
-            madvise(self.raw.nodes.cast(), self.nodes * 4, MADV_DONTNEED);
-            // Turn the in-degree counts into entries that point just past each node's edges.
-            let mut end = 0u32;
-            for node in 0..self.nodes {
-                let degree = (*self.in_degrees.add(node)).load(Relaxed) as u32;
-                assert!(degree <= DEGREE_MASK);
-                end += degree;
-                *self.backward.nodes.add(node) = end << START_SHIFT | degree;
-            }
-            madvise(self.in_degrees.cast(), self.nodes, MADV_DONTNEED);
-        });
-        // Each edge takes the slot below its head's end, and the entry ends up at its start.
-        for node in first_id..first_id + count {
-            for &edge in self.forward.edges_at(*self.forward.nodes.add(node)) {
-                let head = (edge >> WEIGHT_BITS) as usize;
-                let entry = &*self.backward.nodes.add(head).cast::<AtomicU32>();
-                let slot = (entry.fetch_sub(1 << START_SHIFT, Relaxed) >> START_SHIFT) - 1;
-                *self.backward.edges.add(slot as usize) =
-                    (node as u32) << WEIGHT_BITS | (edge & WEIGHT_MASK);
-            }
+        self.release(self.raw.edges.cast(), self.raw.edge_bytes, worker);
+        let chunks = self.chunks.lock().unwrap().clone();
+        self.each_job(chunks.len(), |job| self.rewrite_forward(chunks[job]));
+        self.next_step(|| {});
+        self.release(self.raw.nodes.cast(), self.nodes * 4, worker);
+        // Turn the in-degree counts of this worker's stretch of nodes into entries that point
+        // just past each node's edges. The stretches before it say where its first one ends.
+        let counts = std::slice::from_raw_parts(self.in_degrees.cast::<u8>(), ids);
+        let stretch = ids.div_ceil(self.threads);
+        let (from, to) = ((worker * stretch).min(ids), ((worker + 1) * stretch).min(ids));
+        let mut end = counts[..from].iter().map(|&count| count as u32).sum::<u32>();
+        for node in from..to {
+            let degree = counts[node] as u32;
+            assert!(degree <= DEGREE_MASK);
+            end += degree;
+            *self.backward.nodes.add(node) = end << START_SHIFT | degree;
         }
+        self.next_step(|| {});
+        self.release(self.in_degrees.cast(), ids, worker);
+        // Each edge takes the slot below its head's end, and the entry ends up at its start.
+        self.each_job(ids.div_ceil(CELL), |cell| {
+            for node in cell * CELL..((cell + 1) * CELL).min(ids) {
+                for &edge in self.forward.edges_at(*self.forward.nodes.add(node)) {
+                    let head = (edge >> WEIGHT_BITS) as usize;
+                    let entry = &*self.backward.nodes.add(head).cast::<AtomicU32>();
+                    let slot = (entry.fetch_sub(1 << START_SHIFT, Relaxed) >> START_SHIFT) - 1;
+                    *self.backward.edges.add(slot as usize) =
+                        (node as u32) << WEIGHT_BITS | (edge & WEIGHT_MASK);
+                }
+            }
+        });
         self.next_step(|| {});
 
         let mut forward = Side::new(&self.forward, &layout.heavy, false);
@@ -697,11 +690,10 @@ fn numbers(text: &[u8]) -> impl Iterator<Item = usize> + '_ {
 }
 
 fn main() {
-    // Huge pages would round the per-thread buffers up to 2 MiB each.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
-    // A fixed threshold, so that big blocks always come from and go back to mmap (-3 is
-    // M_MMAP_THRESHOLD; glibc would otherwise raise it after the first big free).
-    unsafe { mallopt(-3, 1 << 17) };
+    // Huge pages would round the per-thread buffers up to 2 MiB each. And a fixed malloc
+    // threshold (-3 is M_MMAP_THRESHOLD; glibc would otherwise raise it after the first big
+    // free), so that big blocks always come from and go back to mmap.
+    unsafe { (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0), mallopt(-3, 1 << 17)) };
     let file = File::open("/data/graph.txt").unwrap();
     let text_len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -710,12 +702,13 @@ fn main() {
     let raw_queries: Vec<_> = ids.chunks(2).map(|pair| (pair[0], pair[1])).collect();
     let run = unsafe {
         let text = map_file(&file, text_len);
-        let mut header = numbers(std::slice::from_raw_parts(text, 64));
+        let mut header = numbers(&text[..64.min(text_len)]);
         let (nodes, edges) = (header.next().unwrap(), header.next().unwrap());
         let shards = (nodes >> SHARD_SHIFT) + 1;
+        // Each worker's last window of new ids may be partly unused.
+        let ids = nodes + threads * CELL;
         Run {
             text,
-            text_len,
             nodes,
             threads,
             next_job: AtomicUsize::new(0),
@@ -723,12 +716,13 @@ fn main() {
             rows: Rows::new(shards),
             raw: Graph::new(shards << SHARD_SHIFT, edges),
             // Room for the unused tails of every worker's EDGE_CLAIM spans.
-            forward: Graph::new(nodes, edges + (edges >> 3) + (1 << 20)),
-            backward: Graph::new(nodes, edges),
+            forward: Graph::new(ids, edges + (edges >> 3) + (1 << 20)),
+            backward: Graph::new(ids, edges),
             // One byte per node is enough: degrees are at most DEGREE_MASK.
-            in_degrees: reserve(nodes).cast(),
+            in_degrees: reserve(ids).cast(),
             heavy: Mutex::new(Vec::new()),
-            claimed: Mutex::new(Vec::new()),
+            next_id: AtomicU32::new(0),
+            chunks: Mutex::new(Vec::new()),
             layout: OnceLock::new(),
             answers: Mutex::new(vec![0; raw_queries.len()]),
             raw_queries,

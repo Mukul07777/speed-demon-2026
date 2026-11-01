@@ -8,25 +8,32 @@
 //!
 //! Threads. `main` starts `available_parallelism() - 1` workers and then works itself, so every
 //! thread runs `Run::work`. Work is handed out through atomic counters (file claims, then
-//! hours), with one barrier between the two phases:
+//! hours). The two phases overlap: after each claim a worker may summarise an hour that is
+//! sealed, meaning that the claims parsed so far at the front of the file hold a line two
+//! hours later, so (the input being the interleaving of eight time-ordered streams) no claim
+//! still to come should hold one of that hour. If that bet fails on some input, `solve` runs
+//! the whole job again and seals nothing before the end of the file, so the output is exact
+//! whatever the order of the lines.
 //!
 //! 1. Parse. Workers claim 1 MiB of the mapped file at a time (pages fault in on demand) and,
 //!    64 KiB at a time, find every newline first and then read each line from both ends with
 //!    no data-dependent branches. Each line becomes a 4-byte row in its hour's area. A claim's
-//!    file pages are dropped as soon as it is parsed.
-//! 2. Summarise. Workers claim one hour each and radix sort its rows by latency, inside the
-//!    hour's own pages. Dealing the sorted rows out by endpoint keeps them in order, so every
-//!    endpoint's latencies come out sorted and a percentile is one array read. The hour's text
-//!    is built over its rows, in the same pages. Once every earlier hour's text exists, an
-//!    hour's offset in the file is known, and the thread that finds it ready writes it there
-//!    with `pwrite` and gives its pages back. So writes run in several threads at once and
-//!    overlap the work, and memory is released as fast as the tmpfs output file grows (which
-//!    counts against the memory limit too).
+//!    file pages are dropped as soon as it is parsed, and it records the lowest and highest
+//!    hour it holds, which is all `advance` needs to seal hours and to notice a failed bet.
+//! 2. Summarise. Workers take sealed hours in order and radix sort each one's rows by latency,
+//!    inside the hour's own pages. Dealing the sorted rows out by endpoint keeps them in order,
+//!    so every endpoint's latencies come out sorted and a percentile is one array read. The
+//!    hour's text is built over its rows, in the same pages. Once every earlier hour's text
+//!    exists, an hour's offset in the file is known, and the thread that finds it ready writes
+//!    it there with `pwrite` and gives its pages back. So writes run in several threads at
+//!    once and overlap the work, and memory is released as fast as the tmpfs output file grows
+//!    (which counts against the memory limit too). Only a few hours of rows are alive at a
+//!    time, not all 72.
 //!
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
-use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex, OnceLock};
+use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
 use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
@@ -113,10 +120,17 @@ struct Run {
     // colliding is about 2e-10.
     slots: [AtomicU64; SLOTS], // hash >> 11 << 11 | id + 1; 0 is an empty slot
     names: Mutex<Vec<&'static [u8]>>, // by id
+    // The names in output order with their ids, as of the last time anyone asked.
+    order: Mutex<Arc<Vec<(&'static [u8], usize)>>>,
     rows: *mut u32,
     stride: usize,
     claimed: [AtomicUsize; HOURS], // rows of each hour's region given out in chunks
-    finished_parsing: Barrier,
+    // Per claim: 0 until parsed, then 1 << 16 | lowest hour << 8 | highest hour of its lines.
+    parsed: Vec<AtomicU32>,
+    // Hours below this have all their rows. Early sealing is a bet on the input's order (see `advance`).
+    sealed: AtomicUsize,
+    early: bool,
+    dirty: AtomicBool, // a line turned up in an hour that was already sealed
     next_hour: AtomicUsize,
     texts: [OnceLock<&'static [u8]>; HOURS], // each hour's text, until it is written
     output: File,
@@ -157,10 +171,10 @@ impl Run {
         // Per hour, the next free row and the final slot of the chunk being filled: a row needs
         // two free, in case it has to escape.
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
-        let (mut key, mut hour, mut cursor) =
-            (u64::MAX, 0, (std::ptr::null_mut(), std::ptr::null_mut()));
+        let (mut hour, mut cursor) = (0, (std::ptr::null_mut(), std::ptr::null_mut()));
         let mut ends = [0u32; BLOCK / MIN_LINE + 1];
         loop {
+            self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= self.len {
                 return;
@@ -171,6 +185,8 @@ impl Run {
             while claim > 0 && *line.sub(1) != b'\n' {
                 line = line.sub(1);
             }
+            // Every claim starts by reading its first hour, so it notes the hours it holds.
+            let (mut key, mut low, mut high) = (u64::MAX, HOURS, 0);
             for start in (claim..(claim + CLAIM).min(self.len)).step_by(BLOCK) {
                 // Find the newlines of the block first. Lines are longer than the 32-byte step, so
                 // a step holds at most one newline, and one unconditional store records it (a
@@ -205,6 +221,7 @@ impl Run {
                         hour =
                             (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
                         cursor = cursors[hour];
+                        (low, high) = (low.min(hour), high.max(hour));
                     }
                     // The method starts at byte 28 and is 3 to 6 letters, so the first space
                     // in that word gives its length, and the name follows it.
@@ -255,7 +272,53 @@ impl Run {
             // A later read of this range, by the next claim's first line, refaults the same
             // bytes, because the mapping is a read-only private file mapping.
             madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
+            self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
         }
+    }
+
+    /// Seals hours. The input is the interleaving of eight time-ordered streams, so the lines of
+    /// an hour are all in the file before the first line two hours later (on seed 1 by at least
+    /// 0.78 MiB; the spec promises no bound, so this is a bet, not a fact). Once the parsed
+    /// claims at the front of the file hold a line of hour h + 2, no claim still to be parsed
+    /// should hold one of hour h, and h is sealed. Its rows are then summarised while the rest of
+    /// the file is read, and given back at once, so only a few hours of rows are alive instead of
+    /// all 72. If the bet fails, some claim holds a line of an hour sealed before it (noticed
+    /// here, once the claims in front of it are parsed): `dirty`, and `solve` runs again,
+    /// sealing nothing until the whole file is read.
+    ///
+    /// Then summarises the next sealed hour, if there is one, and writes what is ready.
+    fn advance(&self) {
+        let (mut top, mut sealed) = (0usize, HOURS);
+        for claim in &self.parsed {
+            let info = claim.load(Acquire) as usize;
+            if info == 0 {
+                sealed = top.saturating_sub(1);
+                break;
+            }
+            self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
+            top = top.max((info & 255) * self.early as usize);
+        }
+        self.sealed.fetch_max(sealed, Release);
+        let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
+        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
+            return;
+        };
+        // The names may have grown since the last hour was summarised.
+        let order = {
+            let names = self.names.lock().unwrap();
+            let mut order = self.order.lock().unwrap();
+            if order.len() != names.len() {
+                let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
+                sorted.sort_unstable();
+                *order = Arc::new(sorted);
+            }
+            order.clone()
+        };
+        let part = unsafe { self.summarise(hour, &order) };
+        self.texts[hour].set(part).unwrap();
+        // Whoever takes the lock after an hour's text is set sees it, so every hour is
+        // written exactly once, by the thread that finds it ready.
+        self.write_ready();
     }
 
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
@@ -272,7 +335,7 @@ impl Run {
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
         // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
         // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
-        let (mut starts, mut errors) = (vec![0u32; order.len() + 2], vec![0u32; order.len() + 2]);
+        let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
         let mut long = Vec::new();
 
         // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
@@ -381,19 +444,10 @@ impl Run {
 
     fn work(&self) {
         unsafe { self.parse() };
-        self.finished_parsing.wait();
-        // Names in output order, with their ids. A &[u8] orders as unsigned bytes with a proper
-        // prefix first. Every worker sorts its own copy at once, so only the copy is under the
-        // lock (sorted under it, the twelve sorts ran one after another).
-        let names = self.names.lock().unwrap().clone();
-        let mut order: Vec<_> = names.into_iter().zip(0..).collect();
-        order.sort_unstable();
-        while let hour @ 0..HOURS = self.next_hour.fetch_add(1, Relaxed) {
-            let part = unsafe { self.summarise(hour, &order) };
-            self.texts[hour].set(part).unwrap();
-            // Whoever takes the lock after an hour's text is set sees it, so every hour is
-            // written exactly once, by the thread that finds it ready.
-            self.write_ready();
+        // Out of claims: what is left is hours that wait for the last claims in flight.
+        while self.next_hour.load(Relaxed) < HOURS {
+            self.advance();
+            thread::yield_now();
         }
     }
 }
@@ -424,6 +478,11 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
+    solve(true) && solve(false);
+}
+
+/// Returns whether the early sealing failed.
+fn solve(early: bool) -> bool {
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -444,8 +503,11 @@ fn main() {
         // scratch (one value per line) after them, or after SPARE_AT rows if that is further,
         // plus the unused ends of one partly filled chunk per thread.
         let stride =
-            (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1024);
-        let rows = map(null, stride * HOURS * 4, 3, 0x4022, -1);
+            (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
+        // Hour areas are multiples of 2 MiB and the first starts on a 2 MiB boundary, so each
+        // hour's pages share one page table instead of spilling into the next.
+        let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);
+        let rows = rows.map_addr(|a| a.next_multiple_of(2 << 20));
         (input, rows.cast(), stride)
     };
 
@@ -458,7 +520,11 @@ fn main() {
         rows,
         stride,
         claimed: [const { AtomicUsize::new(0) }; HOURS],
-        finished_parsing: Barrier::new(threads),
+        order: Mutex::default(),
+        parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
+        sealed: AtomicUsize::new(0),
+        early,
+        dirty: AtomicBool::new(false),
         next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
         output: File::create("/out/summary.txt").unwrap(),
@@ -470,4 +536,5 @@ fn main() {
         }
         run.work();
     });
+    run.dirty.load(Relaxed)
 }
