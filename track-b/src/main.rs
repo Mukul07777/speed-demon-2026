@@ -142,6 +142,9 @@ struct Run {
     word_terms: Vec<u32>,
     samples: Mutex<(Vec<u32>, usize)>,
     next_claim: AtomicUsize,
+    // One counter of claims and one of jobs per phase, so that no phase needs resetting.
+    phase_claims: Vec<AtomicUsize>,
+    phase_jobs: Vec<AtomicUsize>,
     next_job: AtomicUsize,
     step: Barrier,
     bitmaps: *mut u64,
@@ -531,9 +534,9 @@ impl Run {
         doc - first_doc + 1
     }
 
-    fn each_job(&self, count: usize, mut job: impl FnMut(usize)) {
+    fn each_job(&self, counter: &AtomicUsize, count: usize, mut job: impl FnMut(usize)) {
         loop {
-            let next = self.next_job.fetch_add(1, Relaxed);
+            let next = counter.fetch_add(1, Relaxed);
             if next >= count {
                 return;
             }
@@ -630,6 +633,7 @@ impl Run {
             info.count += size;
         }
         std::ptr::write_bytes(region, 0, claimed);
+        self.claimed[shard].store(0, Relaxed);
     }
 
     unsafe fn count_bitmaps(&self) {
@@ -728,21 +732,16 @@ impl Run {
         drop(counts);
         if self.step.wait().is_leader() {
             self.plan_terms();
-            self.next_claim.store(0, Relaxed);
         }
         self.step.wait();
         for phase in 0..self.len.div_ceil(PHASE_CLAIMS * CLAIM) {
             let limit = (phase + 1) * PHASE_CLAIMS;
             loop {
-                let claim = self.next_claim.fetch_add(1, Relaxed);
+                let claim = phase * PHASE_CLAIMS + self.phase_claims[phase].fetch_add(1, Relaxed);
                 if claim >= limit || claim * CLAIM >= self.len {
                     break;
                 }
                 self.index_claim::<false>(claim, &mut [], &mut buffers);
-            }
-            if self.step.wait().is_leader() {
-                self.next_job.store(0, Relaxed);
-                self.next_claim.store(limit, Relaxed);
             }
             self.step.wait();
             let first_doc = |claim| {
@@ -751,16 +750,13 @@ impl Run {
             };
             let base = first_doc(phase * PHASE_CLAIMS);
             assert!(first_doc(limit) - base < u16::MAX as usize);
-            self.each_job(SHARDS, |shard| self.build_shard(shard, base as u32));
-            if self.step.wait().is_leader() {
-                self.next_job.store(0, Relaxed);
-                self.claimed.iter().for_each(|rows| rows.store(0, Relaxed));
-            }
+            self.each_job(&self.phase_jobs[phase], SHARDS, |shard| {
+                self.build_shard(shard, base as u32)
+            });
             self.step.wait();
         }
         if self.step.wait().is_leader() {
             self.count_bitmaps();
-            self.next_job.store(0, Relaxed);
         }
         self.step.wait();
 
@@ -771,7 +767,7 @@ impl Run {
             bits: vec![0; self.words_per_bitmap],
         };
         let mut spaces = [Vec::new(), Vec::new()];
-        self.each_job(batches, |batch| {
+        self.each_job(&self.next_job, batches, |batch| {
             let mut out = Vec::with_capacity(QUERY_BATCH * 64);
             self.answer_batch(batch, &mut scratch, &mut spaces, &mut out);
             self.parts.lock().unwrap()[batch] = out;
@@ -1194,6 +1190,8 @@ fn main() {
             word_terms: Vec::with_capacity(1 << 18),
             samples: Mutex::new((Vec::new(), 0)),
             next_claim: AtomicUsize::new(0),
+            phase_claims: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
+            phase_jobs: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
             next_job: AtomicUsize::new(0),
             step: Barrier::new(threads),
             bitmaps: reserve(MAX_HEAVY * words_per_bitmap * 8, MADV_HUGEPAGE).cast(),
