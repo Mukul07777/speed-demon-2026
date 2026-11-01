@@ -56,6 +56,7 @@ const BATCH_CAP: usize = MAX_RECORDS + 3;
 // The two numbers of a record that wait for `decode_digits`, as indexes of a batch's arrays.
 const ID: usize = 0;
 const AMOUNT: usize = 1;
+const REGION: usize = 2;
 const QUOTE_WORDS: usize = 1 << 10; // masks kept for the rank query, more than one batch
 const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 8;
@@ -309,10 +310,18 @@ impl Run {
         let mut positions = [0u32; MAX_POSITIONS];
         let mut quotes = [0u64; QUOTE_WORDS];
         let mut quotes_before = [0u32; QUOTE_WORDS];
-        let mut pending: Vec<Pending> = Vec::with_capacity(MAX_RECORDS);
+        let mut pending: Vec<Pending> = vec![
+            Pending {
+                hash: 0,
+                lengths: 0,
+                sign: 0,
+                region: 0
+            };
+            MAX_RECORDS
+        ];
         let mut spare = 0..0; // name numbers this worker reserved
-        let mut digits = [[0u64; BATCH_CAP]; 2];
-        let mut numbers = [[0u32; BATCH_CAP]; 2];
+        let mut digits = [[0u64; BATCH_CAP]; 3];
+        let mut numbers = [[0u32; BATCH_CAP]; 3];
         loop {
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= len {
@@ -375,63 +384,59 @@ impl Run {
                         .wrapping_add(below.count_ones())
                 };
                 let complete = filled / FIELDS;
-                pending.clear();
-                // Nothing before a name's comma holds a quote except the record before, so
-                // each record starts from where the last one's note ended.
-                let mut rank = quotes_up_to(record);
-                let mut read_positions = 0;
-                while read_positions < complete * FIELDS && record < claim_end {
-                    let field = positions
-                        .as_ptr()
-                        .add(read_positions)
-                        .cast::<[u32; FIELDS]>();
-                    read_positions += FIELDS;
-                    let [comma1, comma2, comma3, comma4, newline] = (*field).map(|p| p as usize);
-                    let bom = (*input.add(record) == 0xEF) as usize * 3;
-                    let id_len = comma1 - record - bom;
-                    record = newline + 1;
-
-                    let at = pending.len();
-                    digits[ID][at] = digits_before(input.add(comma1), id_len);
-                    let region = number_before(input.add(comma4), comma4 - comma3 - 1) as usize;
-                    let region = region.min(REGION_IDS);
-                    _mm_prefetch::<_MM_HINT_T0>(self.region_table.add(region).cast());
-                    // The sign sits before the digits, where the shift leaves it out.
+                let field = |at: usize| {
+                    let five = positions.as_ptr().add(at * FIELDS).cast::<[u32; FIELDS]>();
+                    (*five).map(|p| p as usize)
+                };
+                // Pass A: how many records start inside this claim, and their numbers.
+                let mut count = 0;
+                let mut start = record;
+                while count < complete && start < claim_end {
+                    let [comma1, _, comma3, comma4, newline] = field(count);
+                    let bom = (*input.add(start) == 0xEF) as usize * 3;
+                    digits[ID][count] = digits_before(input.add(comma1), comma1 - start - bom);
+                    digits[REGION][count] = digits_before(input.add(comma4), comma4 - comma3 - 1);
                     let end = newline - (*input.add(newline - 1) == b'\r') as usize;
                     let negative = (*input.add(comma4 + 1) == b'-') as usize;
-                    digits[AMOUNT][at] = cents_digits(input.add(end), end - comma4 - 1 - negative);
-
-                    // The name has just been read, so only the note's end needs a rank query.
+                    digits[AMOUNT][count] =
+                        cents_digits(input.add(end), end - comma4 - 1 - negative);
+                    pending.get_unchecked_mut(count).sign = -(negative as i64);
+                    start = newline + 1;
+                    count += 1;
+                }
+                for kind in [ID, AMOUNT, REGION] {
+                    decode_digits(&digits[kind], &mut numbers[kind], count);
+                }
+                // Pass B: names and notes.
+                let mut rank = quotes_up_to(record);
+                for at in 0..count {
+                    let [comma1, comma2, comma3, ..] = field(at);
                     let raw_name = comma2 - comma1 - 1;
                     let (hash, name_inside) =
                         name_hash(input.add(comma1 + 2), raw_name.saturating_sub(2));
                     let name_len = raw_name.saturating_sub(2) - name_inside / 2;
                     let rank3 = quotes_up_to(comma3);
-                    // The delimiters add two quotes, but only to a name that is not empty.
                     let name_quotes = name_inside + 2 * (raw_name != 0) as usize;
                     let note_quotes = rank3.wrapping_sub(rank) as usize - name_quotes;
                     rank = rank3;
-                    // A note of raw length L with q quote bytes has L - q/2 - 1 value bytes, or
-                    // L when there are no quotes: q counts the delimiters and each pair.
                     let note_len =
                         comma3 - comma2 - 1 - note_quotes / 2 - (note_quotes != 0) as usize;
                     let bucket = (hash >> (64 - BUCKETS.trailing_zeros())) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(bucket).cast());
-                    pending.push(Pending {
-                        hash,
-                        sign: -(negative as i64),
-                        region: region as u32,
-                        lengths: name_len as u64 | (note_len as u64) << 32,
-                    });
+                    let region = (numbers[REGION][at] as usize).min(REGION_IDS);
+                    _mm_prefetch::<_MM_HINT_T0>(self.region_table.add(region).cast());
+                    let slot = pending.get_unchecked_mut(at);
+                    slot.region = region as u32;
+                    slot.hash = hash;
+                    slot.lengths = name_len as u64 | (note_len as u64) << 32;
                 }
+                let read_positions = count * FIELDS;
+                record = start;
                 // The region table and the name table were each a cache miss on every record,
                 // half of the pass above when it read them itself. Now both are prefetched
                 // before this pass reads them. A locked update of a cold line stalls the core,
                 // so its lines are fetched here and updated in the pass after.
-                for kind in [ID, AMOUNT] {
-                    decode_digits(&digits[kind], &mut numbers[kind], pending.len());
-                }
-                for (at, name) in pending.iter_mut().enumerate() {
+                for (at, name) in pending[..count].iter_mut().enumerate() {
                     let group = *self.region_table.add(name.region as usize) as usize;
                     let amount = (numbers[AMOUNT][at] as i64 ^ name.sign) - name.sign;
                     let s = stats.get_unchecked_mut(group);
@@ -446,7 +451,7 @@ impl Run {
                     _mm_prefetch::<_MM_HINT_ET0>(self.seen.add(word).cast());
                     name.hash = (word << 6 | id % 64) as u64;
                 }
-                for name in &pending {
+                for name in &pending[..count] {
                     (*self.seen.add((name.hash >> 6) as usize))
                         .fetch_or(1 << (name.hash & 63), Relaxed);
                 }
