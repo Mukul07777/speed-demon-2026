@@ -17,13 +17,9 @@
 //!
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
-use std::fs::File;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex, OnceLock};
-use std::thread;
+use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex, OnceLock};
+use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -31,11 +27,9 @@ extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
-const MAP_PRIVATE: i32 = 2;
-const MAP_FIXED: i32 = 0x10;
-const MAP_ANONYMOUS: i32 = 0x20;
-const MAP_NORESERVE: i32 = 0x4000;
+const PROT_READ_WRITE: i32 = 3;
+const MAP_PRIVATE_FIXED: i32 = 0x12;
+const MAP_PRIVATE_ANONYMOUS_NORESERVE: i32 = 0x4022;
 const MADV_DONTNEED: i32 = 4;
 const PR_SET_THP_DISABLE: i32 = 41;
 
@@ -47,7 +41,7 @@ const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const TEXT_ROOM: usize = 1 << 18; // rows (1 MiB) past the rows, more than any hour's text needs
+const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
 const SPACES: u64 = 0x2020_2020_2020_2020;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 const ONES: u64 = 0x0101_0101_0101_0101;
@@ -61,9 +55,6 @@ const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
 
-/// The next free row and the final slot of the chunk being filled: a row needs two free, in
-/// case it has to escape.
-type Cursor = (*mut u32, *mut u32);
 /// Endpoint names in output order, with their ids.
 type Names = [(&'static [u8], usize)];
 
@@ -76,17 +67,6 @@ unsafe fn read(p: *const u8) -> u64 {
 fn spaces_in(word: u64) -> u64 {
     let z = word ^ SPACES;
     z.wrapping_sub(ONES) & !z & HIGHS
-}
-
-/// Every endpoint seen so far. Workers share it: it fills in the first moments of the run
-/// and is read-only after that, so one copy stays hot in cache.
-///
-/// Names are identified by a 64-bit hash alone (53 bits of it are compared), the same
-/// deliberate shortcut Tracks B and C take: with 1,842 names the chance of any two colliding
-/// is about 2e-10.
-struct Catalogue {
-    slots: [AtomicU64; SLOTS], // hash >> 11 << 11 | id + 1; 0 is an empty slot
-    names: Mutex<Vec<&'static [u8]>>, // by id
 }
 
 /// A hash of the whole name without a length-dependent loop: the masked first and last 32
@@ -117,65 +97,17 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
 
 const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
 
-impl Catalogue {
-    /// The id of an endpoint name, new if this is its first appearance.
-    #[inline(always)]
-    unsafe fn lookup(&self, name: *const u8, len: usize) -> usize {
-        let hash = name_hash(name, len);
-        match self.probe(hash) {
-            Ok(id) => id,
-            Err(_) => self.insert(hash, name, len),
-        }
-    }
-
-    /// The id with this hash, or the index of the empty slot that ends its probe sequence.
-    #[inline(always)]
-    fn probe(&self, hash: u64) -> Result<usize, usize> {
-        let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
-        loop {
-            let slot = self.slots[i].load(Acquire);
-            if slot >> ID_BITS == hash >> ID_BITS {
-                return Ok((slot & ID_MASK) as usize - 1);
-            } else if slot == 0 {
-                return Err(i);
-            }
-            i = (i + 1) & (SLOTS - 1);
-        }
-    }
-
-    /// The name is fully written before the Release store publishes the slot, so a reader
-    /// that sees the slot sees the name.
-    #[cold]
-    unsafe fn insert(&self, hash: u64, name: *const u8, len: usize) -> usize {
-        let mut names = self.names.lock().unwrap();
-        // Another worker may have added it while this one waited for the lock.
-        let slot = match self.probe(hash) {
-            Ok(id) => return id,
-            Err(slot) => slot,
-        };
-        let id = names.len();
-        assert!(id < ID_MASK as usize); // id + 1 must fit the low bits of a slot
-        names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
-        self.slots[slot].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
-        id
-    }
-
-    /// Names in output order, with their ids. A &[u8] orders as unsigned bytes with a proper
-    /// prefix first. Every worker sorts its own copy at once, so only the copy is under the
-    /// lock (sorted under it, the twelve sorts ran one after another).
-    fn sorted(&self) -> Vec<(&'static [u8], usize)> {
-        let names = self.names.lock().unwrap().clone();
-        let mut order: Vec<_> = names.into_iter().zip(0..).collect();
-        order.sort_unstable();
-        order
-    }
-}
-
 struct Run {
     input: *mut u8,
     len: usize,
     next_claim: AtomicUsize,
-    catalogue: Catalogue,
+    // The catalogue: every endpoint seen so far. Workers share it: it fills in the first
+    // moments of the run and is read-only after that, so one copy stays hot in cache.
+    // Names are identified by a 64-bit hash alone (53 bits of it are compared), the same
+    // deliberate shortcut Tracks B and C take: with 1,842 names the chance of any two
+    // colliding is about 2e-10.
+    slots: [AtomicU64; SLOTS], // hash >> 11 << 11 | id + 1; 0 is an empty slot
+    names: Mutex<Vec<&'static [u8]>>, // by id
     rows: *mut u32,
     stride: usize,
     claimed: [AtomicUsize; HOURS], // rows of each hour's region given out in chunks
@@ -212,16 +144,38 @@ unsafe fn long_latency(line_end: *const u8) -> (u32, usize) {
 }
 
 impl Run {
-    #[cold]
-    unsafe fn claim_chunk(&self, hour: usize) -> Cursor {
-        let offset = self.claimed[hour].fetch_add(CHUNK, Relaxed);
-        let at = self.rows.add(hour * self.stride + offset);
-        (at, at.add(CHUNK - 1))
+    /// The id of an endpoint name, new if this is its first appearance. Slots are only ever
+    /// filled, under the lock, so a slot seen empty under the lock ends the probe sequence: the
+    /// name is new and goes there. The name is written before the Release store publishes the
+    /// slot, so a reader that sees the slot sees the name.
+    #[inline(always)]
+    unsafe fn lookup(&self, name: *const u8, len: usize) -> usize {
+        let hash = name_hash(name, len);
+        let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
+        loop {
+            let slot = self.slots[i].load(Acquire);
+            if slot >> ID_BITS == hash >> ID_BITS {
+                return (slot & ID_MASK) as usize - 1;
+            } else if slot == 0 {
+                let mut names = self.names.lock().unwrap();
+                if self.slots[i].load(Acquire) == 0 {
+                    let id = names.len();
+                    assert!(id < ID_MASK as usize); // id + 1 must fit the low bits of a slot
+                    names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
+                    self.slots[i].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
+                    return id;
+                }
+                continue; // another worker filled this slot meanwhile: look at it again
+            }
+            i = (i + 1) & (SLOTS - 1);
+        }
     }
 
     unsafe fn parse(&self) {
         let input = self.input;
-        let mut cursors: [Cursor; HOURS] = [(std::ptr::null_mut(), std::ptr::null_mut()); HOURS];
+        // Per hour, the next free row and the final slot of the chunk being filled: a row needs
+        // two free, in case it has to escape.
+        let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
         let mut ends = [0u32; BLOCK / MIN_LINE + 1];
         loop {
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
@@ -235,8 +189,7 @@ impl Run {
                 line = line.sub(1);
             }
             for start in (claim..(claim + CLAIM).min(self.len)).step_by(BLOCK) {
-                let to = (start + BLOCK).min(self.len);
-                let count = find_newlines(input, start, to, &mut ends);
+                let count = find_newlines(input, start, (start + BLOCK).min(self.len), &mut ends);
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
                     // Oct 30, Oct 31, Nov 1 and Nov 2 are day 0 to 3 of the span.
@@ -261,11 +214,12 @@ impl Run {
                     };
                     let status = end.sub(digits + 4);
                     let len = status.sub(1).offset_from(name) as usize;
-                    let id = self.catalogue.lookup(name, len) as u32;
+                    let id = self.lookup(name, len) as u32;
                     let is_error = (*status == b'5') as u32;
-                    let cursor = cursors.get_unchecked_mut(hour as usize);
+                    let (hour, cursor) = (hour as usize, cursors.get_unchecked_mut(hour as usize));
                     if cursor.0 >= cursor.1 {
-                        *cursor = self.claim_chunk(hour as usize);
+                        let at = self.claimed[hour].fetch_add(CHUNK, Relaxed) + hour * self.stride;
+                        *cursor = (self.rows.add(at), self.rows.add(at + CHUNK - 1));
                     }
                     *cursor.0 = ((id + 1) << 1 | is_error) << LATENCY_BITS | latency.min(ESCAPE);
                     cursor.0 = cursor.0.add(1);
@@ -285,25 +239,21 @@ impl Run {
     }
 
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
-    /// area of `rows`: the rows first, then the text over them; the sort scratch is the
-    /// thread's. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
+    /// area of `rows`: the rows first, then the text over them, and the sort scratch further
+    /// on. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
     /// (Text in malloc'd buffers was the bulk of the memory peak: the allocator kept every
     /// buffer it had grown while the writer, which is serial, fell behind.)
-    unsafe fn summarise(&self, hour: usize, order: &Names, spare: &mut Vec<u32>) -> &'static [u8] {
+    unsafe fn summarise(&self, hour: usize, order: &Names) -> &'static [u8] {
         let rows = self.rows.add(hour * self.stride);
         let claimed = self.claimed[hour].load(Relaxed);
-        // The sort scratch is the thread's own, reused hour after hour, so its pages are
-        // faulted in once and stay in cache rather than being fresh for every hour.
-        spare.resize(claimed.max(spare.len()), 0);
-        let spare = spare.as_mut_ptr();
-        let mut starts = vec![0u32; order.len() + 2];
-        let mut errors = starts.clone();
+        // The text can run past the rows, but never a million bytes past them.
+        let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
+        let (mut starts, mut errors) = (vec![0u32; order.len() + 2], vec![0u32; order.len() + 2]);
         let mut long = Vec::new();
 
         // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
         // are all longer than the rest, so sorted on their own they simply follow them.
-        let mut sizes = [[0u32; DIGITS]; 2];
-        let mut count = 0;
+        let (mut sizes, mut count) = ([[0u32; DIGITS]; 2], 0);
         for chunk in (0..claimed).step_by(CHUNK) {
             let mut at = chunk;
             while at < chunk + CHUNK && *rows.add(at) != 0 {
@@ -355,29 +305,31 @@ impl Run {
         }
         long.iter().for_each(|&(latency, row)| deal(row, latency));
 
-        let label = hour_label(hour);
-        let text = rows.cast::<u8>();
-        let mut w = text;
+        // The hour as text with a trailing space, padded so it can be copied as one 32-byte load.
+        let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
+        let mut label = [0; 32];
+        label[..21]
+            .copy_from_slice(format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24).as_bytes());
+        let (text, mut w) = (rows.cast::<u8>(), rows.cast::<u8>());
         for &(name, id) in order {
-            let group = id + 1;
-            let span = starts[group - 1] as usize..starts[group] as usize;
+            let span = starts[id] as usize..starts[id + 1] as usize;
             if span.is_empty() {
                 continue;
             }
-            let (n, bad) = (span.len() as u32, errors[group]);
+            let (n, bad) = (span.len() as u32, errors[id + 1]);
             let sorted = std::slice::from_raw_parts(spare.add(span.start), span.len());
             let at_rank = |p: usize| sorted[(p * sorted.len() + 99) / 100 - 1];
-            let (p50, p95, p99) = (at_rank(50), at_rank(95), at_rank(99));
             copy_nonoverlapping(label.as_ptr(), w, 32);
             copy_nonoverlapping(name.as_ptr(), w.add(21), name.len());
             w = w.add(21 + name.len());
-            for number in [n, p50, p95, p99, bad] {
+            for number in [n, at_rank(50), at_rank(95), at_rank(99), bad] {
                 w = put_number(w, number);
             }
             w = put_number(w, (bad as u64 * 1_000_000 / n as u64) as u32);
             *w = b'\n';
             w = w.add(1);
         }
+        madvise(spare.cast(), (count + long.len()) * 4, MADV_DONTNEED);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
@@ -405,29 +357,26 @@ impl Run {
     fn work(&self) {
         unsafe { self.parse() };
         self.finished_parsing.wait();
-        let order = self.catalogue.sorted();
-        let mut scratch = Vec::new();
-        loop {
-            let hour = self.next_hour.fetch_add(1, Relaxed);
-            if hour >= HOURS {
-                break;
-            }
-            let part = unsafe { self.summarise(hour, &order, &mut scratch) };
+        // Names in output order, with their ids. A &[u8] orders as unsigned bytes with a proper
+        // prefix first. Every worker sorts its own copy at once, so only the copy is under the
+        // lock (sorted under it, the twelve sorts ran one after another).
+        let mut order: Vec<_> = self
+            .names
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .zip(0..)
+            .collect();
+        order.sort_unstable();
+        while let hour @ 0..HOURS = self.next_hour.fetch_add(1, Relaxed) {
+            let part = unsafe { self.summarise(hour, &order) };
             self.texts[hour].set(part).unwrap();
             // Whoever takes the lock after an hour's text is set sees it, so every hour is
             // written exactly once, by the thread that finds it ready.
             self.write_ready();
         }
     }
-}
-
-/// The hour as text with a trailing space, padded so it can be copied as one 32-byte load.
-fn hour_label(hour: usize) -> [u8; 32] {
-    let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
-    let text = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
-    let mut label = [0; 32];
-    label[..21].copy_from_slice(text.as_bytes());
-    label
 }
 
 /// Eight digits at once, as bytes with the first digit lowest. Divides by 10000, then 100,
@@ -464,18 +413,21 @@ fn main() {
     let (input, rows, stride) = unsafe {
         prctl(PR_SET_THP_DISABLE, 1usize, 0usize, 0usize, 0usize);
         let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
-        let private = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-        let null = std::ptr::null_mut();
-        let span = len.div_ceil(4096) * 4096 + 4096;
-        let input = map(null, span, PROT_READ, private, -1);
+        let (null, anonymous) = (std::ptr::null_mut(), MAP_PRIVATE_ANONYMOUS_NORESERVE);
+        let input = map(
+            null,
+            len.div_ceil(4096) * 4096 + 4096,
+            PROT_READ,
+            anonymous,
+            -1,
+        );
         // For an empty file this fails, and the zero page stays.
-        let fd = file.as_raw_fd();
-        map(input, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd);
-        // An hour has room for its rows (two per line, if every line escaped) and its text.
-        let stride = TEXT_ROOM + (len / MIN_LINE + 1) * 2 + threads * CHUNK * 2;
-        let stride = stride.div_ceil(1024) * 1024;
-        let size = stride * HOURS * 4;
-        let rows = map(null, size, PROT_READ | PROT_WRITE, private, -1);
+        map(input, len, PROT_READ, MAP_PRIVATE_FIXED, file.as_raw_fd());
+        // An hour has room for its rows (two per line, if every line escaped), then for the
+        // scratch (one value per line) after them, or after SPARE_AT rows if that is further.
+        let stride =
+            (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1024);
+        let rows = map(null, stride * HOURS * 4, PROT_READ_WRITE, anonymous, -1);
         (input, rows.cast(), stride)
     };
 
@@ -483,10 +435,8 @@ fn main() {
         input,
         len,
         next_claim: AtomicUsize::new(0),
-        catalogue: Catalogue {
-            slots: [const { AtomicU64::new(0) }; SLOTS],
-            names: Mutex::new(Vec::new()),
-        },
+        slots: [const { AtomicU64::new(0) }; SLOTS],
+        names: Mutex::new(Vec::new()),
         rows,
         stride,
         claimed: [const { AtomicUsize::new(0) }; HOURS],
