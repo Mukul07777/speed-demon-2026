@@ -137,21 +137,10 @@ unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
         << (64 - 8 * len)
 }
 
-/// The digits of an amount such as `5.25` in the `len` bytes before `end`, without its point.
-unsafe fn cents_digits(end: *const u8, len: usize) -> u64 {
-    let bytes = digits_before(end, len);
-    // Close the gap the point leaves: its byte is always third from the end.
-    (bytes & 0xFF_FFFF_FFFF) << 8 | bytes & 0xFFFF_0000_0000_0000
-}
-
 /// Turns the first `count` words of eight digit bytes each into numbers, four at a time, like
 /// `eight_digits` does for one. The three arrays of a batch go through the same few
 /// instructions, so a record's numbers cost far less than three scalar multiply chains.
-unsafe fn decode_digits(
-    words: &[u64; MAX_RECORDS],
-    numbers: &mut [u32; MAX_RECORDS],
-    count: usize,
-) {
+unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
     let (ten, hundred, ten_thousand) = (0x010A, 0x0001_0064, 0x0001_2710);
     for at in (0..count).step_by(4) {
         let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
@@ -164,13 +153,6 @@ unsafe fn decode_digits(
         let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(eights));
         _mm_storeu_si128(numbers.as_mut_ptr().add(at).cast(), packed);
     }
-}
-
-/// Sets each bit that has an odd number of set bits at or below it, so quote bits become a
-/// mask of everything inside quotes.
-unsafe fn prefix_xor(bits: u64) -> u64 {
-    let (bits, ones) = (_mm_cvtsi64_si128(bits as i64), _mm_set1_epi8(-1));
-    _mm_cvtsi128_si64(_mm_clmulepi64_si128(bits, ones, 0)) as u64
 }
 
 /// The hash of a name, never 0, which marks an unused slot, and the number of quote bytes in
@@ -208,20 +190,6 @@ fn take_block(counter: &AtomicUsize, size: usize, len: usize) -> Option<usize> {
     Some(counter.fetch_add(size, Relaxed)).filter(|&at| at < len)
 }
 
-/// The group of a country, numbered from 1 in order of first appearance.
-fn group_of(code: &[u8]) -> u8 {
-    let cell = &LETTERS[code.iter().fold(0, |n, &c| n * 26 + (c - b'A') as usize)];
-    if cell.load(Relaxed) == 0 {
-        // Only 240 calls get this far, so a lock is fine.
-        let mut countries = COUNTRIES.lock().unwrap();
-        if cell.load(Relaxed) == 0 {
-            countries.push(String::from_utf8_lossy(code).into_owned());
-            cell.store(countries.len() as u8 - 1, Relaxed);
-        }
-    }
-    cell.load(Relaxed)
-}
-
 impl Run {
     fn parse_regions(&self) {
         let text = self.regions;
@@ -236,7 +204,18 @@ impl Run {
                 let id = fields[..digits]
                     .iter()
                     .fold(0, |n, &c| n * 10 + (c - b'0') as usize);
-                REGION_GROUP[id].store(group_of(&fields[digits + 1..][..3]), Relaxed);
+                // Groups are numbered from 1 in order of first appearance of the country.
+                let code = &fields[digits + 1..][..3];
+                let cell = &LETTERS[code.iter().fold(0, |n, &c| n * 26 + (c - b'A') as usize)];
+                if cell.load(Relaxed) == 0 {
+                    // Only 240 lines get this far, so a lock is fine.
+                    let mut countries = COUNTRIES.lock().unwrap();
+                    if cell.load(Relaxed) == 0 {
+                        countries.push(String::from_utf8_lossy(code).into_owned());
+                        cell.store(countries.len() as u8 - 1, Relaxed);
+                    }
+                }
+                REGION_GROUP[id].store(cell.load(Relaxed), Relaxed);
                 line += digits + 5;
             }
         }
@@ -273,7 +252,11 @@ impl Run {
                     let high = load(input.add(at + 32));
                     let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
                     let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
-                    let inside_now = prefix_xor(quote) ^ inside;
+                    // A carry-less multiply by all ones sets each bit that has an odd number of
+                    // quote bits at or below it: the mask of everything inside quotes.
+                    let ones = _mm_set1_epi8(-1);
+                    let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
+                    let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
                     inside = ((inside_now as i64) >> 63) as u64;
                     let mut structural = (comma | newline) & !inside_now;
                     let word = (at - origin) / 64 % QUOTE_WORDS;
@@ -314,8 +297,9 @@ impl Run {
                     digits[REGION][count] = digits_before(input.add(comma4), comma4 - comma3 - 1);
                     let stop = newline - (*input.add(newline - 1) == b'\r') as usize;
                     let negative = (*input.add(comma4 + 1) == b'-') as usize;
-                    digits[AMOUNT][count] =
-                        cents_digits(input.add(stop), stop - comma4 - 1 - negative);
+                    let cents = digits_before(input.add(stop), stop - comma4 - 1 - negative);
+                    // Close the gap the point leaves: its byte is always third from the end.
+                    digits[AMOUNT][count] = (cents & 0xFF_FFFF_FFFF) << 8 | cents >> 48 << 48;
                     pending.get_unchecked_mut(count).sign = -(negative as i64);
                     start = newline + 1;
                     count += 1;
@@ -421,30 +405,22 @@ impl Run {
     unsafe fn insert(&self, mut index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
         loop {
             for slot in &self.tables.buckets[index] {
-                if spare.start == spare.end {
-                    let first = NEXT_NAME.fetch_add(NAME_BLOCK, Relaxed);
-                    *spare = first..first + NAME_BLOCK;
-                }
                 // A plain read first: a CAS on a slot that is already taken is a wasted locked op.
-                let held = slot.load(Relaxed);
-                if held != 0 {
-                    if held >> NUMBER_BITS == tag {
-                        return (held & NUMBER_MASK) as usize;
+                let mut held = slot.load(Relaxed);
+                if held == 0 {
+                    if spare.is_empty() {
+                        let first = NEXT_NAME.fetch_add(NAME_BLOCK, Relaxed);
+                        *spare = first..first + NAME_BLOCK;
                     }
-                    continue;
+                    let claimed = tag << NUMBER_BITS | spare.start as u64;
+                    // On failure the slot holds another name, or this one if a worker just added it.
+                    match slot.compare_exchange(0, claimed, Relaxed, Relaxed) {
+                        Ok(_) => return spare.next().unwrap(),
+                        Err(seen) => held = seen,
+                    }
                 }
-                let number = spare.start;
-                let claimed = tag << NUMBER_BITS | number as u64;
-                // A slot that is taken holds another name, or this one if a worker just added it.
-                let seen = match slot.compare_exchange(0, claimed, Relaxed, Relaxed) {
-                    Ok(_) => {
-                        spare.start += 1;
-                        return number;
-                    }
-                    Err(seen) => seen,
-                };
-                if seen >> NUMBER_BITS == tag {
-                    return (seen & NUMBER_MASK) as usize;
+                if held >> NUMBER_BITS == tag {
+                    return (held & NUMBER_MASK) as usize;
                 }
             }
             index = (index + 1) % BUCKETS;
@@ -480,16 +456,12 @@ fn money(cents: i64) -> String {
     format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }
 
-/// An anonymous zeroed mapping.
-unsafe fn anonymous(len: usize, prot: i32) -> *mut u8 {
-    mmap(null_mut(), len, prot, MAP_ANON, -1, 0)
-}
-
 /// Maps a file for reading, with a spare zero page after it so wide loads may run past the end.
 unsafe fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap();
     let (fd, len) = (file.as_raw_fd(), file.metadata().unwrap().len() as usize);
-    let base = anonymous(len.next_multiple_of(4096) + 4096, PROT_READ);
+    let size = len.next_multiple_of(4096) + 4096;
+    let base = mmap(null_mut(), size, PROT_READ, MAP_ANON, -1, 0);
     mmap(base, len, PROT_READ, MAP_FILE, fd, 0);
     from_raw_parts(base, len)
 }
@@ -498,7 +470,8 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 /// pages are touched later by the workers, because huge pages are disabled for everything else
 /// before the records start.
 unsafe fn zeroed_huge<T>() -> &'static T {
-    let region = anonymous(size_of::<T>() + HUGE_PAGE, PROT_READ | PROT_WRITE);
+    let (len, prot) = (size_of::<T>() + HUGE_PAGE, PROT_READ | PROT_WRITE);
+    let region = mmap(null_mut(), len, prot, MAP_ANON, -1, 0);
     let aligned = region.add(region.align_offset(HUGE_PAGE));
     madvise(aligned, size_of::<T>(), MADV_HUGEPAGE);
     &*aligned.cast()
