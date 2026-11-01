@@ -47,7 +47,7 @@ const MADV_NOHUGEPAGE: i32 = 15;
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
-const PHASE_CLAIMS: usize = 100; // 20 MiB of text between turning rows into postings
+const PHASE_CLAIMS: usize = 200; // 50 MiB of text between turning rows into postings
 const HEADER: usize = 1; // u16s before a list: a sentinel while it fills, so duplicates drop with no branch
 const CLEAR_JOBS: usize = 16; // slices of the idle bitmap set that are zeroed during a phase
 const TALLY_IDS: usize = 10;
@@ -72,7 +72,7 @@ const MASKS_T: [u64; 6] = [
     0x00000000ffffffff,
 ];
 const DOC_BITS: u32 = 18;
-const CHUNK: usize = 32; // rows; the first of each chunk names the claim that wrote it
+const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
 const PLAN_JOBS: usize = 16;
 const WORKSPACE: usize = 32 << 20; // a worker's share of the one reservation for batch space
@@ -138,7 +138,6 @@ struct Scratch {
     active: usize, // which list the next result goes into
     bits: Vec<u64>,
     marks: Vec<u64>, // all zeros between uses
-    out: Vec<u8>,    // one batch of answer lines
 }
 
 /// What the phases so far found for one query. All zeros is the empty answer, so the array
@@ -841,13 +840,11 @@ impl Run {
             }
         }
         if phase + 1 == self.phase_base.len() - 1 {
-            let out = &mut scratch.out;
-            out.clear();
+            let mut out = Vec::with_capacity(QUERY_BATCH * 64);
             for index in first..end {
-                (*tallies.add(index)).write(out);
+                (*tallies.add(index)).write(&mut out);
             }
-            // Cloned to the exact size: the 4 KiB a batch might need would double the parts.
-            self.parts.lock().unwrap()[batch] = out.clone();
+            self.parts.lock().unwrap()[batch] = out;
         }
     }
 
@@ -932,10 +929,6 @@ impl Run {
         self.step.wait();
         self.each_job(&self.setup[2], PLAN_JOBS, |part| self.plan_buckets(part));
         self.step.wait();
-        if id == 0 {
-            // The sample's counts were only for planning.
-            discard(self.sample.as_ptr().cast(), MAX_TERMS * 4);
-        }
 
         let batches = self.merged().units.len();
         let mut scratch = Scratch {
@@ -943,7 +936,6 @@ impl Run {
             active: 0,
             bits: vec![0; self.words_per_bitmap],
             marks: vec![0; self.words_per_bitmap],
-            out: Vec::new(),
         };
         let phases = self.phase_base.len() - 1;
         // Stage k scans phase k, and a thread that runs out of claims answers phase k - 1
@@ -1239,16 +1231,6 @@ struct Parsed {
 unsafe fn parse_queries(run: &Run, from: usize, to: usize) -> Parsed {
     let text = run.query_text;
     let (mut parsed, mut ids, mut at) = (Parsed::default(), (0, 0), from);
-    // Every vector is sized once from the share's spaces and lines, an upper bound on each of
-    // them: untouched capacity costs no memory, and growing by doubling would strand the old
-    // copies in the thread's arena.
-    let bytes = std::slice::from_raw_parts(text.add(from), to - from);
-    let bound = bytes.iter().filter(|&&c| c == b' ' || c == 10).count();
-    parsed.queries.reserve_exact(bound);
-    parsed.steps.reserve_exact(bound);
-    parsed.words.reserve_exact(bound);
-    parsed.word_terms.reserve_exact(bound);
-    parsed.phrases.reserve_exact(bound);
     while at < to {
         let phrase = *text.add(at) == b'P';
         at += if phrase { 8 } else { 5 }; // past `PHRASE "` or `BOOL `
@@ -1383,15 +1365,6 @@ fn main() {
 
     thread::scope(|s| spawn_tree(s, &run, 0));
 
-    // The index is dead: give it back before the output file takes its share of the peak.
-    unsafe {
-        discard(run.postings.cast(), run.len * 2);
-        discard(run.bitmaps.cast(), 2 * MAX_HEAVY * run.words_per_bitmap * 8);
-        discard(run.workspace, threads * WORKSPACE);
-        for shard in 0..SHARDS {
-            discard(run.rows.add(shard * (run.len + 4096)).cast(), (run.len + 4096) * 4);
-        }
-    }
     let mut out = File::create("/out/results.txt").unwrap();
     for part in run.parts.lock().unwrap().iter() {
         out.write_all(part).unwrap();
