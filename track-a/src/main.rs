@@ -305,9 +305,8 @@ impl Run {
         };
         // The names may have grown since the last hour was summarised.
         let order = {
-            // Taken in this order so that parsers never wait for the sort.
+            let names = self.names.lock().unwrap();
             let mut order = self.order.lock().unwrap();
-            let names = self.names.lock().unwrap().clone();
             if order.len() != names.len() {
                 let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
                 sorted.sort_unstable();

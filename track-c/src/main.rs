@@ -379,7 +379,6 @@ impl Run {
             // record running into the next claim just faults its few pages back in.
             // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
             // into whatever is mapped after the range, and would wipe it.
-            madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
