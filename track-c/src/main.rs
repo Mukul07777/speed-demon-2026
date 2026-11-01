@@ -1,24 +1,32 @@
 //! Speed Demon 2026, Track C (Join).
 //!
+//! Threads and phases. `main` maps both files and starts one worker per CPU as a tree
+//! (`Run::start`). Every worker first zeroes one huge page of the shared tables, then the
+//! workers parse `regions.csv` together in 64 KiB claims into a region-to-group table, and
+//! one barrier later they parse `records.csv` in 1 MiB claims. Each worker sums into its own
+//! `Stats` per group, merged under a lock at the end; `main` sorts the groups and prints.
+//!
 //! The file is parsed in parallel without ever scanning from its start, because the spec
 //! gives a safe resync point: inside a note an LF is only ever followed by a lowercase word
 //! or a quote, so an LF followed by a digit or a BOM always starts a record.
 //!
-//! Each worker claims 1 MiB and walks it in 2 KiB batches:
+//! A claim is walked in batches of 2 KiB, each in four passes:
 //!
 //! 1. Find structure. For each 64 bytes, AVX2 finds quotes, commas and LFs, and a carry-less
 //!    multiply turns the quotes into an inside-quotes mask. `""` toggles twice, so escapes
-//!    need no handling at all. Every record then has exactly five structural bytes.
-//! 2. Read fields. With no branch that depends on the data: 23% of records hold an escape,
-//!    so branching on escapes or field shapes would mispredict constantly.
-//! 3. Number the names. Names are drawn uniformly from 100,000 values, so every lookup is
-//!    a cache miss, and the batch prefetches before it touches anything. A name is a 64-bit
-//!    hash in a table of 64-byte buckets, so a lookup is one cache line and one AVX2 compare.
-//!    Two different names sharing a hash would need odds of about 3 in 10 billion, well below
-//!    the chance of a hardware fault, and the saving is a second memory access per record.
-//!
-//! Each record then sets its name's bit in its country's row of one shared bit matrix, and
-//! popcounts of the rows give the distinct names.
+//!    need no handling at all. Every record then has exactly five structural bytes, whose
+//!    positions go into one array.
+//! 2. Read fields (passes A and B), with no branch that depends on the data: 23% of records
+//!    hold an escape, so branching on escapes or field shapes would mispredict constantly.
+//!    Digits of ids, amounts and regions are gathered and decoded four records at a time.
+//! 3. Stats and name numbers. Names are drawn uniformly from 100,000 values, so every lookup
+//!    is a cache miss, and pass B prefetches before this pass touches anything. A name is a
+//!    64-bit hash: its top 15 bits pick a 64-byte bucket of eight slots, which holds 47 more
+//!    bits of it as a tag beside the name's dense number. Two of 100,000 names matching on
+//!    all 62 bits has odds of about 1 in a billion, and comparing hashes instead of bytes
+//!    saves a second memory access per record.
+//! 4. Distinct names. Each record sets its name's bit in its country's row of one shared bit
+//!    matrix (256 groups by 2^17 names, 4 MiB), and popcounts of the rows give the counts.
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::{arch::x86_64::*, fs::File, ops::Range, os::fd::AsRawFd, ptr::*, slice::from_raw_parts};
 use std::{sync::Barrier, sync::Mutex, thread};
@@ -35,10 +43,11 @@ const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 20;
 const REGION_CLAIM: usize = 1 << 16;
 const BATCH_WORDS: usize = 32; // 64-byte steps of the file between record passes
-const FIELDS: usize = 5; // structural bytes per record: four commas and an LF
-                         // Records that fit in a batch (the shortest is `1,,,1,0.00` and an LF, 11 bytes), two more that
-                         // were left over from the one before, and three for the digit arrays, which are decoded four at
-                         // a time and so may be read up to three past the last record.
+// Structural bytes per record: four commas and an LF.
+const FIELDS: usize = 5;
+// Records that fit in a batch (the shortest is `1,,,1,0.00` and an LF, 11 bytes), two more that
+// were left over from the one before, and three for the digit arrays, which are decoded four at
+// a time and so may be read up to three past the last record.
 const MAX_RECORDS: usize = BATCH_WORDS * 64 / 11 + 5;
 // The three numbers of a record that wait for `decode_digits`, as indexes of a batch's arrays.
 const ID: usize = 0;
@@ -51,9 +60,10 @@ const NUMBER_BITS: i32 = 17; // a name's dense number; the generator draws from 
 const NUMBER_MASK: u64 = (1 << NUMBER_BITS) - 1;
 const REGION_IDS: usize = 1_000_000; // lookup ids stay below this; anything above is unmatched
 const GROUPS: usize = 256; // 240 countries, with index 0 for unmatched
-const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6); // of one group's row of the name bit matrix
-                                                  // Amounts are kept as the largest of `BIAS + amount` and of `BIAS - amount`, both positive, so
-                                                  // that a zeroed `Stats` is a valid empty one and merging two needs only sums and maxima.
+// Words of one group's row of the name bit matrix.
+const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
+// Amounts are kept as the largest of `BIAS + amount` and of `BIAS - amount`, both positive, so
+// that a zeroed `Stats` is a valid empty one and merging two needs only sums and maxima.
 const BIAS: i64 = 1 << 40;
 
 static NEXT_REGION_CLAIM: AtomicUsize = AtomicUsize::new(0);
@@ -203,6 +213,7 @@ impl Run {
                     }
                 }
                 REGION_GROUP[id].store(cell.load(Relaxed), Relaxed);
+                // Past the id, its comma, the three-letter code and the LF.
                 line += digits + 5;
             }
         }
@@ -244,6 +255,7 @@ impl Run {
                     let ones = _mm_set1_epi8(-1);
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
+                    // All ones if the step ended inside quotes: the next step starts inverted.
                     inside = ((inside_now as i64) >> 63) as u64;
                     let mut structural = (comma | newline) & !inside_now;
                     let word = (at - origin) / 64 % QUOTE_WORDS;
@@ -279,6 +291,7 @@ impl Run {
                 let mut start = record;
                 while count < complete && start < end {
                     let [comma1, _, comma3, comma4, newline] = field(count);
+                    // Only the file's first record can start with a BOM, three bytes before its id.
                     let bom = (*input.add(start) == 0xEF) as usize * 3;
                     digits[ID][count] = digits_before(input.add(comma1), comma1 - start - bom);
                     digits[REGION][count] = digits_before(input.add(comma4), comma4 - comma3 - 1);
@@ -301,6 +314,8 @@ impl Run {
                     let raw_name = comma2 - comma1 - 1;
                     let (hash, name_inside) =
                         name_hash(input.add(comma1 + 2), raw_name.saturating_sub(2));
+                    // A quoted field of q quote bytes holds (q - 2) / 2 escapes, so its value is
+                    // `raw - q / 2 - 1` bytes long, and `raw` when q is 0 (an empty field).
                     let name_len = raw_name.saturating_sub(2) - name_inside / 2;
                     let rank3 = quotes_up_to(comma3);
                     let name_quotes = name_inside + 2 * (raw_name != 0) as usize;
@@ -310,6 +325,7 @@ impl Run {
                         comma3 - comma2 - 1 - note_quotes / 2 - (note_quotes != 0) as usize;
                     let bucket = (hash >> (64 - BUCKETS.trailing_zeros())) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.tables.buckets.as_ptr().add(bucket).cast());
+                    // Ids past the table share its last entry, which stays 0: unmatched.
                     let region = (numbers[REGION][at] as usize).min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
                     let slot = pending.get_unchecked_mut(at);
@@ -338,6 +354,7 @@ impl Run {
                     let id = self.intern(name, &mut spare);
                     let word = group * SEEN_WORDS + id / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.tables.seen.as_ptr().add(word).cast());
+                    // The hash is done with, so its slot carries the bit's address to the next pass.
                     name.hash = (word << 6 | id % 64) as u64;
                 }
                 for name in &pending[..count] {

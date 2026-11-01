@@ -14,6 +14,20 @@
 //!    with the phrase. A match writes a row for a pseudo-term that stands for the phrase, so
 //!    a phrase query is then a one-term lookup, and no document is ever read twice.
 //! 4. Evaluate BOOL strictly left to right on whichever of list or bitmap suits each step.
+//!    Queries are answered once per phase, on that phase's postings and bitmaps, into a
+//!    running tally per query (count, id sum, ten smallest ids), so no full index ever exists.
+//!
+//! Threads. One worker per CPU, started as a tree (`spawn_tree`), all running `Run::work`:
+//! parse a share of `queries.txt` and intern its terms into the shared bucket table, merge
+//! (one thread), sample 12 claims, plan anchors and bitmaps, then for each phase scan its
+//! 256 KiB claims, build its postings shard by shard, and answer it. The answers of phase
+//! k - 1 run on whichever threads have run out of scan claims in phase k, so no thread waits
+//! for the slowest scanner. Work is shared through atomic job counters, one set per phase,
+//! so no counter is ever reset. `main` writes the answer parts in file order.
+//!
+//! The term table is 2^15 buckets of one cache line, each with 7 tags and 8 actions
+//! (`Bucket`), on a huge page. A token's action says what the scan does with it: nothing,
+//! set a bit in a bitmap, write a row for a list, or also start a phrase check.
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, ptr::null_mut, thread};
@@ -79,13 +93,13 @@ struct Buffers {
     hashes: &'static mut [u64],
     heavy_hits: &'static mut [u32],  // bitmap << DOC_BITS | document
     list_hits: &'static mut [u64],   // action << 32 | document
-    anchor_hits: &'static mut [u64], // term + 1 << 40 | document << 20 | token
+    anchor_hits: &'static mut [u64], // term + 1 << 40 | document << 20 | token (the shift drops the action's flags)
     counts: &'static mut [u32],      // in the sample, how often each term occurs
 }
 
 #[derive(Clone, Copy)]
 struct Term {
-    first: u32,   // the term's last list part, or its bitmap index
+    first: u32,   // the header slot of the term's list in this phase, or its bitmap index
     count: u32,   // documents containing the term
     phrases: u32, // the first phrase anchored here, + 1
     heavy: bool,
@@ -301,9 +315,11 @@ fn fold_multiply(a: u64, b: u64) -> u64 {
 }
 
 /// The hash of a token in any case, never 0, which marks an unused slot. Tokens are compared
-/// by this hash alone: of 600,000 tokens and 80,000 terms, two sharing 64 bits has odds of
-/// about 3 in a billion. Every token byte is a letter or digit, and `| 0x20` lowers letters
-/// and leaves digits, so folding needs no check on each byte.
+/// by this hash alone, and the table keeps 47 bits of it (15 pick the bucket, 32 are the
+/// tag), so a token that is no query term matches one with odds of about 3 in 10,000 over the
+/// whole corpus: a deliberate shortcut, for one load and compare per token. Every token byte
+/// is a letter or digit, and `| 0x20` lowers letters and leaves digits, so folding needs no
+/// check on each byte.
 const KEY: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 
 /// A load from `MASKS` at `16 - len` is ones for the first `len` bytes and zeros after.
@@ -419,7 +435,7 @@ impl Run {
 
         let mut cursors = [(null_mut(), null_mut()); SHARDS];
         let (mut token_count, mut end_count, mut line_count) = (0, 0, 0);
-        let mut carry = 0u64; // whether the previous 32 bytes ended inside a token
+        let mut carry = 0u64; // whether the previous 64 bytes ended inside a token
         let mut at = start;
         let mut first_token = true;
 
@@ -469,7 +485,8 @@ impl Run {
                     line_count += 1;
                     breaks &= breaks - 1;
                 }
-                // Unconditional stores, so a varying token count needs no loop to predict.
+                // Unconditional stores, so a varying token count needs no loop to predict. Twelve
+                // cover almost every 64-byte step; the loops after take the rare rest.
                 let (found, finished) =
                     (opened.count_ones() as usize, closed.count_ones() as usize);
                 for extra in 0..12 {
@@ -567,6 +584,7 @@ impl Run {
                     *heavy_hits.add(heavy_count) = action << DOC_BITS | doc as u32;
                     heavy_count += (action >> 31) as usize;
                     *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
+                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
                     list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
                     // Rare enough to predict: about 1 token in 150 starts a phrase check.
                     if action & ANCHOR != 0 {
@@ -654,7 +672,7 @@ impl Run {
                 madvise(text.add(from) as *mut u8, to - from, MADV_DONTNEED);
             }
         }
-        // The sample's rows do not exist, so its claims are read again by the main pass.
+        // The documents this claim held, which the sample uses to scale its counts.
         doc - first_doc + 1
     }
 
@@ -971,6 +989,7 @@ impl Run {
                 break;
             }
             self.step.wait();
+            // Postings are u16 offsets from the phase's first document, with u16::MAX the sentinel.
             assert!(self.phase_base[stage + 1] - self.phase_base[stage] < u16::MAX as u32);
             self.each_job(&self.phase_jobs[stage], SHARDS + CLEAR_JOBS, |job| {
                 if job < SHARDS {
@@ -1094,6 +1113,7 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             out.extend(a.iter().filter(|&&doc| held(doc) == (op == Op::And)));
             list(out)
         }
+        // A merged list is cheaper than a bitmap while it is shorter than one.
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => {
             union(a, b, out);
             list(out)
@@ -1299,10 +1319,11 @@ fn main() {
             digits.fold(0, |id, &digit| id * 10 + (digit - b'0') as usize) + 1
         });
         assert!(docs < 1 << DOC_BITS);
-        let stride = len + 4096; // rows per shard: more than any shard can hold
-                                 // Mapped rather than read: a few fault-arounds instead of a copy into fresh pages.
-                                 // The 64 bytes past the end that the parser may look at are zeros, from the page's
-                                 // tail or from the spare page `map_file` leaves.
+        // Rows per shard: more than any shard can hold. Only touched pages cost memory.
+        let stride = len + 4096;
+        // Mapped rather than read: a few fault-arounds instead of a copy into fresh pages.
+        // The 64 bytes past the end that the parser may look at are zeros, from the page's
+        // tail or from the spare page `map_file` leaves.
         let query_text = map_file(&queries, query_len);
         Run {
             text,
@@ -1351,6 +1372,7 @@ fn main() {
         .map(|w| w[1] - w[0])
         .max()
         .unwrap_or(0);
+    // A multiple of 4 words, because `add_bits` reads 256 bits at a time.
     run.words_per_bitmap = (widest as usize / 64 + 2).next_multiple_of(4);
     run.bitmaps =
         unsafe { reserve(2 * MAX_HEAVY * run.words_per_bitmap * 8, MADV_HUGEPAGE).cast() };

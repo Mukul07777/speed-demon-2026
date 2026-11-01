@@ -3,16 +3,24 @@
 //! Node ids are a random relabelling of a road map, so in file order every step of a search
 //! is a cache miss. Most of the program therefore exists to undo that:
 //!
-//! 1. Parse edges into rows, sharded by tail node, which needs no shared counters.
-//! 2. Build an adjacency array from the shards, in any node order.
-//! 3. Grow compact cells of nodes over that graph and renumber in cell order, so that nodes
-//!    close on the map are close in memory.
-//! 4. Rewrite the forward and backward adjacency arrays in the new order.
-//! 5. Answer each query with a bidirectional Dijkstra, on one thread per query.
+//! Every thread runs `Run::work`, the same phases in turn, with a barrier between them
+//! (`next_step`) and jobs claimed from one shared counter:
 //!
-//! An edge is 4 bytes: 21 bits of head and 11 of weight. Only about 3,500 of the 5,000,000
-//! weights need more, so those edges carry an all-ones weight and the real one is looked up
-//! in a side table.
+//! 1. Parse 1 MiB claims of edges into rows, sharded by tail node. Each worker owns a
+//!    64-row chunk per shard at a time, so a row costs no shared counter.
+//! 2. Build the raw adjacency array from the shards, one shard per job, in any node order.
+//! 3. Grow compact cells of nodes over that graph (`grow_cells`). Claiming a node writes its
+//!    new position into its raw entry, and copies its edges straight into the final forward
+//!    array, so nodes close on the map are close in memory and growing and laying out the
+//!    forward array are one pass.
+//! 4. Number the cells (`plan_layout`, one thread), then translate every forward edge head
+//!    to its new id and count in-degrees, and fill the backward array from those counts.
+//! 5. Answer the queries with a bidirectional Dijkstra, one query per job.
+//!
+//! An edge is 4 bytes: 21 bits of head and 11 of weight. A node entry is `start << 5 | degree`.
+//! Only about 3,500 of the 5,000,000 weights need more than 11 bits, so those edges carry an
+//! all-ones weight and the real one is looked up in a side table. Raw rows and the raw graph
+//! are released with `MADV_DONTNEED` as soon as they are used, to keep the peak down.
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -45,7 +53,7 @@ const SHARD_NODES: usize = 1 << SHARD_SHIFT;
 const SHARD_ROWS: usize = SHARD_NODES * 16; // a shard's nodes have fewer than 16 edges each on average
 const CHUNK_ROWS: usize = 64;
 const WEIGHT_BITS: u32 = 11;
-const DEGREE_MASK: u32 = 31;
+const DEGREE_MASK: u32 = 31; // a node entry's low 5 bits; build asserts no degree is larger
 const START_SHIFT: u32 = 5;
 const WEIGHT_MASK: u32 = (1 << WEIGHT_BITS) - 1;
 const CELL: usize = 1 << 10;
@@ -171,6 +179,7 @@ impl Graph {
         }
         for row in rows.rows_of(shard) {
             let slot = &mut cursor[row.low as usize];
+            // Undo the `other + 1` that kept a used row nonzero.
             *self.edges.add(*slot as usize) = row.packed - (1 << WEIGHT_BITS);
             *slot += 1;
         }
@@ -303,8 +312,10 @@ impl Run {
     /// its queue becomes seeds, newest first, so that the next cell starts next door and
     /// neighbouring cells land near each other in the numbering.
     ///
-    /// With random ids a node's entry, its edges and its label are three cache misses. The
-    /// queue says what comes next, so each is prefetched in turn before it is needed.
+    /// With random ids a node's entry and its edges are two cache misses (the label lives in
+    /// the entry). The queue says what comes next, so each is prefetched in turn before it is
+    /// needed. A claimed node's edges are copied, still with old head ids, into this worker's
+    /// own spans of the forward array, listed in the chunks returned with its entries.
     unsafe fn grow_cells(&self, worker: usize) -> (Vec<u32>, Vec<(usize, usize)>) {
         let mut entries: Vec<u32> = Vec::with_capacity(2 * self.nodes / self.threads);
         let (mut chunks, mut cursor, mut limit, mut from) = (Vec::new(), 0, 0, 0);
@@ -354,6 +365,7 @@ impl Run {
                 cursor += neighbours.len();
                 queue.extend(neighbours.iter().map(|&edge| edge >> WEIGHT_BITS));
             }
+            // The last SEEDS_KEPT queued nodes the cell did not reach become seeds.
             let kept = queue.len().saturating_sub(SEEDS_KEPT).max(head);
             seeds.extend_from_slice(&queue[kept..]);
         }
@@ -766,8 +778,10 @@ fn main() {
             step: Barrier::new(threads),
             rows: Rows::new(shards),
             raw: Graph::new(shards << SHARD_SHIFT, edges),
+            // Room for the unused tails of every worker's EDGE_CLAIM spans.
             forward: Graph::new(nodes, edges + (edges >> 3) + (1 << 20)),
             backward: Graph::new(nodes, edges),
+            // One byte per node is enough: degrees are at most DEGREE_MASK.
             in_degrees: reserve(nodes).cast(),
             heavy: Mutex::new(Vec::new()),
             claimed: Mutex::new(Vec::new()),
