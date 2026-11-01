@@ -145,7 +145,8 @@ impl Tally {
             *slot = base + doc;
         }
         self.count += list.len() as u32;
-        self.sum += list.iter().map(|&doc| doc as u64).sum::<u64>() + base as u64 * list.len() as u64;
+        self.sum +=
+            list.iter().map(|&doc| doc as u64).sum::<u64>() + base as u64 * list.len() as u64;
     }
 
     /// Adds a phase's result as a bitmap. The sum of the ids in a word is 64 * word index *
@@ -464,6 +465,13 @@ impl Run {
                 carry = inside >> 31;
                 let mut opened = inside & !shifted;
                 let mut closed = !inside & shifted;
+                // A line is recorded as the index of the token that follows it, the next id.
+                while breaks != 0 {
+                    let before = opened & ((1u32 << breaks.trailing_zeros()) - 1);
+                    lines[line_count] = (token_count + before.count_ones() as usize) as u32;
+                    line_count += 1;
+                    breaks &= breaks - 1;
+                }
                 // Unconditional stores, so a varying token count needs no loop to predict.
                 let (found, finished) =
                     (opened.count_ones() as usize, closed.count_ones() as usize);
@@ -489,25 +497,16 @@ impl Run {
                 }
                 token_count += found;
                 end_count += finished;
-                while breaks != 0 {
-                    lines[line_count] = (at + breaks.trailing_zeros() as usize) as u32;
-                    line_count += 1;
-                    breaks &= breaks - 1;
-                }
                 at += 32;
             }
 
             // Only whole documents go on, so that a phrase has all its tokens at hand.
-            let mut ready = if line_count > 0 { end_count } else { 0 };
-            while ready > 0 && *starts.get_unchecked(ready - 1) > lines[line_count - 1] {
-                ready -= 1;
-            }
-            let (mut token, mut line) = (0, 0);
-            let mut next_line = if line_count > 0 {
-                lines[0] as usize + 1
+            let ready = if line_count > 0 {
+                lines[line_count - 1] as usize
             } else {
-                usize::MAX
+                0
             };
+            let mut token = 0;
             if first_token && ready > 0 {
                 first_token = false;
                 token = 1; // the id of the claim's first document
@@ -521,35 +520,41 @@ impl Run {
                 *hashes.get_unchecked_mut(i) = hash_of(text.add(from), to - from);
             }
             let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
-            while token < ready {
-                if *starts.get_unchecked(token) as usize >= next_line {
-                    doc += 1;
-                    line += 1;
-                    next_line = if line < line_count {
-                        lines[line] as usize + 1
-                    } else {
-                        usize::MAX
-                    };
-                    // A line's first token is its id. As hash 0 it also stops a phrase check
-                    // from running on into the next document.
-                    *hashes.get_unchecked_mut(token) = 0;
+            for line in 0..line_count {
+                let to = lines[line] as usize;
+                while token < to {
+                    let ahead = bucket_of(*hashes.get_unchecked(token + AHEAD));
+                    _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(ahead).cast());
+                    let action = self.action_of(*hashes.get_unchecked(token));
+                    // All three stores happen, and only the right counts move.
+                    *heavy_hits.get_unchecked_mut(heavy_count) = action << DOC_BITS | doc as u32;
+                    heavy_count += (action >> 31) as usize;
+                    *list_hits.get_unchecked_mut(list_count) = (action as u64) << 32 | doc as u64;
+                    list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
+                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
+                    if action & ANCHOR != 0 {
+                        *anchor_hits.get_unchecked_mut(anchor_count) =
+                            (action as u64) << 40 | (doc as u64) << 20 | token as u64;
+                        anchor_count += 1;
+                    }
                     token += 1;
-                    continue;
                 }
-                let ahead = bucket_of(*hashes.get_unchecked(token + AHEAD));
-                _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(ahead).cast());
-                let action = self.action_of(*hashes.get_unchecked(token));
-                // All three stores happen, and only the right counts move.
-                *heavy_hits.get_unchecked_mut(heavy_count) = action << DOC_BITS | doc as u32;
-                heavy_count += (action >> 31) as usize;
-                *list_hits.get_unchecked_mut(list_count) = (action as u64) << 32 | doc as u64;
-                list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
-                *anchor_hits.get_unchecked_mut(anchor_count) =
-                    (action as u64) << 40 | (doc as u64) << 20 | token as u64;
-                anchor_count += (action >> 29 & 1) as usize;
-                token += 1;
+                // The token after a line is the next document's id. As hash 0 it also stops a
+                // phrase check from running on into the next document. The last line stays
+                // for the next batch.
+                if line + 1 < line_count {
+                    doc += 1;
+                    hashes[to] = 0;
+                    token = to + 1;
+                }
             }
-            for &hit in &anchor_hits[..anchor_count] {
+            for (i, &hit) in anchor_hits[..anchor_count].iter().enumerate() {
+                let later = |ahead: usize| (anchor_hits[i + ahead] >> 40) as usize;
+                _mm_prefetch::<_MM_HINT_T0>(self.terms.add(later(8).wrapping_sub(1)).cast());
+                if let Some(term) = later(4).checked_sub(1) {
+                    let first = (*self.terms.add(term)).phrases as usize;
+                    _mm_prefetch::<_MM_HINT_T0>(self.phrases.add(first.wrapping_sub(1)).cast());
+                }
                 let token = hit as usize & ((1 << 20) - 1);
                 let mut next = (*self.terms.add((hit >> 40) as usize - 1)).phrases;
                 while next != 0 {
@@ -568,11 +573,15 @@ impl Run {
                     }
                 }
             }
-            for &hit in &heavy_hits[..heavy_count] {
-                let doc = hit as usize & ((1 << DOC_BITS) - 1);
-                let bitmap = self.bitmap(hit >> DOC_BITS, claim / PHASE_CLAIMS);
-                let doc = doc - self.phase_base[claim / PHASE_CLAIMS] as usize;
-                *bitmap.add(doc / 64) |= 1 << (doc % 64);
+            if heavy_count > 0 {
+                let phase = claim / PHASE_CLAIMS;
+                let (set, base) = (self.bitmap(0, phase), self.phase_base[phase]);
+                let width = self.words_per_bitmap;
+                for &hit in &heavy_hits[..heavy_count] {
+                    let doc = (hit & ((1 << DOC_BITS) - 1)) - base;
+                    let at = (hit >> DOC_BITS) as usize * width + (doc / 64) as usize;
+                    *set.add(at) |= 1 << (doc % 64);
+                }
             }
             for &hit in &list_hits[..list_count] {
                 let term = ((hit >> 32) as u32 & !ANCHOR) - 1;
@@ -589,8 +598,10 @@ impl Run {
                 cursor.0 = cursor.0.add(1);
             }
             // A newline left over belongs to a document whose id comes in the next batch.
-            lines.copy_within(line..line_count, 0);
-            line_count -= line;
+            if line_count > 0 {
+                lines[0] = 0;
+                line_count = 1;
+            }
             starts.copy_within(ready..token_count, 0);
             token_count -= ready;
             ends.copy_within(ready..end_count, 0);
@@ -992,7 +1003,11 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             for &doc in b {
                 let bit = 1 << (doc % 64);
                 let word = &mut *target.add(doc as usize / 64);
-                *word = if op == Op::Or { *word | bit } else { *word & !bit };
+                *word = if op == Op::Or {
+                    *word | bit
+                } else {
+                    *word & !bit
+                };
             }
             finish_bits(bits)
         }
@@ -1239,9 +1254,15 @@ fn main() {
             line.map_or(run.docs, |line| line.1) as u32
         })
         .collect();
-    let widest = run.phase_base.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    let widest = run
+        .phase_base
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .max()
+        .unwrap_or(0);
     run.words_per_bitmap = widest as usize / 64 + 2;
-    run.bitmaps = unsafe { reserve(2 * MAX_HEAVY * run.words_per_bitmap * 8, MADV_HUGEPAGE).cast() };
+    run.bitmaps =
+        unsafe { reserve(2 * MAX_HEAVY * run.words_per_bitmap * 8, MADV_HUGEPAGE).cast() };
     // Huge pages are wanted for the bucket table alone: touch it so it is faulted in as one,
     // then forbid them. Where the kernel gives every region huge pages (THP `always`), thread
     // stacks, heaps and the half-used postings and bitmaps would otherwise each be charged 2 MiB
@@ -1267,7 +1288,8 @@ fn main() {
     *run.parts.lock().unwrap() = (0..batches)
         .map(|batch| match phases {
             0 => b"0 0
-".repeat(QUERY_BATCH.min(run.queries.len() - batch * QUERY_BATCH)),
+"
+            .repeat(QUERY_BATCH.min(run.queries.len() - batch * QUERY_BATCH)),
             _ => Vec::new(),
         })
         .collect();
