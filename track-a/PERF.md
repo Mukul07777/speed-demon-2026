@@ -97,3 +97,5 @@ Line cut on the streaming code (2026-11-01): rustfmt S 363 -> 346, text and plac
 `run-478de8bfb446` (commit 85ae7b3, the code in `src`): 18.7 ms, 16.3 MB, S 370, 86.17 points. Later pushes to this track changed only comments, notes or reverted code.
 
 Failed: sealing hours by timestamp; ceiling about 0.2 ms by measurement, hour 71 cannot seal before EOF.
+
+Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 MiB, no time gain), rank walk instead of deal (slower). Summary is only 130-170 Mticks, about 5 ms; 72% of rows sit in groups over 32, so small-group sorts cannot replace the radix.
