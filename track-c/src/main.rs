@@ -425,6 +425,14 @@ impl Run {
                     let first = NEXT_NAME.fetch_add(NAME_BLOCK, Relaxed);
                     *spare = first..first + NAME_BLOCK;
                 }
+                // A plain read first: a CAS on a slot that is already taken is a wasted locked op.
+                let held = slot.load(Relaxed);
+                if held != 0 {
+                    if held >> NUMBER_BITS == tag {
+                        return (held & NUMBER_MASK) as usize;
+                    }
+                    continue;
+                }
                 let number = spare.start;
                 let claimed = tag << NUMBER_BITS | number as u64;
                 // A slot that is taken holds another name, or this one if a worker just added it.
