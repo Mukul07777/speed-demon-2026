@@ -84,3 +84,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (2026-11-01, tools/wt_c18):** regions pages released per claim: box 26.28 ms, 80.17, `run-77948d9a44b2`. `pread` into per-thread buffers: laptop slower, 14 MiB. A sort-based dedup instead of the matrix is 13 MB at 4 bytes per record, too large.
 
 **Failed (box test, 2026-11-01): no per-claim `MADV_DONTNEED`.** Laptop best -6%. Board `run-3e9a076f5dee` 26.8 ms, 80.33 (slow round, but +4.8 ms is more than the round): exit teardown of the mapping returned. Reverted.
+
+**Failed (box test, 2026-11-01): `-align-loops=32`.** Test of whether code layout explains box swings. Run on 87ea886 inside the usual range of unchanged code; one sample. Reverted.

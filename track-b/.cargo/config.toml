@@ -1,2 +1,2 @@
 [build]
-rustflags = ["-C", "llvm-args=-align-loops=32", "-C", "target-cpu=x86-64-v3", "-C", "target-feature=+aes,+vaes,+crt-static", "-C", "relocation-model=static"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+aes,+vaes,+crt-static", "-C", "relocation-model=static"]
