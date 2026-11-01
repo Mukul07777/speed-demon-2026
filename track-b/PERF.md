@@ -52,3 +52,9 @@ Kept: page release moved from every claim to one sliced `MADV_DONTNEED` per thre
 - `writev` output: 105.2 -> 105.3 (writing is only 0.7 ms).
 - Spinning barrier: 83-87 -> 102-103, spinners take cores from scanners.
 - No `madvise` at all: same on the laptop, but the box pays exit teardown on one thread.
+
+## Futex barrier (2026-11-01)
+
+Profile with per-thread timestamps showed the pre-scan time was mostly `std::sync::Barrier` wake latency (threads released 1-4 ms after the last arrival), not work. Replaced it with a counter + round word: the last arriver does `FUTEX_WAKE`, waiters spin 3000 pauses then `FUTEX_WAIT`. Medians, 30 rounds, run twice in swapped order: 12 CPUs 80.5 -> 75.6 and 79.8 -> 74.2 ms; cpuset 0-5 97.7 -> 95.7 and 98.0 -> 96.2 ms. S +35.
+
+**Failed:** no spin (80.0 -> 79.2, too small); spin 30000 (worse than 3000 on 12 CPUs, no better on cpuset).

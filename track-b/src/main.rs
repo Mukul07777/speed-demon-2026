@@ -29,13 +29,14 @@
 //! (`Bucket`), on a huge page. A token's action says what the scan does with it: nothing,
 //! set a bit in a bitmap, write a row for a list, or also start a phrase check.
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, ptr::null_mut, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, arg: usize, a: usize, b: usize, c: usize) -> i32;
+    fn syscall(number: i64, ...) -> i64;
     fn memchr(text: *const u8, byte: i32, len: usize) -> *const u8;
 }
 // Protection 3 is PROT_READ | PROT_WRITE, and flags 0x12 are MAP_PRIVATE | MAP_FIXED, a file
@@ -850,7 +851,7 @@ impl Run {
             counts: take(&mut next, MAX_TERMS),
         };
         *self.parsed[id].lock().unwrap() = self.parse_share(id);
-        if self.step.wait().is_leader() {
+        if self.step.wait() {
             self.merge();
         }
         self.step.wait();
@@ -1000,6 +1001,44 @@ fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     out.extend_from_slice(&a[i..]);
     out.extend_from_slice(&b[j..]);
 }
+
+/// A barrier on one futex word. The standard one wakes its sleepers through a mutex, one after
+/// another, and threads were released up to 3 ms after the last arrival.
+struct Barrier {
+    threads: u32,
+    arrived: AtomicU32,
+    round: AtomicU32,
+}
+
+impl Barrier {
+    fn new(threads: usize) -> Self {
+        Barrier { threads: threads as u32, arrived: AtomicU32::new(0), round: AtomicU32::new(0) }
+    }
+
+    /// Returns true on the one thread that arrived last.
+    fn wait(&self) -> bool {
+        let round = self.round.load(Acquire);
+        if self.arrived.fetch_add(1, AcqRel) + 1 == self.threads {
+            self.arrived.store(0, Relaxed);
+            self.round.fetch_add(1, Release);
+            // FUTEX_WAKE | FUTEX_PRIVATE_FLAG, every waiter.
+            unsafe { syscall(202, self.round.as_ptr(), 129, i32::MAX) };
+            return true;
+        }
+        for _ in 0..SPIN {
+            if self.round.load(Acquire) != round {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        while self.round.load(Acquire) == round {
+            // FUTEX_WAIT | FUTEX_PRIVATE_FLAG, while the round is still the one seen.
+            unsafe { syscall(202, self.round.as_ptr(), 128, round, 0) };
+        }
+        false
+    }
+}
+const SPIN: u32 = 3000;
 
 /// One step of a BOOL query. The result goes in the scratch list the current set is not in.
 unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
