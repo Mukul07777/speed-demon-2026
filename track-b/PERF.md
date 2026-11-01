@@ -60,3 +60,7 @@ Profile with per-thread timestamps showed the pre-scan time was mostly `std::syn
 **Failed:** no spin (80.0 -> 79.2, too small); spin 30000 (worse than 3000 on 12 CPUs, no better on cpuset).
 
 Box verdict on the futex barrier: 98daaff 103.0 ms and 12a83cd 101.5 ms (`run-f645d9256ed9`, 42.3 MB, S 1091, 77.51) against 103.5 ms (`run-798a2a9dd634`, S 1056, 77.41) without it. Small gain over two runs, kept.
+
+## Heavy bitmaps by 64-document transpose (2026-11-01)
+
+The lookup loop now stores only each token's heavy bitmap index. Each document's heavy terms are ORed into a row of bits that stays in L1, and every 64 documents a 64x64 bit transpose moves the rows into the phase's bitmaps. Removing the pass entirely (timing probe) showed a 7% ceiling. Counts rejected two other ideas: skipping non-query tokens (79% of tokens are query terms) and a direct table for 1-3 character tokens (1-2% ceiling). Paired 30 rounds, median ms: 12 CPUs 81.1->78.5 and 76.2->72.2, cpuset 0-5 97.1->91.1 and 98.1->93.0. Peak unchanged, S +54. Run ID: pending board.

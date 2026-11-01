@@ -63,6 +63,14 @@ const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look fur
 const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its check here
 const MAX_HEAVY: usize = 4096;
 const SHARDS: usize = 64;
+const MASKS_T: [u64; 6] = [
+    0x5555555555555555,
+    0x3333333333333333,
+    0x0f0f0f0f0f0f0f0f,
+    0x00ff00ff00ff00ff,
+    0x0000ffff0000ffff,
+    0x00000000ffffffff,
+];
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
@@ -83,7 +91,9 @@ struct Buffers {
     ends: &'static mut [u32],
     lines: &'static mut [u32],
     hashes: &'static mut [u64],
-    heavy_hits: &'static mut [u32],  // bitmap << DOC_BITS | document
+    heavy_hits: &'static mut [u32],  // the bitmap index of each heavy token, with the HEAVY flag
+    heavy_ends: &'static mut [u32],  // per line, how many heavy hits end with it
+    group: &'static mut [u64],       // the heavy terms of 64 documents, one row of bits each
     list_hits: &'static mut [u64],   // action << 32 | document
     anchor_hits: &'static mut [u64], // term + 1 << 40 | document << 20 | token (the shift drops the action's flags)
     counts: &'static mut [u32],      // in the sample, how often each term occurs
@@ -505,6 +515,7 @@ impl Run {
                 *hashes.add(i) = hash_of(text.add(from), to - from);
             }
             let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
+            let batch_doc = doc;
             // Local copies of the pointers: through `self` and `b` the compiler reloads them
             // after every store, as a store might have changed them.
             let buckets = self.buckets;
@@ -516,7 +527,7 @@ impl Run {
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(buckets, *hashes.add(token));
                     // All three stores happen, and only the right counts move.
-                    *heavy_hits.add(heavy_count) = action << DOC_BITS | doc as u32;
+                    *heavy_hits.add(heavy_count) = action;
                     heavy_count += (action >> 31) as usize;
                     *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
                     // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
@@ -529,6 +540,7 @@ impl Run {
                     }
                     token += 1;
                 }
+                *b.heavy_ends.get_unchecked_mut(line) = heavy_count as u32;
                 // The token after a line is the next document's id. As hash 0 it also stops a
                 // phrase check from running on into the next document. The last line stays
                 // for the next batch.
@@ -563,14 +575,22 @@ impl Run {
                     }
                 }
             }
-            if heavy_count > 0 {
-                let phase = claim / PHASE_CLAIMS;
-                let (set, base) = (self.bitmap(0, phase), self.phase_base[phase]);
-                let width = self.words_per_bitmap;
-                for &hit in &b.heavy_hits[..heavy_count] {
-                    let doc = (hit & ((1 << DOC_BITS) - 1)) - base;
-                    let at = (hit >> DOC_BITS) as usize * width + (doc / 64) as usize;
-                    *set.add(at) |= 1 << (doc % 64);
+            if !SAMPLE {
+                // Each document's heavy terms are gathered as one row of bits, which stays in
+                // cache; every 64 documents the rows are transposed into the bitmaps.
+                let (words, mut from) = (self.heavy_words(), 0);
+                for line in 0..line_count {
+                    let to = b.heavy_ends[line] as usize;
+                    let rel = (batch_doc as usize + line - self.phase_base[claim / PHASE_CLAIMS] as usize) % 64;
+                    let row = &mut b.group[rel * words..(rel + 1) * words];
+                    for &action in &b.heavy_hits[from..to] {
+                        let id = (action & !HEAVY) as usize;
+                        row[id / 64] |= 1 << (id % 64);
+                    }
+                    from = to;
+                    if rel == 63 {
+                        self.flush_group(b.group, claim, batch_doc as usize + line);
+                    }
                 }
             }
             for &hit in &b.list_hits[..list_count] {
@@ -595,8 +615,42 @@ impl Run {
             b.ends.copy_within(ready..end_count, 0);
             end_count -= ready;
         }
+        if !SAMPLE {
+            self.flush_group(b.group, claim, doc as usize);
+        }
         // The documents this claim held, which the sample uses to scale its counts.
         doc - first_doc + 1
+    }
+
+    fn heavy_words(&self) -> usize {
+        self.setup[3].load(Relaxed).min(MAX_HEAVY).div_ceil(64)
+    }
+
+    /// ORs the group of 64 documents that holds `doc` into the phase's bitmaps and clears it.
+    /// Row `j` has the heavy terms of the group's document `j`; transposed, a word is one
+    /// term's bits for the group.
+    unsafe fn flush_group(&self, group: &mut [u64], claim: usize, doc: usize) {
+        let phase = claim / PHASE_CLAIMS;
+        let rel = doc - self.phase_base[phase] as usize;
+        let (words, heavy) = (self.heavy_words(), self.setup[3].load(Relaxed).min(MAX_HEAVY));
+        let out = self.bitmap(0, phase).add(rel / 64);
+        for k in 0..words {
+            let mut m = [0u64; 64];
+            for (j, bits) in m.iter_mut().enumerate() {
+                *bits = std::mem::take(&mut group[j * words + k]);
+            }
+            for half in (0..6).rev() {
+                let (width, mask) = (1usize << half, MASKS_T[half]);
+                for r in (0..64).filter(|r| r & width == 0) {
+                    let t = ((m[r] >> width) ^ m[r + width]) & mask;
+                    m[r + width] ^= t;
+                    m[r] ^= t << width;
+                }
+            }
+            for (t, &bits) in m.iter().enumerate().take(heavy - k * 64) {
+                *out.add((k * 64 + t) * self.words_per_bitmap) |= bits;
+            }
+        }
     }
 
     fn each_job(&self, counter: &AtomicUsize, count: usize, mut job: impl FnMut(usize)) {
@@ -846,6 +900,8 @@ impl Run {
             lines: take(&mut next, BATCH / 2 + 64),
             hashes: take(&mut next, tokens + AHEAD),
             heavy_hits: take(&mut next, tokens),
+            heavy_ends: take(&mut next, BATCH / 2 + 64),
+            group: take(&mut next, 64 * MAX_HEAVY / 64),
             list_hits: take(&mut next, tokens),
             anchor_hits: take(&mut next, tokens),
             counts: take(&mut next, MAX_TERMS),
