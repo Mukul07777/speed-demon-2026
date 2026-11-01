@@ -31,15 +31,10 @@ use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    // Every `madvise` below passes advice 4, MADV_DONTNEED: give the pages back.
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
-const PROT_READ: i32 = 1;
-const PROT_READ_WRITE: i32 = 3;
-const MAP_PRIVATE_FIXED: i32 = 0x12;
-const MAP_PRIVATE_ANONYMOUS_NORESERVE: i32 = 0x4022;
-const MADV_DONTNEED: i32 = 4;
-const PR_SET_THP_DISABLE: i32 = 41;
 
 const CLAIM: usize = 1 << 20;
 const BLOCK: usize = 1 << 16; // fits in L2 between the newline pass and the line pass
@@ -50,10 +45,7 @@ const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
-const SPACES: u64 = 0x2020_2020_2020_2020;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
-const ONES: u64 = 0x0101_0101_0101_0101;
-const HIGHS: u64 = 0x8080_8080_8080_8080;
 
 /// A row is id + 1 in 11 bits, an error bit, then the latency in 20 bits. Only about 1% of
 /// latencies need more: those store ESCAPE here and the full value in the next row, which
@@ -64,7 +56,6 @@ const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
 
 /// Endpoint names in output order, with their ids.
-type Names = [(&'static [u8], usize)];
 
 unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
@@ -73,8 +64,8 @@ unsafe fn read(p: *const u8) -> u64 {
 /// Sets the high bit of each space byte. A borrow can also mark the byte above a space if
 /// that byte is `!`, which never sits above the first space in a method or among digits.
 fn spaces_in(word: u64) -> u64 {
-    let z = word ^ SPACES;
-    z.wrapping_sub(ONES) & !z & HIGHS
+    let z = word ^ 0x2020_2020_2020_2020;
+    z.wrapping_sub(0x0101_0101_0101_0101) & !z & 0x8080_8080_8080_8080
 }
 
 /// A hash of the whole name without a length-dependent loop: the masked first and last 32
@@ -132,33 +123,6 @@ struct Run {
 }
 unsafe impl Sync for Run {}
 
-/// Finds the newlines of [from, to) and returns how many. Lines are longer than the 32-byte
-/// step, so a step holds at most one newline, and one unconditional store records it (a step
-/// with none writes a junk entry that the next store overwrites). Each pass over a block is
-/// then a counted loop, with no branch on where lines end. The aligned load is valid because
-/// blocks start at multiples of 64 KiB in a page-aligned mapping, and the last step may read
-/// up to 31 bytes past the file, into the spare zero page.
-unsafe fn find_newlines(input: *const u8, from: usize, to: usize, ends: &mut [u32]) -> usize {
-    let newline = _mm256_set1_epi8(b'\n' as i8);
-    let (mut count, mut at) = (0, from);
-    while at < to {
-        let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
-        let mask = _mm256_movemask_epi8(hits) as u32;
-        *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
-        count += (mask != 0) as usize;
-        at += 32;
-    }
-    count
-}
-
-/// A latency of eight digits or more, which the word-wide decode cannot see the start of.
-#[cold]
-unsafe fn long_latency(line_end: *const u8) -> (u32, usize) {
-    let digits = (1..).find(|&n| *line_end.sub(n + 1) == b' ').unwrap();
-    let text = std::slice::from_raw_parts(line_end.sub(digits), digits);
-    (std::str::from_utf8_unchecked(text).parse().unwrap(), digits)
-}
-
 impl Run {
     /// The id of an endpoint name, new if this is its first appearance. Slots are only ever
     /// filled, under the lock, so a slot seen empty under the lock ends the probe sequence: the
@@ -205,7 +169,22 @@ impl Run {
                 line = line.sub(1);
             }
             for start in (claim..(claim + CLAIM).min(self.len)).step_by(BLOCK) {
-                let count = find_newlines(input, start, (start + BLOCK).min(self.len), &mut ends);
+                // Find the newlines of the block first. Lines are longer than the 32-byte step, so
+                // a step holds at most one newline, and one unconditional store records it (a
+                // step with none writes a junk entry that the next store overwrites). Each pass
+                // over a block is then a counted loop, with no branch on where lines end. The
+                // aligned load is valid because blocks start at multiples of 64 KiB in a
+                // page-aligned mapping, and the last step may read up to 31 bytes past the
+                // file, into the spare zero page.
+                let newline = _mm256_set1_epi8(b'\n' as i8);
+                let (mut count, mut at) = (0, start);
+                while at < (start + BLOCK).min(self.len) {
+                    let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
+                    let mask = _mm256_movemask_epi8(hits) as u32;
+                    *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
+                    count += (mask != 0) as usize;
+                    at += 32;
+                }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
                     // `clock` is "DDTHH:MM" (bytes 8 to 15 of the timestamp). Oct 30, Oct 31,
@@ -234,7 +213,10 @@ impl Run {
                         let v = (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
                         (v as u32, digits)
                     } else {
-                        long_latency(end)
+                        // Eight digits or more: the word-wide decode cannot see where they start.
+                        let digits = (1..).find(|&n| *end.sub(n + 1) == b' ').unwrap();
+                        let text = std::slice::from_raw_parts(end.sub(digits), digits);
+                        (std::str::from_utf8_unchecked(text).parse().unwrap(), digits)
                     };
                     // The line ends "<name> <status> <latency>\n", with a 3-digit status.
                     let status = end.sub(digits + 4);
@@ -261,7 +243,7 @@ impl Run {
             // torn down by one thread at exit, which cost about 7 ms on the scoring kernel.
             // A later read of this range, by the next claim's first line, refaults the same
             // bytes, because the mapping is a read-only private file mapping.
-            madvise(input.add(claim), CLAIM.min(self.len - claim), MADV_DONTNEED);
+            madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
         }
     }
 
@@ -270,7 +252,7 @@ impl Run {
     /// on. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
     /// (Text in malloc'd buffers was once the bulk of the memory peak: the allocator kept every
     /// buffer it had grown while a single writer fell behind.)
-    unsafe fn summarise(&self, hour: usize, order: &Names) -> &'static [u8] {
+    unsafe fn summarise(&self, hour: usize, order: &[(&[u8], usize)]) -> &'static [u8] {
         let rows = self.rows.add(hour * self.stride);
         let claimed = self.claimed[hour].load(Relaxed);
         // The scratch starts past the rows and at least SPARE_AT rows (1 MiB) in: the text is
@@ -338,11 +320,9 @@ impl Run {
         }
         long.iter().for_each(|&(latency, row)| deal(row, latency));
 
-        // The hour as text with a trailing space, padded so it can be copied as one 32-byte load.
+        // The hour as text with a trailing space (21 bytes), copied in front of every line.
         let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
-        let mut label = [0; 32];
-        label[..21]
-            .copy_from_slice(format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24).as_bytes());
+        let label = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
         let (text, mut w) = (rows.cast::<u8>(), rows.cast::<u8>());
         for &(name, id) in order {
             let span = starts[id] as usize..starts[id + 1] as usize;
@@ -352,7 +332,7 @@ impl Run {
             let (n, bad) = (span.len() as u32, errors[id + 1]);
             let sorted = std::slice::from_raw_parts(spare.add(span.start), span.len());
             let at_rank = |p: usize| sorted[(p * sorted.len() + 99) / 100 - 1];
-            copy_nonoverlapping(label.as_ptr(), w, 32);
+            copy_nonoverlapping(label.as_ptr(), w, 21);
             copy_nonoverlapping(name.as_ptr(), w.add(21), name.len());
             w = w.add(21 + name.len());
             for number in [n, at_rank(50), at_rank(95), at_rank(99), bad] {
@@ -363,7 +343,7 @@ impl Run {
             w = w.add(1);
         }
         // The ranks are all read: give the scratch pages back now, not when the hour is written.
-        madvise(spare.cast(), (count + long.len()) * 4, MADV_DONTNEED);
+        madvise(spare.cast(), (count + long.len()) * 4, 4);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
@@ -384,7 +364,7 @@ impl Run {
             self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back.
             let rows = unsafe { self.rows.add(hour * self.stride) };
-            unsafe { madvise(rows.cast(), self.stride * 4, MADV_DONTNEED) };
+            unsafe { madvise(rows.cast(), self.stride * 4, 4) };
         }
     }
 
@@ -394,14 +374,8 @@ impl Run {
         // Names in output order, with their ids. A &[u8] orders as unsigned bytes with a proper
         // prefix first. Every worker sorts its own copy at once, so only the copy is under the
         // lock (sorted under it, the twelve sorts ran one after another).
-        let mut order: Vec<_> = self
-            .names
-            .lock()
-            .unwrap()
-            .iter()
-            .copied()
-            .zip(0..)
-            .collect();
+        let names = self.names.lock().unwrap().clone();
+        let mut order: Vec<_> = names.into_iter().zip(0..).collect();
         order.sort_unstable();
         while let hour @ 0..HOURS = self.next_hour.fetch_add(1, Relaxed) {
             let part = unsafe { self.summarise(hour, &order) };
@@ -447,24 +421,20 @@ fn main() {
     // Name lookups read a little past a line, so a spare zero page follows the file.
     // Each hour reserves room for every line, and only the pages it touches cost anything.
     let (input, rows, stride) = unsafe {
-        prctl(PR_SET_THP_DISABLE, 1usize, 0usize, 0usize, 0usize);
+        // Linux constants: prctl 41 is PR_SET_THP_DISABLE; mmap protections 1 (read) and 3
+        // (read and write); flags 0x4022 (private, anonymous, no reserve) and 0x12 (private, fixed).
+        prctl(41, 1usize, 0usize, 0usize, 0usize);
         let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
-        let (null, anonymous) = (std::ptr::null_mut(), MAP_PRIVATE_ANONYMOUS_NORESERVE);
-        let input = map(
-            null,
-            len.div_ceil(4096) * 4096 + 4096,
-            PROT_READ,
-            anonymous,
-            -1,
-        );
+        let null = std::ptr::null_mut();
+        let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
         // For an empty file this fails, and the zero page stays.
-        map(input, len, PROT_READ, MAP_PRIVATE_FIXED, file.as_raw_fd());
+        map(input, len, 1, 0x12, file.as_raw_fd());
         // An hour has room for its rows (two per line, if every line escaped), then for the
         // scratch (one value per line) after them, or after SPARE_AT rows if that is further,
         // plus the unused ends of one partly filled chunk per thread.
         let stride =
             (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1024);
-        let rows = map(null, stride * HOURS * 4, PROT_READ_WRITE, anonymous, -1);
+        let rows = map(null, stride * HOURS * 4, 3, 0x4022, -1);
         (input, rows.cast(), stride)
     };
 
