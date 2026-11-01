@@ -209,6 +209,7 @@ impl Run {
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
         }
+        pin();
         // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
         // it while the regions load. It must end before huge pages are disabled.
         let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
@@ -410,6 +411,27 @@ unsafe fn zeroed<T>() -> &'static T {
     let aligned = region.add(region.align_offset(HUGE_PAGE));
     madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
     &*aligned.cast()
+}
+
+extern "C" {
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+}
+
+/// Pins the calling thread to the next allowed CPU, so that the scheduler neither stacks two
+/// busy workers on one CPU nor moves them. Call it after a worker has started any others:
+/// a new thread inherits its parent's mask.
+fn pin() {
+    static NEXT_CPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nth = NEXT_CPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut allowed = [0u64; 4];
+    unsafe { sched_getaffinity(0, 32, allowed.as_mut_ptr()) };
+    let cpus = (0..256).filter(|&cpu| allowed[cpu / 64] >> (cpu % 64) & 1 != 0);
+    if let Some(cpu) = cpus.clone().nth(nth % cpus.count().max(1)) {
+        let mut only = [0u64; 4];
+        only[cpu / 64] = 1 << (cpu % 64);
+        unsafe { sched_setaffinity(0, 32, only.as_ptr()) };
+    }
 }
 
 fn main() {

@@ -380,6 +380,7 @@ impl Run {
     }
 
     fn work(&self) {
+        pin();
         unsafe { self.parse() };
         self.finished_parsing.wait();
         // Names in output order, with their ids. A &[u8] orders as unsigned bytes with a proper
@@ -421,6 +422,27 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
     let zeros = ZEROS as u128 * ((1 << 64) + 1);
     write_unaligned(w.add(1).cast(), (digits + zeros) >> (8 * skip));
     w.add(17 - skip)
+}
+
+extern "C" {
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+}
+
+/// Pins the calling thread to the next allowed CPU, so that the scheduler neither stacks two
+/// busy workers on one CPU nor moves them. Call it after a worker has started any others:
+/// a new thread inherits its parent's mask.
+fn pin() {
+    static NEXT_CPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nth = NEXT_CPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut allowed = [0u64; 4];
+    unsafe { sched_getaffinity(0, 32, allowed.as_mut_ptr()) };
+    let cpus = (0..256).filter(|&cpu| allowed[cpu / 64] >> (cpu % 64) & 1 != 0);
+    if let Some(cpu) = cpus.clone().nth(nth % cpus.count().max(1)) {
+        let mut only = [0u64; 4];
+        only[cpu / 64] = 1 << (cpu % 64);
+        unsafe { sched_setaffinity(0, 32, only.as_ptr()) };
+    }
 }
 
 fn main() {
