@@ -51,10 +51,11 @@ const DEGREE_MASK: u32 = 15;
 const HEAVY_FLAG: u32 = 16;
 const START_SHIFT: u32 = 5;
 const CELL: usize = 1 << 10;
+const EDGE_CLAIM: usize = 1 << 12; // edge slots a worker takes at a time for the nodes it claims
 const SEEDS_KEPT: usize = 32; // of a finished cell's queue
 const FAR_AHEAD: usize = 12; // queue entries ahead to prefetch a node
 const NEAR_AHEAD: usize = 6; // queue entries ahead to prefetch its edges
-const REWRITE_BATCH: usize = 32; // nodes translated together, after prefetching
+const REWRITE_BATCH: usize = 64; // edges translated together, after prefetching
 const BLOCK_SHIFT: u32 = 6; // distances live in blocks of this many neighbouring nodes
 const BLOCK_NODES: usize = 1 << BLOCK_SHIFT;
 const WINDOW: usize = 1 << WEIGHT_BITS; // light edges reach at most this far ahead
@@ -258,7 +259,6 @@ type Heavy = (u32, u32, u32);
 
 struct Layout {
     node_base: Vec<u32>, // the first new id of each worker's nodes
-    edge_base: Vec<usize>,
     queries: Vec<(u32, u32)>,
     heavy_out: Vec<Heavy>,
     heavy_in: Vec<Heavy>,
@@ -280,7 +280,7 @@ struct Run {
     in_degrees: *mut AtomicU8,
     labels: *mut AtomicU32,
     heavy: Mutex<Vec<Heavy>>,
-    claimed: Mutex<Vec<(usize, usize, usize)>>, // worker, nodes, edges
+    claimed: Mutex<Vec<(usize, usize)>>, // worker, nodes
     layout: OnceLock<Layout>,
     raw_queries: Vec<(u32, u32)>,
     answers: Vec<AtomicU64>,
@@ -363,12 +363,12 @@ impl Run {
     ///
     /// With random ids a node's entry, its edges and its label are three cache misses. The
     /// queue says what comes next, so each is prefetched in turn before it is needed.
-    unsafe fn grow_cells(&self, worker: usize) -> (Vec<u32>, usize) {
-        let mut order: Vec<u32> = Vec::with_capacity(2 * self.nodes / self.threads);
+    unsafe fn grow_cells(&self, worker: usize) -> (Vec<u32>, Vec<(usize, usize)>) {
+        let mut entries: Vec<u32> = Vec::with_capacity(2 * self.nodes / self.threads);
+        let (mut chunks, mut cursor, mut limit, mut from) = (Vec::new(), 0, 0, 0);
         let mut seeds: Vec<u32> = Vec::new();
         let mut queue: Vec<u32> = Vec::new();
         let mut scan = 0..0;
-        let mut edges = 0;
         loop {
             let seed = match seeds.pop() {
                 Some(seed) => seed as usize,
@@ -402,22 +402,33 @@ impl Run {
                 let node = queue[head] as usize;
                 head += 1;
                 let label = &*self.labels.add(node);
-                let value = ((worker as u32 + 1) << LABEL_SHIFT) | order.len() as u32;
+                let value = ((worker as u32 + 1) << LABEL_SHIFT) | entries.len() as u32;
                 if label.load(Relaxed) != 0
                     || label.compare_exchange(0, value, Relaxed, Relaxed).is_err()
                 {
                     continue;
                 }
-                order.push(node as u32);
                 size += 1;
                 let neighbours = self.raw.edges_of(node);
-                edges += neighbours.len();
+                if cursor + neighbours.len() > limit {
+                    chunks.push((from, cursor));
+                    from = self.forward.next_edge.fetch_add(EDGE_CLAIM, Relaxed);
+                    (cursor, limit) = (from, from + EDGE_CLAIM);
+                }
+                std::ptr::copy_nonoverlapping(
+                    neighbours.as_ptr(),
+                    self.forward.edges.add(cursor),
+                    neighbours.len(),
+                );
+                entries.push((cursor as u32) << START_SHIFT | neighbours.len() as u32);
+                cursor += neighbours.len();
                 queue.extend(neighbours.iter().map(|&edge| edge >> WEIGHT_BITS));
             }
             let kept = queue.len().saturating_sub(SEEDS_KEPT).max(head);
             seeds.extend_from_slice(&queue[kept..]);
         }
-        (order, edges)
+        chunks.push((from, cursor));
+        (entries, chunks)
     }
 
     #[inline(always)]
@@ -430,13 +441,11 @@ impl Run {
     fn plan_layout(&self) -> Layout {
         let mut claimed = self.claimed.lock().unwrap();
         claimed.sort_unstable();
-        let (mut nodes, mut edges) = (0, 0);
-        let (mut node_base, mut edge_base) = (Vec::new(), Vec::new());
-        for &(_, node_count, edge_count) in claimed.iter() {
+        let mut nodes = 0;
+        let mut node_base = Vec::new();
+        for &(_, node_count) in claimed.iter() {
             node_base.push(nodes as u32);
-            edge_base.push(edges);
             nodes += node_count;
-            edges += edge_count;
         }
         let map = |old: u32| unsafe { self.new_id(&node_base, old as usize) };
         let queries = self
@@ -452,51 +461,26 @@ impl Run {
         heavy_in.sort_unstable();
         Layout {
             node_base,
-            edge_base,
             queries,
             heavy_out,
             heavy_in,
         }
     }
 
-    /// Translates every edge head to its new id, which is a random lookup per edge. Working
-    /// in small batches lets each one prefetch all it will touch before it touches it.
-    ///
-    /// The worker's old ids wait in the slots of `forward.nodes` that it is about to fill, and
-    /// each batch is copied out before its slots are overwritten.
-    unsafe fn rewrite_forward(&self, worker: usize, count: usize, layout: &Layout) {
-        let first = layout.node_base[worker] as usize;
-        let mut id = first;
-        let mut at = layout.edge_base[worker];
-        for done in (0..count).step_by(REWRITE_BATCH) {
-            let size = REWRITE_BATCH.min(count - done);
-            let mut copy = [0; REWRITE_BATCH];
-            copy[..size].copy_from_slice(std::slice::from_raw_parts(
-                self.forward.nodes.add(first + done),
-                size,
-            ));
-            let batch = &copy[..size];
-            for &old in batch {
-                _mm_prefetch::<_MM_HINT_T0>(self.raw.nodes.add(old as usize).cast());
-            }
-            for &old in batch {
-                let start = *self.raw.nodes.add(old as usize) >> START_SHIFT;
-                _mm_prefetch::<_MM_HINT_T0>(self.raw.edges.add(start as usize).cast());
-            }
-            for &old in batch {
-                for &edge in self.raw.edges_of(old as usize) {
-                    let head = (edge >> WEIGHT_BITS) as usize;
+    /// Translates every edge head, in place, to its new id, which is a random lookup per edge.
+    /// Working in small batches lets each one prefetch all it will touch before it touches it.
+    unsafe fn rewrite_forward(&self, chunks: &[(usize, usize)], layout: &Layout) {
+        for &(from, to) in chunks {
+            for batch in (from..to).step_by(REWRITE_BATCH) {
+                let batch = batch..(batch + REWRITE_BATCH).min(to);
+                for at in batch.clone() {
+                    let head = (*self.forward.edges.add(at) >> WEIGHT_BITS) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.labels.add(head).cast());
                 }
-            }
-            for &old in batch {
-                let edges = self.raw.edges_of(old as usize);
-                *self.forward.nodes.add(id) = (at as u32) << START_SHIFT | edges.len() as u32;
-                id += 1;
-                for &edge in edges {
-                    let head = self.new_id(&layout.node_base, (edge >> WEIGHT_BITS) as usize);
-                    *self.forward.edges.add(at) = head << WEIGHT_BITS | (edge & (LIGHT as u32 - 1));
-                    at += 1;
+                for at in batch {
+                    let edge = self.forward.edges.add(at);
+                    let head = self.new_id(&layout.node_base, (*edge >> WEIGHT_BITS) as usize);
+                    *edge = head << WEIGHT_BITS | (*edge & (LIGHT as u32 - 1));
                     (*self.in_degrees.add(head as usize)).fetch_add(1, Relaxed);
                 }
             }
@@ -540,27 +524,24 @@ impl Run {
         self.next_step(|| {});
         self.each_job(self.shards, |shard| self.raw.build_shard(&self.rows, shard));
         self.next_step(|| self.rows.release());
-        let (order, edges) = self.grow_cells(worker);
-        self.claimed
-            .lock()
-            .unwrap()
-            .push((worker, order.len(), edges));
+        let (entries, chunks) = self.grow_cells(worker);
+        self.claimed.lock().unwrap().push((worker, entries.len()));
         self.next_step(|| {
             let _ = self.layout.set(self.plan_layout());
+            self.raw.release();
         });
         let layout = self.layout.get().unwrap();
         std::ptr::copy_nonoverlapping(
-            order.as_ptr(),
+            entries.as_ptr(),
             self.forward.nodes.add(layout.node_base[worker] as usize),
-            order.len(),
+            entries.len(),
         );
-        let count = order.len();
-        drop(order);
-        self.rewrite_forward(worker, count, layout);
+        let count = entries.len();
+        drop(entries);
+        self.rewrite_forward(&chunks, layout);
         let first_id = layout.node_base[worker] as usize;
         let own_nodes = first_id..first_id + count;
         self.next_step(|| {
-            self.raw.release();
             madvise(self.labels.cast(), self.nodes * 4, MADV_DONTNEED);
             self.lay_out_backward();
         });
@@ -950,7 +931,7 @@ fn main() {
             step: Barrier::new(threads),
             rows: Rows::new(shards),
             raw: Graph::new(nodes, edges),
-            forward: Graph::new(nodes, edges),
+            forward: Graph::new(nodes, edges + (edges >> 3) + (1 << 20)),
             backward: Graph::new(nodes, edges),
             in_degrees: reserve(nodes, MADV_NOHUGEPAGE).cast(),
             labels: reserve(nodes * 4, MADV_HUGEPAGE).cast(),
