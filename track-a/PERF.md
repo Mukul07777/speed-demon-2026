@@ -74,3 +74,5 @@ Single-thread, the newline scan alone is 14.8 of 32.5 ms and memory-bound; a pur
 **Not kept (2026-11-01): 20 us sleep instead of yielding at the end of the parse.** `run-0a2da0f0982f` 20.8 ms, 15.2 MB, 85.29: memory -0.9 MB but time +8% in a slowish round.
 
 Line cut on the streaming code (2026-11-01): rustfmt S 363 -> 346, text and placement under one mutex, `sealed` field removed, single-use closures folded. Medians 19.78->19.13, 21.02->19.76 on 12 CPUs, 23.24->22.99, 23.08->22.63 on cpuset 0-5. Hash, worked example, empty file and 10 adversarial files pass.
+
+**Reverted (2026-11-01): the line cut to S 353.** Box 19.49, 19.67, 19.79 ms (85.94, 85.70, 85.76) against 19.17, 19.27, 18.67 ms (85.95, 85.88, 86.17) at S 370. About 3% slower, which outweighs the lines.

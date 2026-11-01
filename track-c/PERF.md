@@ -65,3 +65,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (2026-11-01, tools/wt_c14): dot-anchored record finding.** Records found from the amount's dot, which relies on a generator fact, not the grammar. Hash and hostile cases pass, but 12 CPUs best/median 19.67/24.88 -> 19.96/24.28 and one CPU only -2.6%, for S +21. Not kept. Stage floor on 12 CPUs, best ms: setup 3.4, read 9.2, masks 9.8, fields 12.8, hash 12.9, bucket prefetch 15.1, region and stats 16.9, full 20.3. Private tables instead of shared ones saved only about 1 ms, so sharing is not the main cost.
 
 **Not kept (2026-11-01): line cut (S 294->289) with a plain load before the locked bit update.** Box 22.61 and 22.76 ms, 82.05 and 82.00, against 21.96 ms and 82.40.
+
+**Failed (2026-11-01): bit updates deferred one batch** (box 22.90 ms, 81.82) **and bucket prefetch for write while the table fills** (23.50 ms, 81.60). Code back at the best-scored version.
