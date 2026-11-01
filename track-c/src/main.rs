@@ -51,6 +51,11 @@ const FIELDS: usize = 5; // structural bytes per record: four commas and an LF
 const MIN_RECORD: usize = 11; // `1,,,1,0.00` and an LF
 const MAX_POSITIONS: usize = BATCH_WORDS * 64 / MIN_RECORD * FIELDS + 2 * FIELDS;
 const MAX_RECORDS: usize = MAX_POSITIONS / FIELDS;
+// Digit arrays are decoded four at a time, so they may be read up to three past the last record.
+const BATCH_CAP: usize = MAX_RECORDS + 3;
+// The two numbers of a record that wait for `decode_digits`, as indexes of a batch's arrays.
+const ID: usize = 0;
+const AMOUNT: usize = 1;
 const QUOTE_WORDS: usize = 1 << 10; // masks kept for the rank query, more than one batch
 const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 5;
@@ -94,15 +99,14 @@ impl Stats {
     }
 }
 
-/// One record between the passes of a batch: its name and region wait for their table lines.
+/// One record between the passes of a batch. Its id and amount wait in the batch's digit
+/// arrays until `decode_digits` has turned them into numbers.
 #[derive(Clone, Copy)]
 struct Pending {
     hash: u64,
     lengths: u64, // as in `Stats`
     sign: i64,    // -1 for a negative amount, else 0
     region: u32,
-    id: u64,
-    amount: u64,
 }
 
 /// One cache line: name hashes and their numbers + 1. Numbers are dense, which keeps the bit
@@ -124,6 +128,9 @@ struct Run {
     letters: Vec<AtomicU8>,         // country code to group
     countries: Mutex<Vec<[u8; 3]>>, // group - 1 to country code
     regions_done: Barrier,
+    // Start addresses of the huge pages of the two tables, touched by whichever worker claims them.
+    huge_pages: Vec<usize>,
+    next_huge_page: AtomicUsize,
     buckets: *mut Bucket,
     next_name: AtomicUsize,
     seen: *const AtomicU64, // SEEN_WORDS per group
@@ -153,10 +160,10 @@ fn eight_digits(digits: u64) -> u64 {
 /// The number written in the `len` bytes before `end`, for lengths 1 to 8. Shifting the
 /// digits to the top makes the bytes below them read as leading zeros.
 unsafe fn number_before(end: *const u8, len: usize) -> u64 {
-    eight_digits(digits_before(end, len))
+    eight_digits((read(end.sub(8)) ^ ZEROS) >> (64 - 8 * len) << (64 - 8 * len))
 }
 
-/// The `len` digit bytes before `end`, for lengths 1 to 8, as eight-digit words.
+/// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
 /// Shifting them to the top makes the bytes below read as leading zeros.
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
     (read(end.sub(8)) ^ ZEROS) >> (64 - 8 * len) << (64 - 8 * len)
@@ -167,6 +174,28 @@ unsafe fn cents_digits(end: *const u8, len: usize) -> u64 {
     let bytes = digits_before(end, len);
     // Close the gap the point leaves: its byte is always third from the end.
     (bytes & 0xFF_FFFF_FFFF) << 8 | bytes & 0xFFFF_0000_0000_0000
+}
+
+/// Turns the first `count` words of eight digit bytes each into numbers, four at a time, like
+/// `eight_digits` does for one. The three arrays of a batch go through the same few
+/// instructions, so a record's numbers cost far less than three scalar multiply chains.
+unsafe fn decode_digits(words: &[u64; BATCH_CAP], numbers: &mut [u32; BATCH_CAP], count: usize) {
+    for at in (0..count).step_by(4) {
+        let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
+        // Pairs of digits, then groups of four, then all eight.
+        let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
+        let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
+        let eights = _mm256_madd_epi16(
+            _mm256_packus_epi32(fours, fours),
+            _mm256_set1_epi32(0x0001_2710),
+        );
+        // Each 128-bit half now holds its two numbers in its low 64 bits.
+        let packed = _mm256_permute4x64_epi64::<0b1000>(eights);
+        _mm_storeu_si128(
+            numbers.as_mut_ptr().add(at).cast(),
+            _mm256_castsi256_si128(packed),
+        );
+    }
 }
 
 /// Sets each bit that has an odd number of set bits at or below it, so quote bits become a
@@ -288,6 +317,8 @@ impl Run {
         let mut quotes = [0u64; QUOTE_WORDS];
         let mut quotes_before = [0u32; QUOTE_WORDS];
         let mut pending: Vec<Pending> = Vec::with_capacity(MAX_RECORDS);
+        let mut digits = [[0u64; BATCH_CAP]; 2];
+        let mut numbers = [[0u32; BATCH_CAP]; 2];
         loop {
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= len {
@@ -367,15 +398,15 @@ impl Run {
                     let id_len = comma1 - record - bom;
                     record = newline + 1;
 
-                    let id = number_before(input.add(comma1), id_len);
+                    let at = pending.len();
+                    digits[ID][at] = digits_before(input.add(comma1), id_len);
                     let region = number_before(input.add(comma4), comma4 - comma3 - 1) as usize;
                     let region = region.min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(self.region_table.add(region).cast());
                     // The sign sits before the digits, where the shift leaves it out.
                     let end = newline - (*input.add(newline - 1) == b'\r') as usize;
                     let negative = (*input.add(comma4 + 1) == b'-') as usize;
-                    let amount =
-                        eight_digits(cents_digits(input.add(end), end - comma4 - 1 - negative));
+                    digits[AMOUNT][at] = cents_digits(input.add(end), end - comma4 - 1 - negative);
 
                     // The name has just been read, so only the note's end needs a rank query.
                     let raw_name = comma2 - comma1 - 1;
@@ -397,8 +428,6 @@ impl Run {
                         hash,
                         sign: -(negative as i64),
                         region: region as u32,
-                        id,
-                        amount,
                         lengths: name_len as u64 | (note_len as u64) << 32,
                     });
                 }
@@ -406,12 +435,15 @@ impl Run {
                 // half of the pass above when it read them itself. Now both are prefetched
                 // before this pass reads them. A locked update of a cold line stalls the core,
                 // so its lines are fetched here and updated in the pass after.
-                for name in pending.iter_mut() {
+                for kind in [ID, AMOUNT] {
+                    decode_digits(&digits[kind], &mut numbers[kind], pending.len());
+                }
+                for (at, name) in pending.iter_mut().enumerate() {
                     let group = *self.region_table.add(name.region as usize) as usize;
-                    let amount = (name.amount as i64 ^ name.sign) - name.sign;
+                    let amount = (numbers[AMOUNT][at] as i64 ^ name.sign) - name.sign;
                     let s = stats.get_unchecked_mut(group);
                     s.count += 1;
-                    s.id_sum += name.id;
+                    s.id_sum += numbers[ID][at] as u64;
                     s.amount_sum += amount;
                     s.amount_min = s.amount_min.min(amount);
                     s.amount_max = s.amount_max.max(amount);
@@ -491,7 +523,28 @@ impl Run {
         }
     }
 
+    /// Starts `descendants` more workers as a tree, so that no thread spends a millisecond
+    /// spawning them all, and then works itself.
+    fn start<'scope>(
+        &'scope self,
+        scope: &'scope thread::Scope<'scope, '_>,
+        mut descendants: usize,
+    ) {
+        while descendants > 0 {
+            let share = descendants.div_ceil(2);
+            scope.spawn(move || self.start(scope, share - 1));
+            descendants -= share;
+        }
+        self.work();
+    }
+
     fn work(&self) {
+        // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
+        // it while the regions load. It must end before huge pages are disabled.
+        let page = self.next_huge_page.fetch_add(1, Relaxed);
+        if let Some(&at) = self.huge_pages.get(page) {
+            unsafe { *(at as *mut u8) = 0 };
+        }
         unsafe { self.parse_regions() };
         self.regions_done.wait();
         // Idempotent, and set before this worker allocates anything for the records.
@@ -525,17 +578,15 @@ unsafe fn map_file(file: &File, len: usize) -> *const u8 {
 }
 
 /// A table of whole huge pages, which must start on a huge page boundary to get any. Its pages
-/// are touched here, because huge pages are disabled for everything else before the records
-/// start.
-unsafe fn zeroed_huge<T>(count: usize) -> *mut T {
+/// are touched later by the workers, because huge pages are disabled for everything else
+/// before the records start. Returns the table and the start of each of its pages.
+unsafe fn zeroed_huge<T>(count: usize) -> (*mut T, impl Iterator<Item = usize>) {
     let bytes = count * size_of::<T>();
     let region: *mut u8 = zeroed(bytes + HUGE_PAGE);
     let aligned = region.add(region.align_offset(HUGE_PAGE));
     madvise(aligned, bytes, MADV_HUGEPAGE);
-    for page in (0..bytes).step_by(HUGE_PAGE) {
-        *aligned.add(page) = 0;
-    }
-    aligned.cast()
+    let start = aligned as usize;
+    (aligned.cast(), (start..start + bytes).step_by(HUGE_PAGE))
 }
 
 unsafe fn zeroed<T>(count: usize) -> *mut T {
@@ -559,8 +610,8 @@ fn main() {
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
 
     let run = unsafe {
-        let buckets = zeroed_huge(BUCKETS);
-        let seen = zeroed_huge(GROUPS * SEEN_WORDS);
+        let (buckets, bucket_pages) = zeroed_huge(BUCKETS);
+        let (seen, seen_pages) = zeroed_huge(GROUPS * SEEN_WORDS);
         Run {
             records: map_file(&records, records_len),
             records_len,
@@ -572,6 +623,8 @@ fn main() {
             letters: (0..LETTERS).map(|_| AtomicU8::new(0)).collect(),
             countries: Mutex::new(Vec::new()),
             regions_done: Barrier::new(threads),
+            huge_pages: bucket_pages.chain(seen_pages).collect(),
+            next_huge_page: AtomicUsize::new(0),
             buckets,
             next_name: AtomicUsize::new(0),
             seen,
@@ -579,10 +632,7 @@ fn main() {
         }
     };
     thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
-        }
-        run.work();
+        run.start(s, threads - 1);
     });
 
     let totals = run.totals.lock().unwrap();
