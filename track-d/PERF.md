@@ -32,3 +32,5 @@ How to read the table: each row is one step, in order. Run ID, T, M and points a
 ## Backward search on the forward graph (2026-11-01)
 
 Roads are almost all two-way, so the backward graph repeated the forward one. Removed: backward arrays, in-degrees, scatter loop. A u16 `rev` array parallel to `forward.edges` holds the weight of the arc back, filled by a pull pass; one-way arcs go to a sorted list, flagged on the node. Distance blocks are u16, with larger labels in the `wide` map. Laptop peak 65->55 MiB (the grow phase now sets the floor at about 56), best +2%, median -3%. Hash, worked example and six generated seeds match. Run ID: pending board.
+
+**Not kept (2026-11-01): the backward search above.** Box 123.1 and 124.0 ms, 58.8 and 58.4 MB, S 669, 72.16 and 72.10, a tie with 119.0 ms, 67.8 MB, S 608, 72.22. Memory gained 0.65, lines and time took it back. Code at 842c452 and tools/wt_d8/v/rev2.rs.

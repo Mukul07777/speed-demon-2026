@@ -80,3 +80,5 @@ Line cut on the streaming code (2026-11-01): rustfmt S 363 -> 346, text and plac
 **Not kept (2026-11-01): idle threads share writing ready hours.** `run-4bcc3237cdf1` 19.15 ms, 15.9 MB, S 377, 85.94: a tie with the 85.88-86.17 band for 7 more lines. Sealing at h+1 is unsafe: hour-h lines arrive up to 1.38 MiB after the first h+1 line, and claims are 1 MiB.
 
 **Failed (2026-11-01, tools/wt_a17): end-of-file hours summarised by 2 or 3 endpoint-range parts.** Exact, but +4 to 15% time, +15% CPU, peak unchanged. The tail is only 3-9 hours and 1-4 ms; the peak comes during the parse, with about 12 hours of rows plus the output.
+
+**Not kept (2026-11-01): line cut keeping the original hash, deal loop and shared seal.** `run-45dc16ee7f11` 19.41 ms, 16.4 MB, S 362, 85.80: a tie.
