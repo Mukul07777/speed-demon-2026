@@ -54,3 +54,5 @@ Parse-only builds, best ms: full 12.0-12.5, newline scan alone 8.0, no hash -1.2
 - `CHUNK` 64 or 128: slower, peak unchanged.
 
 **Failed (2026-11-01): futex barrier from Track B.** B gained ~5 ms by replacing `std::sync::Barrier` (1-4 ms wake latency, many barriers per run). This track has only one or two barriers, so the saving is about 0-3% and only on all cores (0% on cpuset 0-5), while the barrier adds ~35 lines. Net negative on the keep rule; not kept. SPIN 1000 vs 3000 made no consistent difference.
+
+**Failed (2026-11-01): file pages released in large slices.** Each 1 MiB claim calls `madvise(DONTNEED)` during the parse, which could interrupt every parsing thread with a TLB flush. Tried 16 MiB slices shared by the workers, right after the parse (v1) or after the summaries (v2). Paired 30 rounds, best/median µs: 12 CPUs base 17488/19478, v1 16920/19711, v2 17105/19974; cpuset 0-5 base 20454/22105, v1 20568/21655, v2 20320/21780. No clear gain for about 9 more lines, so not kept. Hash 495ca09682, worked example and empty file pass.

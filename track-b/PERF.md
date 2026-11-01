@@ -58,3 +58,5 @@ Kept: page release moved from every claim to one sliced `MADV_DONTNEED` per thre
 Profile with per-thread timestamps showed the pre-scan time was mostly `std::sync::Barrier` wake latency (threads released 1-4 ms after the last arrival), not work. Replaced it with a counter + round word: the last arriver does `FUTEX_WAKE`, waiters spin 3000 pauses then `FUTEX_WAIT`. Medians, 30 rounds, run twice in swapped order: 12 CPUs 80.5 -> 75.6 and 79.8 -> 74.2 ms; cpuset 0-5 97.7 -> 95.7 and 98.0 -> 96.2 ms. S +35.
 
 **Failed:** no spin (80.0 -> 79.2, too small); spin 30000 (worse than 3000 on 12 CPUs, no better on cpuset).
+
+Box verdict on the futex barrier: 98daaff 103.0 ms and 12a83cd 101.5 ms (`run-f645d9256ed9`, 42.3 MB, S 1091, 77.51) against 103.5 ms (`run-798a2a9dd634`, S 1056, 77.41) without it. Small gain over two runs, kept.
