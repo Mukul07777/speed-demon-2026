@@ -327,7 +327,6 @@ impl Run {
                     advice,
                 )
             };
-            advise(MADV_POPULATE_READ);
             let origin = self.first_record(claim);
             let mut record = origin; // the next record to read
             let mut at = origin; // the next byte to scan
