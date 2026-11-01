@@ -1,2 +1,2 @@
 [build]
-rustflags = ["-C", "target-cpu=raptorlake"]
+rustflags = ["-C", "target-cpu=raptorlake", "-C", "target-feature=+crt-static"]

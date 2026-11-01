@@ -466,6 +466,10 @@ impl Run {
         for (total, part) in totals.iter_mut().zip(&stats) {
             total.merge(part);
         }
+        // Leak the per-worker buffers: freeing them makes 12 threads take the mmap lock
+        // for munmap at once, and the process exits right after anyway.
+        std::mem::forget(pending);
+        std::mem::forget(stats);
     }
 
     /// The number of a name, new if this is its first appearance.
