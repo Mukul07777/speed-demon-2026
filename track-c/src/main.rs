@@ -23,7 +23,7 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::ptr::read_unaligned;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex};
 use std::thread;
 
@@ -58,7 +58,8 @@ const ID: usize = 0;
 const AMOUNT: usize = 1;
 const QUOTE_WORDS: usize = 1 << 10; // masks kept for the rank query, more than one batch
 const BUCKETS: usize = 1 << 15;
-const BUCKET_SLOTS: usize = 5;
+const BUCKET_SLOTS: usize = 8;
+const NUMBER_BITS: i32 = 17; // MAX_NAMES
 const MAX_NAMES: usize = 1 << 17; // the generator draws from 100,000
 const REGION_IDS: usize = 1_000_000; // lookup ids stay below this; anything above is unmatched
 const GROUPS: usize = 256; // 240 countries, with index 0 for unmatched
@@ -109,12 +110,11 @@ struct Pending {
     region: u32,
 }
 
-/// One cache line: name hashes and their numbers + 1. Numbers are dense, which keeps the bit
-/// matrix small.
+/// One cache line of eight slots. A slot holds a 47-bit name tag above the name's dense number,
+/// so one compare-and-swap claims a slot with its number. Numbers keep the bit matrix small.
 #[repr(C, align(64))]
 struct Bucket {
-    tags: [AtomicU64; BUCKET_SLOTS],
-    numbers: [AtomicU32; BUCKET_SLOTS],
+    slots: [AtomicU64; BUCKET_SLOTS],
 }
 
 struct Run {
@@ -468,45 +468,45 @@ impl Run {
     /// The number of a name, new if this is its first appearance.
     unsafe fn intern(&self, name: &Pending) -> u32 {
         let index = (name.hash >> (64 - BUCKETS.trailing_zeros())) as usize;
+        let tag = name.hash & (1 << 47) - 1 | 1;
         let slots = self.buckets.add(index).cast::<__m256i>();
-        let wanted = _mm256_set1_epi64x(name.hash as i64);
-        let low = _mm256_cmpeq_epi64(_mm256_load_si256(slots), wanted);
-        let high = _mm256_cmpeq_epi64(_mm256_load_si256(slots.add(1)), wanted);
-        let found = _mm256_movemask_pd(_mm256_castsi256_pd(low))
-            | (_mm256_movemask_pd(_mm256_castsi256_pd(high)) & 1) << 4;
+        let wanted = _mm256_set1_epi64x(tag as i64);
+        let [low, high] = [0, 1].map(|half| {
+            let slot = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(slots.add(half)));
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slot, wanted)))
+        });
+        let found = low | high << 4;
         if found != 0 {
-            let number =
-                (*self.buckets.add(index)).numbers[found.trailing_zeros() as usize].load(Relaxed);
-            if number != 0 {
-                return number - 1;
-            }
+            let slot =
+                (*self.buckets.add(index)).slots[found.trailing_zeros() as usize].load(Relaxed);
+            return slot as u32 & (MAX_NAMES - 1) as u32;
         }
-        self.insert(index, name.hash)
+        self.insert(index, tag)
     }
 
-    /// Finds or adds a name that its first bucket does not answer for: the 100,000 first
-    /// appearances, and the 5% of lookups whose bucket was full. A compare-and-swap decides
-    /// each slot, so no lock is needed.
+    /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
+    /// whose bucket is full and spills into the next. A compare-and-swap decides each slot, so
+    /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
-    unsafe fn insert(&self, mut index: usize, hash: u64) -> u32 {
+    unsafe fn insert(&self, mut index: usize, tag: u64) -> u32 {
         loop {
-            let bucket = &*self.buckets.add(index);
-            for (tag, cell) in bucket.tags.iter().zip(&bucket.numbers) {
-                if tag.load(Relaxed) == 0 && tag.compare_exchange(0, hash, Relaxed, Relaxed).is_ok()
-                {
-                    let number = self.next_name.fetch_add(1, Relaxed) as u32 + 1;
-                    assert!((number as usize) <= MAX_NAMES);
-                    cell.store(number, Relaxed);
-                    return number - 1;
+            for slot in &(*self.buckets.add(index)).slots {
+                let mut seen = slot.load(Relaxed);
+                if seen == 0 {
+                    let number = self.next_name.fetch_add(1, Relaxed);
+                    assert!(number < MAX_NAMES);
+                    seen = match slot.compare_exchange(
+                        0,
+                        tag << NUMBER_BITS | number as u64,
+                        Relaxed,
+                        Relaxed,
+                    ) {
+                        Ok(_) => return number as u32,
+                        Err(other) => other,
+                    };
                 }
-                if tag.load(Relaxed) == hash {
-                    // Another worker may still be writing the number.
-                    loop {
-                        let number = cell.load(Relaxed);
-                        if number != 0 {
-                            return number - 1;
-                        }
-                    }
+                if seen >> NUMBER_BITS == tag {
+                    return seen as u32 & (MAX_NAMES - 1) as u32;
                 }
             }
             index = (index + 1) % BUCKETS;
