@@ -47,3 +47,5 @@ How to read the table: each row is one step, in order. Run ID, T, M and points a
 A bucket stays one 64-byte line but holds 8 u32 tags and 8 u32 number words (14 check bits plus the 17-bit number). A hit is one 256-bit compare, one number load and one check compare, where the old lookup did two of each. Removal probe: lookup costs about 18% of wall, half of it compute, not misses. Paired median ms: 12 CPUs 63.3->54.5 and 60.9->53.7, cpuset 0-5 86.3->77.3 and 87.4->79.6 (the laptop ran about 2.7x slow that session, so ratios only). Peak unchanged, S +14. Run ID: pending board.
 
 **Rejected at counting:** name-major bitmap (+6-8 MB), sorted staged bit updates (lines stay random), group-partitioned lists (10-13 MB), smaller name table (overflows).
+
+**Reverted (2026-11-01): the 32-bit tag buckets above.** Box 22.19 ms (`run-3cb96f167de2`, 82.10) and 22.22 ms (`run-76252468fe28`, 81.72) against 22.0 ms (`run-b7163ec15e9a`, 82.40). The laptop's -9 to -14% came from a session running 2.7x slow, and it did not reach the box. It lives in history at 6798244.
