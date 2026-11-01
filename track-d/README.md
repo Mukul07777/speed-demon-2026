@@ -12,11 +12,18 @@ Rust, standard library only. Node ids are a random relabelling of a road map, so
 
 **Renumber.** Workers grow cells of up to 1024 nodes with a breadth-first search over the raw graph. They claim nodes by a CAS that writes the node's new position into its raw entry. The last nodes in a cell's queue seed the next cell, so neighbouring cells get neighbouring numbers. In the old numbering a node's entry and its edges are two cache misses, so the queue is used to prefetch both before they are needed.
 
-A claimed node's edges are copied straight into the final forward array, so growing the cells and laying out the forward array are one pass. Next, the edge heads are translated to new ids in batches of 64, each batch prefetched first, while the in-degrees are counted atomically. The backward array is then filled from those counts. The raw graph is released once it is no longer needed.
+A claimed node's edges are copied straight into the final forward array, so growing the cells and laying out the forward array are one pass. Next, the edge heads are translated to new ids in batches of 64, each batch prefetched first, while the in-degrees are counted atomically. The backward array is then filled from those counts. The raw graph is released once it is no longer needed, each worker giving back its own stretch of the region.
 
 **Search.** Each query runs a bidirectional Dijkstra, one query per job. The search always advances the side with fewer live entries. Settling a node checks the other side's label, which catches every meeting point. The search stops when the two frontier minimums add up to the best distance found. If one side runs dry, it has settled everything it can reach, which answers an unreachable target at once.
 
 Light edges reach less than 2048 ahead, so the frontier is a circular window of exact-distance buckets, and a pop scans for the next non-empty bucket. Heavy edges wait in a small heap outside the window. Distances are u32 values (wider ones go in a side map) in 64-node blocks, handed out when a search first reaches them, so a search pays only for what it touches. The graph does not fit in the cache, so each new label prefetches the edges that settling its node will read.
+
+## Tried and reverted
+
+Each is in `PERF.md` with its numbers; none is in `src`.
+
+- Serving the backward search from the forward graph (a parallel array of reverse weights): 9 MB less memory, but the score tied (72.16 against 72.22) once lines and time were counted.
+- A binary heap in place of the bucket queue (17 to 54% slower), dropping `MADV_POPULATE_READ` (slower on the box), profile-guided optimisation (under the 3% bar).
 
 ## Dependencies
 

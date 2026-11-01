@@ -30,6 +30,14 @@ Comparing hashes instead of names is a deliberate shortcut. Two of the 100,000 n
 
 **Distinct names.** One shared bit matrix has a row per country group, indexed by the name's number. It is 256 × 2^17 bits, or 4 MiB, on huge pages. Popcounts of the rows give the distinct-name counts.
 
+## Tried and reverted
+
+Each is in `PERF.md` with its numbers; none is in `src`. Laptop gains of 5 to 14% did not reach the box.
+
+- Buckets of eight 32-bit tags (`run-3cb96f167de2`, `run-76252468fe28`): 82.10 and 81.72 against 82.40.
+- A read-ahead prefetch of the input, and an inlined hash with unrolled position extraction (`run-d4401d6162d7`, 25.07 ms, 80.67).
+- An owner-computes bit matrix, a name-indexed bit matrix (3 times slower), lazy huge-page zeroing, dot-anchored record finding, deferred bit updates: ties or losses.
+
 ## Dependencies
 
 None.

@@ -12,7 +12,7 @@ Rust, standard library only. The queries can be read before the corpus, so the p
 
 1. AVX2 marks token bytes and newlines, 64 bytes at a time. Token starts and ends are written with unconditional stores.
 2. Tokens are hashed two at a time with VAES.
-3. One loop looks up each token, with its bucket prefetched 20 tokens ahead. It splits hits with no branch into bitmap hits, list hits and phrase anchors.
+3. One loop looks up each token, with its bucket prefetched 20 tokens ahead. It splits hits with no branch into bitmap hits, list hits and phrase anchors. A bitmap hit only sets a bit in a small row for the current document, which stays in L1; every 64 documents a 64x64 bit transpose moves those rows into the phase's bitmaps.
 
 A small sample (12 claims) chooses which terms get bitmaps: those in at least 1/32 of the documents. List terms write 4-byte rows into chunks per shard, and each chunk records the claim that wrote it. Taking the chunks in claim order therefore gives sorted document lists without sorting.
 
@@ -23,7 +23,7 @@ A small sample (12 claims) chooses which terms get bitmaps: those in at least 1/
 - its rows become lists of 16-bit offsets from the phase's first document, and the row pages are reused;
 - every query is evaluated on that phase alone, strictly left to right, and the result is added to the query's tally (count, id sum, ten smallest ids).
 
-As a result the whole index never exists at once, and peak memory is about 41 MB. A BOOL step uses whichever form suits its operands:
+As a result the whole index never exists at once, and peak memory is about 42 MB. A BOOL step uses whichever form suits its operands:
 
 - a branch-free search when one list is much shorter than the other;
 - a scratch bitmap of marks when the lists are of similar length;
@@ -32,7 +32,15 @@ As a result the whole index never exists at once, and peak memory is about 41 MB
 
 A bitmap result gets its count and id sum from nibble lookups, 32 bytes at a time.
 
-The answers of phase k-1 run on whichever threads have run out of scan claims in phase k, which fills the wait at the barrier after each scan. `PR_SET_THP_DISABLE` is set at the start, after the bucket table has been touched, so that table alone keeps its huge page.
+The answers of phase k-1 run on whichever threads have run out of scan claims in phase k, which fills the wait at the barrier after each scan. Barriers are one futex word (spin 3000 pauses, then `FUTEX_WAIT`), because the standard barrier took 1 to 4 ms to wake its threads. `PR_SET_THP_DISABLE` is set at the start, after the bucket table has been touched, so that table alone keeps its huge page.
+
+## Tried and reverted
+
+Each is in `PERF.md` with its numbers; none is in `src`.
+
+- A 26 MiB peak (100 claims per phase and smaller buffers): memory under 44 MB earns nothing for this track, and the time cost made it lose (`run-004a611bfcd9`, 77.15 against 78.18).
+- Spreading the previous phase's answers evenly through the next scan, a read-ahead prefetch, a pre-fault with `MADV_POPULATE_WRITE`, a trailing-OR shortcut, a SIMD list AND, an interleaved OR union, profile-guided optimisation: ties or losses.
+- Exact 8-byte keys for short tokens: correct, but 73.7 to 82.3 ms best, so slower.
 
 ## Dependencies
 
@@ -40,4 +48,4 @@ None.
 
 ## With another 24 hours
 
-The scan is about 60% of the time and is bound by instruction count, not by memory latency. The next step would be a cheaper path per token: tokenising and hashing fused in one pass, or an exact short-key table for the most common terms. After that, a SIMD union for OR steps.
+The scan is about 60% of the time and is bound by instruction count, not by memory latency. A stage floor measured on the laptop (read 6.3 ms, tokenise 8.9, hash 14.2, lookup about 25, against a scan of 42 ms) says the lookup is the target. An exact short-key table was tried and lost, so the next step would be a cheaper path per token that does not add passes, for example tokenising and hashing fused in one loop.
