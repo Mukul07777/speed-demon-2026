@@ -128,6 +128,9 @@ struct Run {
     letters: Vec<AtomicU8>,         // country code to group
     countries: Mutex<Vec<[u8; 3]>>, // group - 1 to country code
     regions_done: Barrier,
+    // Start addresses of the huge pages of the two tables, touched by whichever worker claims them.
+    huge_pages: Vec<usize>,
+    next_huge_page: AtomicUsize,
     buckets: *mut Bucket,
     next_name: AtomicUsize,
     seen: *const AtomicU64, // SEEN_WORDS per group
@@ -520,9 +523,32 @@ impl Run {
         }
     }
 
+    /// Starts `descendants` more workers as a tree, so that no thread spends a millisecond
+    /// spawning them all, and then works itself.
+    fn start<'scope>(
+        &'scope self,
+        scope: &'scope thread::Scope<'scope, '_>,
+        mut descendants: usize,
+    ) {
+        while descendants > 0 {
+            let share = descendants.div_ceil(2);
+            scope.spawn(move || self.start(scope, share - 1));
+            descendants -= share;
+        }
+        self.work();
+    }
+
     fn work(&self) {
+        // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
+        // it while the regions load. It must end before huge pages are disabled.
+        let page = self.next_huge_page.fetch_add(1, Relaxed);
+        if let Some(&at) = self.huge_pages.get(page) {
+            unsafe { *(at as *mut u8) = 0 };
+        }
         unsafe { self.parse_regions() };
         self.regions_done.wait();
+        // Idempotent, and set before this worker allocates anything for the records.
+        unsafe { prctl(PR_SET_THP_DISABLE, 1usize, 0usize, 0usize, 0usize) };
         unsafe { self.parse_records() };
     }
 }
@@ -551,17 +577,16 @@ unsafe fn map_file(file: &File, len: usize) -> *const u8 {
     base
 }
 
-/// A table of whole huge pages, which must start on a huge page boundary to get any. It is
-/// touched at once, because huge pages are about to be disabled for everything else.
-unsafe fn zeroed_huge<T>(count: usize) -> *mut T {
+/// A table of whole huge pages, which must start on a huge page boundary to get any. Its pages
+/// are touched later by the workers, because huge pages are disabled for everything else
+/// before the records start. Returns the table and the start of each of its pages.
+unsafe fn zeroed_huge<T>(count: usize) -> (*mut T, impl Iterator<Item = usize>) {
     let bytes = count * size_of::<T>();
     let region: *mut u8 = zeroed(bytes + HUGE_PAGE);
     let aligned = region.add(region.align_offset(HUGE_PAGE));
     madvise(aligned, bytes, MADV_HUGEPAGE);
-    for page in (0..bytes).step_by(HUGE_PAGE) {
-        *aligned.add(page) = 0;
-    }
-    aligned.cast()
+    let start = aligned as usize;
+    (aligned.cast(), (start..start + bytes).step_by(HUGE_PAGE))
 }
 
 unsafe fn zeroed<T>(count: usize) -> *mut T {
@@ -585,9 +610,8 @@ fn main() {
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
 
     let run = unsafe {
-        let buckets = zeroed_huge(BUCKETS);
-        let seen = zeroed_huge(GROUPS * SEEN_WORDS);
-        prctl(PR_SET_THP_DISABLE, 1usize, 0usize, 0usize, 0usize);
+        let (buckets, bucket_pages) = zeroed_huge(BUCKETS);
+        let (seen, seen_pages) = zeroed_huge(GROUPS * SEEN_WORDS);
         Run {
             records: map_file(&records, records_len),
             records_len,
@@ -599,6 +623,8 @@ fn main() {
             letters: (0..LETTERS).map(|_| AtomicU8::new(0)).collect(),
             countries: Mutex::new(Vec::new()),
             regions_done: Barrier::new(threads),
+            huge_pages: bucket_pages.chain(seen_pages).collect(),
+            next_huge_page: AtomicUsize::new(0),
             buckets,
             next_name: AtomicUsize::new(0),
             seen,
@@ -606,10 +632,7 @@ fn main() {
         }
     };
     thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
-        }
-        run.work();
+        run.start(s, threads - 1);
     });
 
     let totals = run.totals.lock().unwrap();
