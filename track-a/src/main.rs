@@ -47,7 +47,7 @@ const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
+const TEXT_ROOM: usize = 1 << 18; // rows (1 MiB) past the rows, more than any hour's text needs
 const SPACES: u64 = 0x2020_2020_2020_2020;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 const ONES: u64 = 0x0101_0101_0101_0101;
@@ -64,6 +64,8 @@ const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit 
 /// The next free row and the final slot of the chunk being filled: a row needs two free, in
 /// case it has to escape.
 type Cursor = (*mut u32, *mut u32);
+/// Endpoint names in output order, with their ids.
+type Names = [(&'static [u8], usize)];
 
 unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
@@ -283,15 +285,17 @@ impl Run {
     }
 
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
-    /// area of `rows`: the rows first, then the text over them, and the sort scratch further
-    /// on. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
+    /// area of `rows`: the rows first, then the text over them; the sort scratch is the
+    /// thread's. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
     /// (Text in malloc'd buffers was the bulk of the memory peak: the allocator kept every
     /// buffer it had grown while the writer, which is serial, fell behind.)
-    unsafe fn summarise(&self, hour: usize, order: &[(&[u8], usize)]) -> &'static [u8] {
+    unsafe fn summarise(&self, hour: usize, order: &Names, spare: &mut Vec<u32>) -> &'static [u8] {
         let rows = self.rows.add(hour * self.stride);
         let claimed = self.claimed[hour].load(Relaxed);
-        // The text can run past the rows, but never a million bytes past them.
-        let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
+        // The sort scratch is the thread's own, reused hour after hour, so its pages are
+        // faulted in once and stay in cache rather than being fresh for every hour.
+        spare.resize(claimed.max(spare.len()), 0);
+        let spare = spare.as_mut_ptr();
         let mut starts = vec![0u32; order.len() + 2];
         let mut errors = starts.clone();
         let mut long = Vec::new();
@@ -374,7 +378,6 @@ impl Run {
             *w = b'\n';
             w = w.add(1);
         }
-        madvise(spare.cast(), (count + long.len()) * 4, MADV_DONTNEED);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
@@ -403,12 +406,13 @@ impl Run {
         unsafe { self.parse() };
         self.finished_parsing.wait();
         let order = self.catalogue.sorted();
+        let mut scratch = Vec::new();
         loop {
             let hour = self.next_hour.fetch_add(1, Relaxed);
             if hour >= HOURS {
                 break;
             }
-            let part = unsafe { self.summarise(hour, &order) };
+            let part = unsafe { self.summarise(hour, &order, &mut scratch) };
             self.texts[hour].set(part).unwrap();
             // Whoever takes the lock after an hour's text is set sees it, so every hour is
             // written exactly once, by the thread that finds it ready.
@@ -467,9 +471,8 @@ fn main() {
         // For an empty file this fails, and the zero page stays.
         let fd = file.as_raw_fd();
         map(input, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd);
-        // An hour has room for its rows (two per line, if every line escaped), then for the
-        // scratch (one value per line) after them, or after SPARE_AT rows if that is further.
-        let stride = SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2;
+        // An hour has room for its rows (two per line, if every line escaped) and its text.
+        let stride = TEXT_ROOM + (len / MIN_LINE + 1) * 2 + threads * CHUNK * 2;
         let stride = stride.div_ceil(1024) * 1024;
         let size = stride * HOURS * 4;
         let rows = map(null, size, PROT_READ | PROT_WRITE, private, -1);
