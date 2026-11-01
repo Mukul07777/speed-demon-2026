@@ -285,19 +285,20 @@ fn fold_multiply(a: u64, b: u64) -> u64 {
 /// and leaves digits, so folding needs no check on each byte.
 const KEY: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 
+#[repr(align(16))]
+struct Masks([u8; 32]);
+static MASKS: Masks = {
+    let mut bytes = [0u8; 32];
+    let mut i = 0;
+    while i < 16 {
+        bytes[i] = 0xFF;
+        i += 1;
+    }
+    Masks(bytes)
+};
+
 #[inline(always)]
 unsafe fn hash_of(token: *const u8, len: usize) -> u64 {
-    #[repr(align(16))]
-    struct Masks([u8; 32]);
-    static MASKS: Masks = {
-        let mut bytes = [0u8; 32];
-        let mut i = 0;
-        while i < 16 {
-            bytes[i] = 0xFF;
-            i += 1;
-        }
-        Masks(bytes)
-    };
     if len > 16 {
         return long_hash(token, len);
     }
@@ -426,7 +427,7 @@ impl Run {
             anchor_hits,
         } = buffers;
         let (mut token_count, mut end_count, mut line_count) = (0, 0, 0);
-        let mut carry = 0u32; // whether the previous 32 bytes ended inside a token
+        let mut carry = 0u64; // whether the previous 32 bytes ended inside a token
         let mut at = start;
         let mut first_token = true;
 
@@ -440,30 +441,38 @@ impl Run {
         while at < end {
             let batch_end = (at + BATCH).min(end);
             while at < batch_end {
-                let chunk = _mm256_loadu_si256(text.add(at).cast());
-                let lower = _mm256_or_si256(chunk, fold);
-                let letters = _mm256_and_si256(
-                    _mm256_cmpgt_epi8(lower, floor_lower),
-                    _mm256_cmpgt_epi8(ceil_lower, lower),
-                );
-                let digits = _mm256_and_si256(
-                    _mm256_cmpgt_epi8(chunk, floor_digit),
-                    _mm256_cmpgt_epi8(ceil_digit, chunk),
-                );
-                let mut inside = _mm256_movemask_epi8(_mm256_or_si256(letters, digits)) as u32;
-                let mut breaks = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32;
-                if at + 32 > end {
-                    let keep = (1u32 << (end - at)).wrapping_sub(1);
+                let classify = |at: usize| {
+                    let chunk = _mm256_loadu_si256(text.add(at).cast());
+                    let lower = _mm256_or_si256(chunk, fold);
+                    let letters = _mm256_and_si256(
+                        _mm256_cmpgt_epi8(lower, floor_lower),
+                        _mm256_cmpgt_epi8(ceil_lower, lower),
+                    );
+                    let digits = _mm256_and_si256(
+                        _mm256_cmpgt_epi8(chunk, floor_digit),
+                        _mm256_cmpgt_epi8(ceil_digit, chunk),
+                    );
+                    (
+                        _mm256_movemask_epi8(_mm256_or_si256(letters, digits)) as u32 as u64,
+                        _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32 as u64,
+                    )
+                };
+                let (inside_low, breaks_low) = classify(at);
+                let (inside_high, breaks_high) = classify(at + 32);
+                let mut inside = inside_low | inside_high << 32;
+                let mut breaks = breaks_low | breaks_high << 32;
+                if at + 64 > end {
+                    let keep = (1u64 << (end - at)).wrapping_sub(1);
                     inside &= keep;
                     breaks &= keep;
                 }
                 let shifted = inside << 1 | carry;
-                carry = inside >> 31;
+                carry = inside >> 63;
                 let mut opened = inside & !shifted;
                 let mut closed = !inside & shifted;
                 // A line is recorded as the index of the token that follows it, the next id.
                 while breaks != 0 {
-                    let before = opened & ((1u32 << breaks.trailing_zeros()) - 1);
+                    let before = opened & ((1u64 << breaks.trailing_zeros()) - 1);
                     lines[line_count] = (token_count + before.count_ones() as usize) as u32;
                     line_count += 1;
                     breaks &= breaks - 1;
@@ -471,7 +480,7 @@ impl Run {
                 // Unconditional stores, so a varying token count needs no loop to predict.
                 let (found, finished) =
                     (opened.count_ones() as usize, closed.count_ones() as usize);
-                for extra in 0..8 {
+                for extra in 0..12 {
                     *starts.get_unchecked_mut(token_count + extra) =
                         (at + opened.trailing_zeros() as usize) as u32;
                     *ends.get_unchecked_mut(end_count + extra) =
@@ -479,13 +488,13 @@ impl Run {
                     opened &= opened.wrapping_sub(1);
                     closed &= closed.wrapping_sub(1);
                 }
-                let mut extra = 8;
+                let mut extra = 12;
                 while opened != 0 {
                     starts[token_count + extra] = (at + opened.trailing_zeros() as usize) as u32;
                     opened &= opened - 1;
                     extra += 1;
                 }
-                extra = 8;
+                extra = 12;
                 while closed != 0 {
                     ends[end_count + extra] = (at + closed.trailing_zeros() as usize) as u32;
                     closed &= closed - 1;
@@ -493,7 +502,7 @@ impl Run {
                 }
                 token_count += found;
                 end_count += finished;
-                at += 32;
+                at += 64;
             }
 
             // Only whole documents go on, so that a phrase has all its tokens at hand.
@@ -508,7 +517,42 @@ impl Run {
                 token = 1; // the id of the claim's first document
                 hashes[0] = 0;
             }
-            for i in token..ready {
+            let mut i = token;
+            while i + 1 < ready {
+                let (from_a, to_a) = (
+                    *starts.get_unchecked(i) as usize,
+                    *ends.get_unchecked(i) as usize,
+                );
+                let (from_b, to_b) = (
+                    *starts.get_unchecked(i + 1) as usize,
+                    *ends.get_unchecked(i + 1) as usize,
+                );
+                let (len_a, len_b) = (to_a - from_a, to_b - from_b);
+                if (len_a | len_b) > 16 {
+                    *hashes.get_unchecked_mut(i) = hash_of(text.add(from_a), len_a);
+                    *hashes.get_unchecked_mut(i + 1) = hash_of(text.add(from_b), len_b);
+                } else {
+                    let masks = MASKS.0.as_ptr();
+                    let pair = _mm256_set_m128i(
+                        _mm_loadu_si128(text.add(from_b).cast()),
+                        _mm_loadu_si128(text.add(from_a).cast()),
+                    );
+                    let mask = _mm256_set_m128i(
+                        _mm_loadu_si128(masks.add(16 - len_b).cast()),
+                        _mm_loadu_si128(masks.add(16 - len_a).cast()),
+                    );
+                    let key = _mm256_and_si256(_mm256_or_si256(pair, _mm256_set1_epi8(0x20)), mask);
+                    let mixed = _mm256_aesenc_epi128(
+                        _mm256_aesenc_epi128(key, _mm256_set1_epi64x(KEY)),
+                        key,
+                    );
+                    let folded = _mm256_xor_si256(mixed, _mm256_srli_si256::<8>(mixed));
+                    *hashes.get_unchecked_mut(i) = _mm256_extract_epi64::<0>(folded) as u64 | 1;
+                    *hashes.get_unchecked_mut(i + 1) = _mm256_extract_epi64::<2>(folded) as u64 | 1;
+                }
+                i += 2;
+            }
+            if i < ready {
                 let (from, to) = (
                     *starts.get_unchecked(i) as usize,
                     *ends.get_unchecked(i) as usize,
