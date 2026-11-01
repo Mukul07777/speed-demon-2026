@@ -41,3 +41,9 @@ How to read the table: each row is one step, in order. Run ID, T, M and points a
 | next | **Failed**: profile-guided optimisation (allowed by the harness allowlist; three seed-1 full-data runs merged with llvm-profdata, rebuilt with `-C profile-use`, Dockerfile unchanged, offline). All checks pass; slightly slower in all four 25-round runs (median +0.1 to +0.9 ms). Rejected: the bar was 3% on both settings, and the profile comes from seed 1 only. | | | | |
 
 **Failed (2026-11-01): futex barrier from Track B.** B gained ~5 ms by replacing `std::sync::Barrier` (1-4 ms wake latency, many barriers per run). This track has only one or two barriers, so the saving is about 0-3% and only on all cores (0% on cpuset 0-5), while the barrier adds ~35 lines. Net negative on the keep rule; not kept. SPIN 1000 vs 3000 made no consistent difference.
+
+## Name bucket with 32-bit tags (2026-11-01)
+
+A bucket stays one 64-byte line but holds 8 u32 tags and 8 u32 number words (14 check bits plus the 17-bit number). A hit is one 256-bit compare, one number load and one check compare, where the old lookup did two of each. Removal probe: lookup costs about 18% of wall, half of it compute, not misses. Paired median ms: 12 CPUs 63.3->54.5 and 60.9->53.7, cpuset 0-5 86.3->77.3 and 87.4->79.6 (the laptop ran about 2.7x slow that session, so ratios only). Peak unchanged, S +14. Run ID: pending board.
+
+**Rejected at counting:** name-major bitmap (+6-8 MB), sorted staged bit updates (lines stay random), group-partitioned lists (10-13 MB), smaller name table (overflows).

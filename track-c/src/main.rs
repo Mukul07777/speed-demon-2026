@@ -84,7 +84,7 @@ static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Numbers keep the bit matrix small.
 /// 1: the name bit matrix, `SEEN_WORDS` words per group.
 #[repr(C)]
-struct Tables([[AtomicU64; 8]; BUCKETS], [AtomicU64; GROUPS * SEEN_WORDS]);
+struct Tables([[AtomicU32; 16]; BUCKETS], [AtomicU64; GROUPS * SEEN_WORDS]);
 
 /// What the workers share: 0 the records file, 1 the regions file, 2 the tables, 3 the barrier
 /// after the regions are loaded.
@@ -146,55 +146,68 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     (_mm_cvtsi128_si64(mixed) as u64 | 1, quotes)
 }
 
+/// The 15 more bits of a name's hash that its number word keeps above the number. The top one is
+/// always set, so a stored word is never 0, which is how a number not stored yet shows.
+fn check(hash: u64) -> u32 {
+    (hash >> 32) as u32 & 0x3FFF | 1 << 14
+}
+
 /// The next unclaimed block of `size` bytes in a file of `len` bytes, if any is left.
 fn take_block(counter: &AtomicUsize, size: usize, len: usize) -> Option<usize> {
     Some(counter.fetch_add(size, Relaxed)).filter(|&at| at < len)
 }
 
 impl Run {
-    /// The number of a name, new if this is its first appearance.
+    /// The number of a name, new if this is its first appearance. A bucket holds eight 32-bit
+    /// tags, then the eight numbers of their names, so a hit costs one wide compare and one load.
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let index = (hash >> 49) as usize;
-        let tag = hash & (1 << 47) - 1 | 1;
-        let bucket = &self.2 .0[index];
-        let wanted = _mm256_set1_epi64x(tag as i64);
-        let [low, high] = [0, 1].map(|half| {
-            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
-            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
-            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
-        });
-        let found = low | high << 4;
-        if found == 0 {
-            return self.insert(index, tag, spare);
+        let bucket = &self.2 .0[(hash >> 49) as usize];
+        let tags = _mm256_load_si256(bucket.as_ptr().cast());
+        let found = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+            tags,
+            _mm256_set1_epi32(hash as i32),
+        )));
+        if found != 0 {
+            let held = bucket[8 + found.trailing_zeros() as usize].load(Relaxed);
+            if held >> NUMBER_BITS == check(hash) {
+                return (held & NAME_MASK as u32) as usize;
+            }
         }
-        (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
+        self.insert(hash, spare)
     }
 
-    /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
-    /// whose bucket is full and spills into the next. A compare-and-swap decides each slot, so
-    /// no lock is needed. A worker that loses a race to the same name wastes one number.
+    /// The other lookups: the 100,000 first appearances, names in a full bucket's neighbour, a name
+    /// whose number is not stored yet, and names that share a tag. A compare-and-swap decides each
+    /// tag, then its owner stores the number. A worker that loses a race to the same name waits for it.
     #[cold]
-    unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
+    unsafe fn insert(&self, hash: u64, spare: &mut Range<usize>) -> usize {
         if spare.is_empty() {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
             *spare = first..first + 32;
         }
-        let claimed = tag << NUMBER_BITS | spare.start as u64;
+        let tag = hash as u32;
         // From the bucket's first slot to the end of the table, and round again if need be.
-        let slots = self.2 .0.as_flattened();
-        for slot in slots[index * 8..].iter().chain(slots) {
-            // Read first: a compare-and-swap on a taken slot would only pull its line away from
-            // the other cores.
-            match slot.load(Relaxed) {
-                // On failure the slot holds another name, or this one if a worker just added it.
-                0 => match slot.compare_exchange(0, claimed, Relaxed, Relaxed) {
-                    Ok(_) => return spare.next().unwrap(),
-                    Err(held) if held >> NUMBER_BITS == tag => return (held & NAME_MASK) as usize,
-                    Err(_) => {}
-                },
-                held if held >> NUMBER_BITS == tag => return (held & NAME_MASK) as usize,
-                _ => {}
+        for bucket in self.2 .0[(hash >> 49) as usize..].iter().chain(&self.2 .0) {
+            for slot in 0..8 {
+                let mut held = bucket[slot].load(Relaxed);
+                if held == 0 {
+                    held = bucket[slot].compare_exchange(0, tag, Relaxed, Relaxed).unwrap_or_else(|x| x);
+                    if held == 0 {
+                        let number = spare.next().unwrap();
+                        bucket[8 + slot].store(check(hash) << NUMBER_BITS | number as u32, Release);
+                        return number;
+                    }
+                }
+                if held == tag {
+                    let mut number = 0;
+                    while number == 0 {
+                        number = bucket[8 + slot].load(Acquire);
+                    }
+                    if number >> NUMBER_BITS == check(hash) {
+                        return (number & NAME_MASK as u32) as usize;
+                    }
+                }
             }
         }
         unreachable!()
