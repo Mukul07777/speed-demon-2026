@@ -1,11 +1,19 @@
 //! Speed Demon 2026, Track A (Ingest).
 //!
-//! One pool of threads does everything, in two phases:
+//! Data layout. The input is mapped read-only, followed by one spare zero page. One anonymous
+//! reservation holds a fixed-size area per hour (`stride` u32s; untouched pages cost nothing):
+//! the hour's rows first, in chunks of 256 claimed by whichever worker needs one; later the
+//! hour's output text, written over its rows; and the radix-sort scratch further on. Endpoints
+//! are ids from one shared hash table that fills in the first moments of the run.
 //!
-//! 1. Parse. Workers claim 1 MiB of the mapped file and map it in with one call, because
-//!    faulting pages in one at a time from every thread costs more than parsing them. Then,
-//!    64 KiB at a time, they find every newline first and read each line from both ends
-//!    with no data-dependent branches. Each line becomes a 4-byte row in its hour's region.
+//! Threads. `main` starts `available_parallelism() - 1` workers and then works itself, so every
+//! thread runs `Run::work`. Work is handed out through atomic counters (file claims, then
+//! hours), with one barrier between the two phases:
+//!
+//! 1. Parse. Workers claim 1 MiB of the mapped file at a time (pages fault in on demand) and,
+//!    64 KiB at a time, find every newline first and then read each line from both ends with
+//!    no data-dependent branches. Each line becomes a 4-byte row in its hour's area. A claim's
+//!    file pages are dropped as soon as it is parsed.
 //! 2. Summarise. Workers claim one hour each and radix sort its rows by latency, inside the
 //!    hour's own pages. Dealing the sorted rows out by endpoint keeps them in order, so every
 //!    endpoint's latencies come out sorted and a percentile is one array read. The hour's text
@@ -72,6 +80,10 @@ fn spaces_in(word: u64) -> u64 {
 /// A hash of the whole name without a length-dependent loop: the masked first and last 32
 /// bytes cover any name up to 64 bytes, and the few longer ones also fold in the middle.
 /// Never leaves the id bits zero, so a live slot is never 0.
+///
+/// Both loads may stray outside the name, which is safe: the tail load starts at most 32 bytes
+/// before the name's end, still inside the line (a name starts at byte 32 or later), and the
+/// head load runs at most 32 bytes past the end of the file, into the spare zero page.
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     // Lane numbers 0 to 31, to keep the first or the last `short` bytes of a 32-byte load.
@@ -86,8 +98,9 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     let hash = middle.iter().fold(len as u64, |hash, &byte| {
         (hash.rotate_left(5) ^ byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
     });
-    // Three AES rounds mix each 16-byte half. The tail is the first round key, and the
-    // length and constants go in as the later ones.
+    // Three AES rounds (`vaesenc` does both 16-byte halves at once) mix head and tail far
+    // better than one multiply, at about the same cost. The round keys are the tail, then the
+    // length with a constant, then the output of the first round.
     let key = _mm256_set_epi64x(KEY as i64, !KEY as i64, len as i64, -(len as i64));
     let mixed = _mm256_aesenc_epi128(head, tail);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
@@ -120,8 +133,11 @@ struct Run {
 unsafe impl Sync for Run {}
 
 /// Finds the newlines of [from, to) and returns how many. Lines are longer than the 32-byte
-/// step, so a step holds at most one newline, and one unconditional store records it. Each
-/// pass over a block is then a counted loop, with no branch on where lines end.
+/// step, so a step holds at most one newline, and one unconditional store records it (a step
+/// with none writes a junk entry that the next store overwrites). Each pass over a block is
+/// then a counted loop, with no branch on where lines end. The aligned load is valid because
+/// blocks start at multiples of 64 KiB in a page-aligned mapping, and the last step may read
+/// up to 31 bytes past the file, into the spare zero page.
 unsafe fn find_newlines(input: *const u8, from: usize, to: usize, ends: &mut [u32]) -> usize {
     let newline = _mm256_set1_epi8(b'\n' as i8);
     let (mut count, mut at) = (0, from);
@@ -192,10 +208,15 @@ impl Run {
                 let count = find_newlines(input, start, (start + BLOCK).min(self.len), &mut ends);
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    // Oct 30, Oct 31, Nov 1 and Nov 2 are day 0 to 3 of the span.
+                    // `clock` is "DDTHH:MM" (bytes 8 to 15 of the timestamp). Oct 30, Oct 31,
+                    // Nov 1 and Nov 2 are day 0 to 3 of the span: the day's units digit plus
+                    // one, less one in October, whose tens digit '3' (0x33) has bit 1 set
+                    // where '0' (0x30) does not.
                     let clock = read(line.add(8));
                     let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
                     let hour = day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18;
+                    // The method starts at byte 28 and is 3 to 6 letters, so the first space
+                    // in that word gives its length, and the name follows it.
                     let method = spaces_in(read(line.add(28))).trailing_zeros() as usize / 8;
                     let name = line.add(29 + method);
                     // Read the latency back from the newline. Its length varies line by
@@ -203,6 +224,9 @@ impl Run {
                     let last_eight = read(end.sub(8));
                     let spaces = spaces_in(last_eight);
                     let (latency, digits) = if spaces != 0 {
+                        // The digits are the top `digits` bytes of the little-endian word.
+                        // Keep only those, as values 0 to 9, and join neighbours in three
+                        // multiply-shift steps: pairs, then fours, then all eight.
                         let digits = spaces.leading_zeros() as usize / 8;
                         let v = (last_eight ^ ZEROS) >> (64 - 8 * digits) << (64 - 8 * digits);
                         let v = (v & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
@@ -212,10 +236,13 @@ impl Run {
                     } else {
                         long_latency(end)
                     };
+                    // The line ends "<name> <status> <latency>\n", with a 3-digit status.
                     let status = end.sub(digits + 4);
                     let len = status.sub(1).offset_from(name) as usize;
                     let id = self.lookup(name, len) as u32;
                     let is_error = (*status == b'5') as u32;
+                    // Each worker fills its own chunk of each hour, so storing a row needs no
+                    // atomics; only taking a new chunk touches the shared counter.
                     let (hour, cursor) = (hour as usize, cursors.get_unchecked_mut(hour as usize));
                     if cursor.0 >= cursor.1 {
                         let at = self.claimed[hour].fetch_add(CHUNK, Relaxed) + hour * self.stride;
@@ -241,13 +268,17 @@ impl Run {
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
     /// area of `rows`: the rows first, then the text over them, and the sort scratch further
     /// on. Nothing is allocated per hour, and `write_ready` gives the whole area back in one call.
-    /// (Text in malloc'd buffers was the bulk of the memory peak: the allocator kept every
-    /// buffer it had grown while the writer, which is serial, fell behind.)
+    /// (Text in malloc'd buffers was once the bulk of the memory peak: the allocator kept every
+    /// buffer it had grown while a single writer fell behind.)
     unsafe fn summarise(&self, hour: usize, order: &Names) -> &'static [u8] {
         let rows = self.rows.add(hour * self.stride);
         let claimed = self.claimed[hour].load(Relaxed);
-        // The text can run past the rows, but never a million bytes past them.
+        // The scratch starts past the rows and at least SPARE_AT rows (1 MiB) in: the text is
+        // written over the rows and can grow longer than them, though never to 1 MiB. Rounded
+        // to whole pages so that `madvise` can release it.
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
+        // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
+        // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
         let (mut starts, mut errors) = (vec![0u32; order.len() + 2], vec![0u32; order.len() + 2]);
         let mut long = Vec::new();
 
@@ -298,7 +329,9 @@ impl Run {
         let mut deal = |row: u32, latency: u32| {
             let start = starts.get_unchecked_mut((row >> (LATENCY_BITS + 1)) as usize);
             *spare.add(*start as usize) = latency;
-            *start += 1; // leaves each group's end where the next group's start was
+            // Group id + 1 advances from its start to its end, which is where the next group
+            // started, so starts[id]..starts[id + 1] ends up as the span of `id`.
+            *start += 1;
         };
         for i in 0..count {
             deal(*rows.add(i), *rows.add(i) & ESCAPE);
@@ -329,6 +362,7 @@ impl Run {
             *w = b'\n';
             w = w.add(1);
         }
+        // The ranks are all read: give the scratch pages back now, not when the hour is written.
         madvise(spare.cast(), (count + long.len()) * 4, MADV_DONTNEED);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
@@ -396,7 +430,9 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
     *w = b' ';
     let digits = eight_digits(value / 100_000_000) as u128
         | (eight_digits(value % 100_000_000) as u128) << 64;
-    let skip = (digits | 1 << 127).trailing_zeros() as usize / 8; // leading zeros
+    // Leading zero digits are the low bytes. The top bit is a sentinel, so 0 still prints one
+    // digit. The 16-byte store runs past the number; the next field or line overwrites it.
+    let skip = (digits | 1 << 127).trailing_zeros() as usize / 8;
     let zeros = ZEROS as u128 * ((1 << 64) + 1);
     write_unaligned(w.add(1).cast(), (digits + zeros) >> (8 * skip));
     w.add(17 - skip)
@@ -424,7 +460,8 @@ fn main() {
         // For an empty file this fails, and the zero page stays.
         map(input, len, PROT_READ, MAP_PRIVATE_FIXED, file.as_raw_fd());
         // An hour has room for its rows (two per line, if every line escaped), then for the
-        // scratch (one value per line) after them, or after SPARE_AT rows if that is further.
+        // scratch (one value per line) after them, or after SPARE_AT rows if that is further,
+        // plus the unused ends of one partly filled chunk per thread.
         let stride =
             (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1024);
         let rows = map(null, stride * HOURS * 4, PROT_READ_WRITE, anonymous, -1);
