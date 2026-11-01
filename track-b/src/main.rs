@@ -43,7 +43,9 @@ const MADV_POPULATE_READ: i32 = 22;
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 const PHASE_CLAIMS: usize = 128; // 32 MiB of text between turning rows into postings
-const HEADER: usize = 5; // u16s of a list part: previous part, first document, length
+const HEADER: usize = 1; // u16s before a list: a sentinel while it fills, so duplicates drop with no branch
+const CLEAR_JOBS: usize = 16; // slices of the idle bitmap set that are zeroed during a phase
+const TALLY_IDS: usize = 10;
 const BATCH: usize = 1 << 14; // bytes of text between the token pass and the term pass
 const MAX_TOKENS: usize = 1 << 19; // of a batch and an unfinished document
 const BUCKET_BITS: u32 = 15;
@@ -126,6 +128,75 @@ struct Scratch {
     bits: Vec<u64>,
 }
 
+/// What the phases so far found for one query. All zeros is the empty answer, so the array
+/// of them can come straight from fresh pages.
+#[derive(Clone, Copy)]
+struct Tally {
+    count: u32,
+    sum: u64,
+    first: [u32; TALLY_IDS], // the smallest ids, filled from the first phases on
+}
+
+impl Tally {
+    /// Adds a phase's result as a list of ids relative to the phase's first document.
+    fn add_list(&mut self, base: u32, list: &[u32]) {
+        let room = TALLY_IDS.saturating_sub(self.count as usize);
+        for (slot, &doc) in self.first[TALLY_IDS - room..].iter_mut().zip(list) {
+            *slot = base + doc;
+        }
+        self.count += list.len() as u32;
+        self.sum += list.iter().map(|&doc| doc as u64).sum::<u64>() + base as u64 * list.len() as u64;
+    }
+
+    /// Adds a phase's result as a bitmap. The sum of the ids in a word is 64 * word index *
+    /// popcount plus the sum of the bit positions, and each bit of a position can be counted
+    /// across the whole word at once.
+    fn add_bits(&mut self, base: u32, bits: &[u64]) {
+        const POSITION_BITS: [u64; 6] = [
+            0xAAAA_AAAA_AAAA_AAAA,
+            0xCCCC_CCCC_CCCC_CCCC,
+            0xF0F0_F0F0_F0F0_F0F0,
+            0xFF00_FF00_FF00_FF00,
+            0xFFFF_0000_FFFF_0000,
+            0xFFFF_FFFF_0000_0000,
+        ];
+        let (mut count, mut sum) = (0u64, 0u64);
+        for (index, &word) in bits.iter().enumerate() {
+            let ones = word.count_ones() as u64;
+            count += ones;
+            sum += ones * index as u64 * 64;
+            for (shift, mask) in POSITION_BITS.iter().enumerate() {
+                sum += ((word & mask).count_ones() as u64) << shift;
+            }
+        }
+        let mut written = self.count as usize;
+        'words: for (index, &word) in bits.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                if written >= TALLY_IDS {
+                    break 'words;
+                }
+                self.first[written] = base + index as u32 * 64 + word.trailing_zeros();
+                word &= word - 1;
+                written += 1;
+            }
+        }
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        put_number(out, self.count as u64);
+        out.push(b' ');
+        put_number(out, self.sum);
+        for &doc in &self.first[..(self.count as usize).min(TALLY_IDS)] {
+            out.push(b' ');
+            put_number(out, doc as u64);
+        }
+        out.push(b'\n');
+    }
+}
+
 struct Run {
     text: *const u8,
     len: usize,
@@ -145,14 +216,18 @@ struct Run {
     // One counter of claims and one of jobs per phase, so that no phase needs resetting.
     phase_claims: Vec<AtomicUsize>,
     phase_jobs: Vec<AtomicUsize>,
-    next_job: AtomicUsize,
+    // Per phase: the jobs that build, the jobs that answer, and the next free posting.
+    answer_jobs: Vec<AtomicUsize>,
+    phase_postings: Vec<AtomicUsize>,
+    phase_base: Vec<u32>, // the first document of each phase, then the document count
+    heavy_total: AtomicUsize,
+    tallies: *mut Tally,
     step: Barrier,
     bitmaps: *mut u64,
     rows: *mut u32,
     stride: usize,
     claimed: Vec<AtomicUsize>,
     postings: *mut u16,
-    next_posting: AtomicUsize,
     parts: Mutex<Vec<Vec<u8>>>,
 }
 unsafe impl Sync for Run {}
@@ -495,8 +570,9 @@ impl Run {
             }
             for &hit in &heavy_hits[..heavy_count] {
                 let doc = hit as usize & ((1 << DOC_BITS) - 1);
-                let bitmap = (hit >> DOC_BITS) as usize * self.words_per_bitmap;
-                *self.bitmaps.add(bitmap + doc / 64) |= 1 << (doc % 64);
+                let bitmap = self.bitmap(hit >> DOC_BITS, claim / PHASE_CLAIMS);
+                let doc = doc - self.phase_base[claim / PHASE_CLAIMS] as usize;
+                *bitmap.add(doc / 64) |= 1 << (doc % 64);
             }
             for &hit in &list_hits[..list_count] {
                 let term = ((hit >> 32) as u32 & !ANCHOR) - 1;
@@ -585,11 +661,14 @@ impl Run {
                 }
             }
         }
+        self.heavy_total.store(heavy, Relaxed);
     }
 
-    /// Sorts a shard's rows into one list per term. Chunks are taken in claim order, and each
-    /// claim writes in document order, so the result is sorted with no sorting of rows.
-    unsafe fn build_shard(&self, shard: usize, base: u32) {
+    /// Sorts a shard's rows into one list per term for this phase. Chunks are taken in claim
+    /// order, and each claim writes in document order, so the result is sorted with no sorting
+    /// of rows.
+    unsafe fn build_shard(&self, shard: usize, phase: usize) {
+        let base = self.phase_base[phase];
         let region = self.rows.add(shard * self.stride);
         let claimed = self.claimed[shard].load(Relaxed);
         let mut chunks: Vec<(u32, u32)> = (0..claimed)
@@ -598,16 +677,26 @@ impl Run {
             .collect();
         chunks.sort_unstable();
         let terms = self.term_count.div_ceil(SHARDS) + 1;
+        // Lists belong to one phase: last phase's are gone, bitmap terms keep their index.
+        for low in 0..terms {
+            if let Some(info) = (low * SHARDS + shard < self.term_count)
+                .then(|| &mut *self.terms.add(low * SHARDS + shard))
+                .filter(|info| !info.heavy)
+            {
+                info.first = 0;
+                info.count = 0;
+            }
+        }
         let mut cursors = vec![0u32; terms];
         for_rows(region, &chunks, |low, _| {
             *cursors.get_unchecked_mut(low) += 1
         });
-        // Until a part is complete its length field holds a sentinel, so a document can always
+        // Until a list is complete its sentinel slot holds u16::MAX, so a document can always
         // be compared with the one before it. A term repeats within a document, but a
         // document's rows are adjacent.
-        let parts = cursors.iter().filter(|&&size| size > 0).count();
-        let total = cursors.iter().sum::<u32>() as usize + parts * HEADER;
-        let mut at = self.next_posting.fetch_add(total, Relaxed) as u32;
+        let lists = cursors.iter().filter(|&&size| size > 0).count();
+        let total = cursors.iter().sum::<u32>() as usize + lists * HEADER;
+        let mut at = self.phase_postings[phase].fetch_add(total, Relaxed) as u32;
         for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
             let size = *cursor;
             *cursor = at + HEADER as u32;
@@ -623,87 +712,87 @@ impl Run {
         });
         for low in (0..terms).filter(|&low| firsts[low] > 0) {
             let info = &mut *self.terms.add(low * SHARDS + shard);
-            let part = firsts[low] - HEADER as u32;
-            let head = self.postings.add(part as usize);
-            let size = cursors[low] - firsts[low];
-            head.cast::<u32>().write_unaligned(info.first);
-            head.add(2).cast::<u32>().write_unaligned(base);
-            *head.add(4) = size as u16;
-            info.first = part;
-            info.count += size;
+            info.first = firsts[low] - HEADER as u32;
+            info.count = cursors[low] - firsts[low];
         }
         std::ptr::write_bytes(region, 0, claimed);
         self.claimed[shard].store(0, Relaxed);
     }
 
-    unsafe fn count_bitmaps(&self) {
-        for term in 0..self.term_count {
-            let info = &mut *self.terms.add(term);
-            if info.heavy {
-                let bits =
-                    std::slice::from_raw_parts(self.bitmap(info.first), self.words_per_bitmap);
-                info.count = bits.iter().map(|w| w.count_ones()).sum();
-            }
-        }
+    /// Zeroes a slice of the bitmap set that the next phase will fill.
+    unsafe fn clear_bitmaps(&self, phase: usize, slice: usize) {
+        let heavy = self.heavy_total.load(Relaxed);
+        let (from, to) = (heavy * slice / CLEAR_JOBS, heavy * (slice + 1) / CLEAR_JOBS);
+        let first = self.bitmap(from as u32, phase + 1);
+        std::ptr::write_bytes(first, 0, (to - from) * self.words_per_bitmap);
     }
 
-    unsafe fn bitmap(&self, index: u32) -> *mut u64 {
-        self.bitmaps.add(index as usize * self.words_per_bitmap)
+    /// Bitmaps come in two sets, so that one is zeroed while the other is being answered from.
+    /// A bit is a document's offset from the first document of the phase.
+    unsafe fn bitmap(&self, index: u32, phase: usize) -> *mut u64 {
+        let set = (phase & 1) * MAX_HEAVY + index as usize;
+        self.bitmaps.add(set * self.words_per_bitmap)
     }
 
-    /// A term's documents. A list is rebuilt in `space` from its parts, last part first.
-    unsafe fn set_of(&self, term: u32, space: &mut Vec<u32>) -> Set {
+    /// A term's documents in this phase, as offsets from its first document.
+    unsafe fn set_of(&self, term: u32, phase: usize, space: &mut Vec<u32>) -> Set {
         let info = *self.terms.add(term as usize);
         if info.heavy {
-            let bits = self.bitmap(info.first);
+            let bits = self.bitmap(info.first, phase);
             return Set::Bits(std::slice::from_raw_parts(bits, self.words_per_bitmap));
         }
-        let mut end = info.count as usize;
+        let size = info.count as usize;
         space.clear();
-        space.reserve(end);
+        space.reserve(size);
         let out = space.as_mut_ptr();
-        let mut part = info.first;
-        while part != 0 {
-            let head = self.postings.add(part as usize);
-            let base = head.add(2).cast::<u32>().read_unaligned();
-            let size = *head.add(4) as usize;
-            end -= size;
-            for i in 0..size {
-                *out.add(end + i) = base + *head.add(HEADER + i) as u32;
-            }
-            part = head.cast::<u32>().read_unaligned();
+        let docs = self.postings.add(info.first as usize + HEADER);
+        for i in 0..size {
+            *out.add(i) = *docs.add(i) as u32;
         }
-        Set::List(std::slice::from_raw_parts(out, info.count as usize))
+        Set::List(std::slice::from_raw_parts(out, size))
     }
 
     unsafe fn answer_bool(
         &self,
         steps: &[(Op, u32)],
+        phase: usize,
         scratch: &mut Scratch,
         spaces: &mut [Vec<u32>; 2],
     ) -> Set {
         let [head, rest] = spaces;
-        let mut current = self.set_of(steps[0].1, head);
+        let mut current = self.set_of(steps[0].1, phase, head);
         for &(op, term) in &steps[1..] {
-            current = apply(op, current, self.set_of(term, rest), scratch);
+            current = apply(op, current, self.set_of(term, phase, rest), scratch);
         }
         current
     }
 
+    /// Adds this phase's share of each query in a batch to its tally. After the last phase the
+    /// tallies are final, and the batch's lines are written.
     unsafe fn answer_batch(
         &self,
         batch: usize,
+        phase: usize,
         scratch: &mut Scratch,
         spaces: &mut [Vec<u32>; 2],
-        out: &mut Vec<u8>,
     ) {
+        let base = self.phase_base[phase];
         let first = batch * QUERY_BATCH;
-        for query in &self.queries[first..(first + QUERY_BATCH).min(self.queries.len())] {
+        let end = (first + QUERY_BATCH).min(self.queries.len());
+        for (query, index) in self.queries[first..end].iter().zip(first..) {
             let steps = &self.steps[query.first as usize..(query.first + query.len) as usize];
-            match self.answer_bool(steps, scratch, spaces) {
-                Set::List(list) => write_list(out, list),
-                Set::Bits(bits) => write_bits(out, bits),
+            let tally = &mut *self.tallies.add(index);
+            match self.answer_bool(steps, phase, scratch, spaces) {
+                Set::List(list) => tally.add_list(base, list),
+                Set::Bits(bits) => tally.add_bits(base, bits),
             }
+        }
+        if phase + 1 == self.phase_base.len() - 1 {
+            let mut out = Vec::with_capacity(QUERY_BATCH * 64);
+            for index in first..end {
+                (*self.tallies.add(index)).write(&mut out);
+            }
+            self.parts.lock().unwrap()[batch] = out;
         }
     }
 
@@ -734,7 +823,16 @@ impl Run {
             self.plan_terms();
         }
         self.step.wait();
-        for phase in 0..self.len.div_ceil(PHASE_CLAIMS * CLAIM) {
+
+        let batches = self.queries.len().div_ceil(QUERY_BATCH);
+        let mut scratch = Scratch {
+            lists: [Vec::new(), Vec::new()],
+            active: 0,
+            bits: vec![0; self.words_per_bitmap],
+        };
+        let mut spaces = [Vec::new(), Vec::new()];
+        let phases = self.phase_base.len() - 1;
+        for phase in 0..phases {
             let limit = (phase + 1) * PHASE_CLAIMS;
             loop {
                 let claim = phase * PHASE_CLAIMS + self.phase_claims[phase].fetch_add(1, Relaxed);
@@ -744,34 +842,24 @@ impl Run {
                 self.index_claim::<false>(claim, &mut [], &mut buffers);
             }
             self.step.wait();
-            let first_doc = |claim| {
-                self.aligned_line(claim * CLAIM)
-                    .map_or(self.docs, |line| line.1)
-            };
-            let base = first_doc(phase * PHASE_CLAIMS);
-            assert!(first_doc(limit) - base < u16::MAX as usize);
-            self.each_job(&self.phase_jobs[phase], SHARDS, |shard| {
-                self.build_shard(shard, base as u32)
+            assert!(self.phase_base[phase + 1] - self.phase_base[phase] < u16::MAX as u32);
+            self.each_job(&self.phase_jobs[phase], SHARDS + CLEAR_JOBS, |job| {
+                if job < SHARDS {
+                    self.build_shard(job, phase)
+                } else {
+                    self.clear_bitmaps(phase, job - SHARDS)
+                }
             });
             self.step.wait();
+            // Each phase is answered while its lists are at hand and then forgotten, so
+            // memory holds one phase of postings and no more.
+            self.each_job(&self.answer_jobs[phase], batches, |batch| {
+                self.answer_batch(batch, phase, &mut scratch, &mut spaces)
+            });
+            if phase + 1 < phases {
+                self.step.wait();
+            }
         }
-        if self.step.wait().is_leader() {
-            self.count_bitmaps();
-        }
-        self.step.wait();
-
-        let batches = self.queries.len().div_ceil(QUERY_BATCH);
-        let mut scratch = Scratch {
-            lists: [Vec::new(), Vec::new()],
-            active: 0,
-            bits: vec![0; self.words_per_bitmap],
-        };
-        let mut spaces = [Vec::new(), Vec::new()];
-        self.each_job(&self.next_job, batches, |batch| {
-            let mut out = Vec::with_capacity(QUERY_BATCH * 64);
-            self.answer_batch(batch, &mut scratch, &mut spaces, &mut out);
-            self.parts.lock().unwrap()[batch] = out;
-        });
     }
 }
 
@@ -954,56 +1042,6 @@ fn put_number(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&digits[at..]);
 }
 
-fn write_list(out: &mut Vec<u8>, list: &[u32]) {
-    put_number(out, list.len() as u64);
-    out.push(b' ');
-    put_number(out, list.iter().map(|&doc| doc as u64).sum());
-    for &doc in &list[..list.len().min(10)] {
-        out.push(b' ');
-        put_number(out, doc as u64);
-    }
-    out.push(b'\n');
-}
-
-/// The sum of the ids in a word is 64 * base * popcount plus the sum of the bit positions,
-/// and each bit of a position can be counted across the whole word at once.
-fn write_bits(out: &mut Vec<u8>, bits: &[u64]) {
-    const POSITION_BITS: [u64; 6] = [
-        0xAAAA_AAAA_AAAA_AAAA,
-        0xCCCC_CCCC_CCCC_CCCC,
-        0xF0F0_F0F0_F0F0_F0F0,
-        0xFF00_FF00_FF00_FF00,
-        0xFFFF_0000_FFFF_0000,
-        0xFFFF_FFFF_0000_0000,
-    ];
-    let (mut count, mut sum) = (0u64, 0u64);
-    for (index, &word) in bits.iter().enumerate() {
-        let ones = word.count_ones() as u64;
-        count += ones;
-        sum += ones * index as u64 * 64;
-        for (shift, mask) in POSITION_BITS.iter().enumerate() {
-            sum += ((word & mask).count_ones() as u64) << shift;
-        }
-    }
-    put_number(out, count);
-    out.push(b' ');
-    put_number(out, sum);
-    let mut written = 0;
-    'words: for (index, &word) in bits.iter().enumerate() {
-        let mut word = word;
-        while word != 0 {
-            if written == 10 {
-                break 'words;
-            }
-            out.push(b' ');
-            put_number(out, index as u64 * 64 + word.trailing_zeros() as u64);
-            word &= word - 1;
-            written += 1;
-        }
-    }
-    out.push(b'\n');
-}
-
 /// Adds a term to the table, or finds it, and returns its id.
 unsafe fn intern(run: &mut Run, hash: u64) -> u32 {
     let mut index = bucket_of(hash);
@@ -1172,13 +1210,12 @@ fn main() {
             .fold(0, |v, &d| v * 10 + (d - b'0') as usize);
         let docs = if len == 0 { 0 } else { last_id + 1 };
         assert!(docs < 1 << DOC_BITS);
-        let words_per_bitmap = docs.div_ceil(64) + 1;
         let stride = len + 4096; // rows per shard: more than any shard can hold
         Run {
             text,
             len,
             docs,
-            words_per_bitmap,
+            words_per_bitmap: 0,
             buckets: reserve(BUCKETS * size_of::<Bucket>(), MADV_HUGEPAGE).cast(),
             terms: reserve(MAX_TERMS * size_of::<Term>(), MADV_HUGEPAGE).cast(),
             term_count: 0,
@@ -1192,17 +1229,31 @@ fn main() {
             next_claim: AtomicUsize::new(0),
             phase_claims: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
             phase_jobs: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
-            next_job: AtomicUsize::new(0),
+            answer_jobs: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(0)).collect(),
+            phase_postings: (0..len.div_ceil(PHASE_CLAIMS * CLAIM)).map(|_| AtomicUsize::new(1)).collect(),
+            phase_base: Vec::new(),
+            heavy_total: AtomicUsize::new(0),
+            tallies: std::ptr::null_mut(),
             step: Barrier::new(threads),
-            bitmaps: reserve(MAX_HEAVY * words_per_bitmap * 8, MADV_HUGEPAGE).cast(),
+            bitmaps: std::ptr::null_mut(),
             rows: reserve(SHARDS * stride * 4, MADV_NOHUGEPAGE).cast(),
             stride,
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
             postings: reserve(len * 2 + HUGE_PAGE, MADV_HUGEPAGE).cast(),
-            next_posting: AtomicUsize::new(1),
             parts: Mutex::new(Vec::new()),
         }
     };
+    // Phases start on documents that are multiples of 64, and a bitmap covers one phase.
+    let phases = len.div_ceil(PHASE_CLAIMS * CLAIM);
+    run.phase_base = (0..=phases)
+        .map(|phase| {
+            let line = unsafe { run.aligned_line(phase * PHASE_CLAIMS * CLAIM) };
+            line.map_or(run.docs, |line| line.1) as u32
+        })
+        .collect();
+    let widest = run.phase_base.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    run.words_per_bitmap = widest as usize / 64 + 2;
+    run.bitmaps = unsafe { reserve(2 * MAX_HEAVY * run.words_per_bitmap * 8, MADV_HUGEPAGE).cast() };
     // Huge pages are wanted for the bucket table alone: touch it so it is faulted in as one,
     // then forbid them. Where the kernel gives every region huge pages (THP `always`), thread
     // stacks, heaps and the half-used postings and bitmaps would otherwise each be charged 2 MiB
@@ -1223,7 +1274,15 @@ fn main() {
         );
     }
     let batches = run.queries.len().div_ceil(QUERY_BATCH);
-    *run.parts.lock().unwrap() = vec![Vec::new(); batches];
+    run.tallies = unsafe { space::<Tally>(run.queries.len()).as_mut_ptr() };
+    // With no documents there is no phase to write the answers, and every answer is empty.
+    *run.parts.lock().unwrap() = (0..batches)
+        .map(|batch| match phases {
+            0 => b"0 0
+".repeat(QUERY_BATCH.min(run.queries.len() - batch * QUERY_BATCH)),
+            _ => Vec::new(),
+        })
+        .collect();
     *run.samples.lock().unwrap() = (vec![0; run.term_count], 0);
 
     thread::scope(|s| {
