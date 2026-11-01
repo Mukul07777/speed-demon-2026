@@ -67,3 +67,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Not kept (2026-11-01): line cut (S 294->289) with a plain load before the locked bit update.** Box 22.61 and 22.76 ms, 82.05 and 82.00, against 21.96 ms and 82.40.
 
 **Failed (2026-11-01): bit updates deferred one batch** (box 22.90 ms, 81.82) **and bucket prefetch for write while the table fills** (23.50 ms, 81.60). Code back at the best-scored version.
+
+**Failed (2026-11-01, tools/wt_c15):** region barrier moved behind the first record batch (box 22.61 ms, S 301, 81.93); 16 KiB region claims and per-claim `MAP_POPULATE` remap (laptop slower, not boxed).
