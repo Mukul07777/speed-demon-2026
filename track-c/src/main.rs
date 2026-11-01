@@ -21,6 +21,7 @@
 //! popcounts of the rows give the distinct names.
 use std::arch::x86_64::*;
 use std::fs::File;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::ptr::read_unaligned;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
@@ -59,6 +60,7 @@ const AMOUNT: usize = 1;
 const QUOTE_WORDS: usize = 1 << 10; // masks kept for the rank query, more than one batch
 const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 8;
+const NAME_BLOCK: usize = 32; // name numbers a worker reserves at a time
 const NUMBER_BITS: i32 = 17; // MAX_NAMES
 const MAX_NAMES: usize = 1 << 17; // the generator draws from 100,000
 const REGION_IDS: usize = 1_000_000; // lookup ids stay below this; anything above is unmatched
@@ -309,6 +311,7 @@ impl Run {
         let mut quotes = [0u64; QUOTE_WORDS];
         let mut quotes_before = [0u32; QUOTE_WORDS];
         let mut pending: Vec<Pending> = Vec::with_capacity(MAX_RECORDS);
+        let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; BATCH_CAP]; 2];
         let mut numbers = [[0u32; BATCH_CAP]; 2];
         loop {
@@ -440,7 +443,7 @@ impl Run {
                     s.amount_min = s.amount_min.min(amount);
                     s.amount_max = s.amount_max.max(amount);
                     s.lengths += name.lengths;
-                    let id = self.intern(name) as usize;
+                    let id = self.intern(name, &mut spare) as usize;
                     let word = group * SEEN_WORDS + id / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.seen.add(word).cast());
                     name.hash = (word << 6 | id % 64) as u64;
@@ -466,7 +469,7 @@ impl Run {
     }
 
     /// The number of a name, new if this is its first appearance.
-    unsafe fn intern(&self, name: &Pending) -> u32 {
+    unsafe fn intern(&self, name: &Pending, spare: &mut Range<usize>) -> u32 {
         let index = (name.hash >> (64 - BUCKETS.trailing_zeros())) as usize;
         let tag = name.hash & (1 << 47) - 1 | 1;
         let slots = self.buckets.add(index).cast::<__m256i>();
@@ -481,19 +484,23 @@ impl Run {
                 (*self.buckets.add(index)).slots[found.trailing_zeros() as usize].load(Relaxed);
             return slot as u32 & (MAX_NAMES - 1) as u32;
         }
-        self.insert(index, tag)
+        self.insert(index, tag, spare)
     }
 
     /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
     /// whose bucket is full and spills into the next. A compare-and-swap decides each slot, so
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
-    unsafe fn insert(&self, mut index: usize, tag: u64) -> u32 {
+    unsafe fn insert(&self, mut index: usize, tag: u64, spare: &mut Range<usize>) -> u32 {
         loop {
             for slot in &(*self.buckets.add(index)).slots {
                 let mut seen = slot.load(Relaxed);
                 if seen == 0 {
-                    let number = self.next_name.fetch_add(1, Relaxed);
+                    if spare.is_empty() {
+                        let first = self.next_name.fetch_add(NAME_BLOCK, Relaxed);
+                        *spare = first..first + NAME_BLOCK;
+                    }
+                    let number = spare.start;
                     assert!(number < MAX_NAMES);
                     seen = match slot.compare_exchange(
                         0,
@@ -501,7 +508,10 @@ impl Run {
                         Relaxed,
                         Relaxed,
                     ) {
-                        Ok(_) => return number as u32,
+                        Ok(_) => {
+                            spare.start += 1;
+                            return number as u32;
+                        }
                         Err(other) => other,
                     };
                 }
