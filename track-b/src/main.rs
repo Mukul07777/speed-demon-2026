@@ -50,9 +50,9 @@ const BATCH: usize = 1 << 14; // bytes of text between the token pass and the te
 const MAX_TOKENS: usize = 1 << 19; // of a batch and an unfinished document
 const BUCKET_BITS: u32 = 15;
 const BUCKETS: usize = 1 << BUCKET_BITS;
-const BUCKET_SLOTS: usize = 5;
+const BUCKET_SLOTS: usize = 7;
 const MAX_TERMS: usize = BUCKETS * BUCKET_SLOTS;
-const AHEAD: usize = 12; // tokens between a bucket's prefetch and its lookup
+const AHEAD: usize = 20; // tokens between a bucket's prefetch and its lookup
 const HEAVY: u32 = 1 << 31; // an action: 0 for no term, a bitmap index here, or a term id + 1
 const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look further
 const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its check here
@@ -68,7 +68,7 @@ const QUERY_BATCH: usize = 64;
 /// takes the same path as a hit.
 #[repr(C, align(64))]
 struct Bucket {
-    tags: [u64; BUCKET_SLOTS],
+    tags: [u32; BUCKET_SLOTS + 1],
     actions: [u32; BUCKET_SLOTS + 1],
 }
 
@@ -283,6 +283,8 @@ fn fold_multiply(a: u64, b: u64) -> u64 {
 /// by this hash alone: of 600,000 tokens and 80,000 terms, two sharing 64 bits has odds of
 /// about 3 in a billion. Every token byte is a letter or digit, and `| 0x20` lowers letters
 /// and leaves digits, so folding needs no check on each byte.
+const KEY: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
+
 #[inline(always)]
 unsafe fn hash_of(token: *const u8, len: usize) -> u64 {
     #[repr(align(16))]
@@ -302,11 +304,9 @@ unsafe fn hash_of(token: *const u8, len: usize) -> u64 {
     let mask = _mm_loadu_si128(MASKS.0.as_ptr().add(16 - len).cast());
     let folded = _mm_or_si128(_mm_loadu_si128(token.cast()), _mm_set1_epi8(0x20));
     let key = _mm_and_si128(folded, mask);
-    let (low, high) = (
-        _mm_cvtsi128_si64(key) as u64,
-        _mm_extract_epi64(key, 1) as u64,
-    );
-    fold_multiply(low ^ 0xA076_1D64_78BD_642F, high ^ 0xE703_7ED1_A0B4_28DB) | 1
+    // Two AES rounds spread every byte over the whole block, in fewer uops than a multiply.
+    let mixed = _mm_aesenc_si128(_mm_aesenc_si128(key, _mm_set1_epi64x(KEY)), key);
+    (_mm_cvtsi128_si64(mixed) ^ _mm_extract_epi64(mixed, 1)) as u64 | 1
 }
 
 #[inline(always)]
@@ -357,13 +357,9 @@ impl Run {
     #[inline(always)]
     unsafe fn action_of(&self, hash: u64) -> u32 {
         let bucket = self.buckets.add(bucket_of(hash));
-        let lines = bucket.cast::<__m256i>();
-        let wanted = _mm256_set1_epi64x(hash as i64);
-        let low = _mm256_cmpeq_epi64(_mm256_load_si256(lines), wanted);
-        let high = _mm256_cmpeq_epi64(_mm256_load_si256(lines.add(1)), wanted);
-        let found = _mm256_movemask_pd(_mm256_castsi256_pd(low))
-            | (_mm256_movemask_pd(_mm256_castsi256_pd(high)) & 1) << 4
-            | 1 << BUCKET_SLOTS;
+        let wanted = _mm256_set1_epi32(hash as i32);
+        let same = _mm256_cmpeq_epi32(_mm256_load_si256(bucket.cast()), wanted);
+        let found = _mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32 | 1 << BUCKET_SLOTS;
         let action = (*bucket).actions[found.trailing_zeros() as usize];
         if action == OVERFLOW {
             return self.action_past(hash);
@@ -378,7 +374,7 @@ impl Run {
         loop {
             let bucket = &*self.buckets.add(index);
             for slot in 0..BUCKET_SLOTS {
-                if bucket.tags[slot] == hash {
+                if bucket.tags[slot] == hash as u32 {
                     return bucket.actions[slot];
                 }
             }
@@ -1045,12 +1041,12 @@ unsafe fn intern(run: &mut Run, hash: u64) -> u32 {
     loop {
         let bucket = &mut *run.buckets.add(index);
         for slot in 0..BUCKET_SLOTS {
-            if bucket.tags[slot] == hash {
+            if bucket.tags[slot] == hash as u32 {
                 return bucket.actions[slot] - 1;
             }
             if bucket.tags[slot] == 0 {
                 let term = run.term_count as u32;
-                bucket.tags[slot] = hash;
+                bucket.tags[slot] = hash as u32;
                 bucket.actions[slot] = term + 1;
                 run.term_count += 1;
                 return term;
