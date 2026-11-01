@@ -52,3 +52,5 @@ Parse-only builds, best ms: full 12.0-12.5, newline scan alone 8.0, no hash -1.2
 - Biggest hours first: 18530/20768 (17762/20452), tie.
 - Hash table 2^14 or 2^16 slots, cheaper hash lane fold: ties.
 - `CHUNK` 64 or 128: slower, peak unchanged.
+
+**Failed (2026-11-01): futex barrier from Track B.** B gained ~5 ms by replacing `std::sync::Barrier` (1-4 ms wake latency, many barriers per run). This track has only one or two barriers, so the saving is about 0-3% and only on all cores (0% on cpuset 0-5), while the barrier adds ~35 lines. Net negative on the keep rule; not kept. SPIN 1000 vs 3000 made no consistent difference.
