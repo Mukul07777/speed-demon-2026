@@ -110,3 +110,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (box, 2026-11-02, tools/wt_c52): spill table for full buckets.** 214,188 lookups walked to a cold next bucket at 2^14 buckets (ceiling 1.4-1.8 ms). A 128 KB spill table replaced the walk: exact, laptop tie, but `run-1c23080414bf` 23.6 ms, 10.5 MB, S 299, 81.77. Reverted; the same a27b66a code later scored best, 24.0 ms, 82.54 (commit 9f9817b).
 
 **Failed (box, 2026-11-02, tools/wt_c53): bucket misses deferred to their own prefetch pass.** Exact. Laptop 12 CPUs median -4 to -5%, best tie, 6 CPUs tie or worse. Box `run-d722366e0d38` 24.1 ms, 9.0 MB, S 317, 82.05 against 82.54. Variants with a branch in the loop, or a neighbour prefetch per record, were slower on the laptop. Reverted.
+
+**Failed (2026-11-02, tools/wt_c54): compact region table.** A rank bitmap in 64-byte lines with group bytes ranked per claim (about 0.5 MB instead of 1 MB). Exact, peak -0.55 MB, but median +0.4 to 2 ms from the dependent load chain, S +72: net loss. Freeing page tables by re-mmapping consumed windows cut VmPTE 540 to 200 kB but not the peak, and ran far slower.

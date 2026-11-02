@@ -122,3 +122,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Tried (2026-11-02, tools/wt_b52):** keeping one AES half in `hash_pair` tied in 6 rounds and was dropped. Removing the heavy-row bit loop showed no measurable ceiling. PACK table replaced by `pext` of `pdep`, 14 lines fewer: 12 CPUs one set better, one worse, so box test.
 
 **Not kept (2026-11-02): the pext table above.** Box `run-ae450ddf8737` 91.4 ms, S 1063, 78.74 and `run-5b6c766f9709` 90.8 ms, 78.80, against 78.90 and 78.66 for the table: a tie. Code back at 4eeb9d1, the best score.
+
+**Tried, tie (2026-11-02, tools/wt_b53):** hash pair written with one vector store and the tag broadcast loaded from memory. Four paired sets, mixed signs (-1.2 to +2.5 ms), +12 lines. Fresh profile (Mticks over threads): tokenise 300, hash 190, lookup 440, left-pack 120, heavy rows 150, emit 170; threads finish each scan within 1-3 ms.
