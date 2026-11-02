@@ -8,13 +8,13 @@ Rust, standard library only. The queries can be read before the corpus, so the p
 
 **Terms.** Each thread parses a share of `queries.txt` and interns its terms into one shared table of 2^15 buckets. A bucket is one cache line with 7 tags of 32 bits and 8 actions, on a huge page. A token is hashed with two AES rounds over its first 16 bytes ORed with `0x20`. Every token byte is a letter or a digit, so `| 0x20` lowercases letters and leaves digits as they are, with no check per byte. A lookup is one 256-bit compare, and a token that is not in the table takes the same path as one that is. Tokens are compared by 47 hash bits (15 pick the bucket, 32 are the tag). This is a deliberate shortcut: the odds of a false match are about 3 in 10,000 over the whole corpus.
 
-**Scan.** The corpus is mapped and split into 512 KiB claims. Each claim starts on a document whose id is a multiple of 64, so no two threads ever write the same bitmap word. A batch of 16 KiB goes through these steps:
+**Scan.** The corpus is mapped and split into 1 MiB claims. Each claim starts on a document whose id is a multiple of 64, so no two threads ever write the same bitmap word. A batch of 16 KiB goes through these steps:
 
 1. AVX2 marks token bytes and newlines, 64 bytes at a time. Token starts and ends are written with unconditional stores.
 2. Tokens are hashed two at a time with VAES.
 3. One loop looks up each token, with its bucket prefetched 20 tokens ahead. It stores one action per token, then packs the hits 8 tokens at a time with one AVX2 `permutevar8x32` and a 256-entry table, with no branch and no scalar store per token, into bitmap hits, list hits and phrase anchors. A bitmap hit only sets a bit in a small row for the current document, which stays in L1; every 64 documents a 64x64 bit transpose moves those rows into the phase's bitmaps.
 
-A small sample (6 claims) chooses which terms get bitmaps: those in at least 1/32 of the documents. List terms write 4-byte rows into chunks per shard, and each chunk records the claim that wrote it. Taking the chunks in claim order therefore gives sorted document lists without sorting.
+A small sample (3 claims) chooses which terms get bitmaps: those in at least 1/32 of the documents. List terms write 4-byte rows into chunks per shard, and each chunk records the claim that wrote it. Taking the chunks in claim order therefore gives sorted document lists without sorting.
 
 **Phrases.** No positions are stored. Every phrase is anchored on its rarest word in the sample. When an anchor appears in the scan, the hashes of the tokens around it are compared with the phrase. A match writes a row for a pseudo-term that stands for the phrase, so a phrase query becomes a one-term lookup. A batch ends on a document boundary, and each document's id token gets hash 0, so a check never runs into the next document.
 

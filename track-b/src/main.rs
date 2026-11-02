@@ -19,7 +19,7 @@
 //!
 //! Threads. One worker per CPU, started as a tree (`spawn_tree`), all running `Run::work`:
 //! parse a share of `queries.txt` and intern its terms into the shared bucket table, sample
-//! 6 claims, plan anchors and bitmaps, then for each phase scan its 512 KiB claims, build
+//! 3 claims, plan anchors and bitmaps, then for each phase scan its 1 MiB claims, build
 //! its postings shard by shard (zeroing a slice of the idle bitmaps), and answer it. The
 //! answers of phase k - 1 run on whichever threads have run out of scan claims in phase k,
 //! so no thread waits for the slowest scanner. Work is shared through atomic job counters,
@@ -45,9 +45,9 @@ extern "C" {
 const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 
 const HUGE_PAGE: usize = 1 << 21;
-const CLAIM: usize = 1 << 19;
+const CLAIM: usize = 1 << 20;
 // 50 MiB of text between turning rows into postings.
-const PHASE_CLAIMS: usize = 100;
+const PHASE_CLAIMS: usize = 50;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
@@ -964,8 +964,8 @@ impl Run {
         self.shares[id].set(self.parse_share(id)).ok();
         self.barrier();
         // Threads that wake late find fewer claims left, instead of delaying everyone.
-        // 6 claims are read to choose the terms that get bitmaps.
-        self.each_job(&self.setup[0], 6, |claim| {
+        // 3 claims are read to choose the terms that get bitmaps.
+        self.each_job(&self.setup[0], 3, |claim| {
             self.setup[4].fetch_add(self.index_claim::<true>(claim, &mut buffers), Relaxed);
         });
         let terms = self.term_count.load(Relaxed);
