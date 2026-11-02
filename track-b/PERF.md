@@ -120,3 +120,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Kept (2026-11-02, tools/wt_b51): SIMD left-pack of token actions.** The lookup loop stores one action per token, then packs hits 8 at a time with `permutevar8x32` and a 256-entry table, replacing three unconditional stores per token. Four paired sets: 12 CPUs best -0.6 to -3.7%, median -2.2 to -7.0%; cpuset 0-5 best -5.2 to -6.7%, median -1.9 to -7.7%. Hash f86973c21022, worked and mixed pass. Box `run-8e9b84007bcc` 89.8 ms, 42.6 MB, S 1073, 78.90 against 94.3 ms, S 1004, 78.58. Faults counted, about 16.8k, nearly all first touches of the 41 MiB peak plus the text mapping; no cheap cut.
 
 **Tried (2026-11-02, tools/wt_b52):** keeping one AES half in `hash_pair` tied in 6 rounds and was dropped. Removing the heavy-row bit loop showed no measurable ceiling. PACK table replaced by `pext` of `pdep`, 14 lines fewer: 12 CPUs one set better, one worse, so box test.
+
+**Not kept (2026-11-02): the pext table above.** Box `run-ae450ddf8737` 91.4 ms, S 1063, 78.74 and `run-5b6c766f9709` 90.8 ms, 78.80, against 78.90 and 78.66 for the table: a tie. Code back at 4eeb9d1, the best score.
