@@ -2,7 +2,7 @@
 
 ## Where it ended
 
-Best board run: `run-478de8bfb446`, commit 85ae7b3. T 18.7 ms, M 16.3 MB, S 370, 86.17 points. Repeat runs of the same code landed between 85.7 and 86.2, so the last decimal is noise. From the first Rust version: 72.8 ms to 18.7, 63.8 MB to 16.3, 67.83 to 86.17 points.
+Best board run: `run-87eb73a4553d` (18.8 ms, 15.9 MB, S 370, 86.20 points); the Track A code is unchanged since commit 85ae7b3, and repeat runs of it land between 85.7 and 86.2, so the last decimal is noise (the earlier `run-478de8bfb446` on the same code read 18.7 ms, 16.3 MB, 86.17). From the first Rust version: 72.8 ms to 18.8, 63.8 MB to 15.9, 67.83 to 86.20 points.
 
 Three lessons:
 
@@ -94,7 +94,7 @@ Line cut on the streaming code (2026-11-01): rustfmt S 363 -> 346, text and plac
 
 ## Best run
 
-`run-478de8bfb446` (commit 85ae7b3, the code in `src`): 18.7 ms, 16.3 MB, S 370, 86.17 points. Later pushes to this track changed only comments, notes or reverted code.
+`run-87eb73a4553d` (the code in `src`, unchanged since commit 85ae7b3): 18.8 ms, 15.9 MB, S 370, 86.20 points. The earlier `run-478de8bfb446` on the same code read 18.7 ms, 16.3 MB, 86.17. Later pushes to this track changed only comments, notes or reverted code.
 
 Failed: sealing hours by timestamp; ceiling about 0.2 ms by measurement, hour 71 cannot seal before EOF.
 
