@@ -105,12 +105,12 @@ struct Term {
     in_bool: bool,
 }
 
-/// A phrase, the hashes of its words, and the tally of its query, which the scan fills in.
+/// A phrase, the hashes of its words, and the pseudo-term holding its matches.
 struct Phrase {
-    tally: *mut Tally,
-    len: u8,
-    pivot: u8, // which word is the anchor, chosen from the sample
-    next: u32, // the next phrase with the same anchor, + 1
+    term: u32,
+    len: u32,
+    pivot: u32, // which word is the anchor, chosen from the sample
+    next: u32,  // the next phrase with the same anchor, + 1
     words: [u64; MAX_WORDS],
 }
 
@@ -143,7 +143,6 @@ struct Tally {
     count: u32,
     sum: u64,
     first: [u32; TALLY_IDS], // the smallest ids, filled from the first phases on
-    lock: AtomicU32,         // a phrase's tally is updated by the scan, on any thread
 }
 
 impl Tally {
@@ -214,23 +213,6 @@ impl Tally {
                     .map(move |bit| index as u32 * 64 + bit)
             });
         self.add(base, count, sum, ids);
-    }
-
-    /// Adds a document found by the scan. Documents come in any order, so the ten smallest are
-    /// kept sorted by insertion.
-    fn add_found(&mut self, doc: u32) {
-        while self.lock.swap(1, Acquire) != 0 {
-            std::hint::spin_loop();
-        }
-        let held = (self.count as usize).min(TALLY_IDS);
-        let at = self.first[..held].partition_point(|&id| id < doc);
-        if at < TALLY_IDS {
-            self.first.copy_within(at..held.min(TALLY_IDS - 1), at + 1);
-            self.first[at] = doc;
-        }
-        self.count += 1;
-        self.sum += doc as u64;
-        self.lock.store(0, Release);
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -542,16 +524,11 @@ impl Run {
                 let mut t = from;
                 while t < to {
                     let v = _mm256_loadu_si256(acts.add(t).cast());
-                    let valid = if to - t >= 8 {
-                        255
-                    } else {
-                        (1u32 << (to - t)) - 1
-                    };
+                    let valid = if to - t >= 8 { 255 } else { (1u32 << (to - t)) - 1 };
                     let heavy = _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 & valid;
-                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
-                        v,
-                        _mm256_setzero_si256(),
-                    ))) as u32
+                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(
+                        _mm256_cmpgt_epi32(v, _mm256_setzero_si256()),
+                    )) as u32
                         & valid;
                     let pick = |mask: u32| {
                         _mm256_cvtepu8_epi32(_mm_loadl_epi64(PACK[mask as usize].as_ptr().cast()))
@@ -603,27 +580,17 @@ impl Run {
                 let token = hit as usize & ((1 << 20) - 1);
                 let mut next = (*self.terms.add((hit >> 40) as usize - 1)).phrases;
                 while next != 0 {
-                    let index = next as u64 - 1;
-                    let phrase = &*self.phrases.add(index as usize);
+                    let phrase = &*self.phrases.add(next as usize - 1);
                     next = phrase.next;
                     let (len, pivot) = (phrase.len as usize, phrase.pivot as usize);
                     if token >= pivot
                         && token - pivot + len <= ready
                         && b.hashes[token - pivot..token - pivot + len] == phrase.words[..len]
                     {
-                        b.list_hits[phrase_count] = index << 32 | (hit >> 20 & ((1 << 20) - 1));
+                        b.list_hits[phrase_count] =
+                            (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
                         phrase_count += 1;
                     }
-                }
-            }
-            // A phrase query is answered by the scan itself: it has few matches in all, so its
-            // tally is filled in as they are found. A phrase that matches twice in a document
-            // counts once, and sorting puts such repeats next to each other.
-            let found = &mut b.list_hits[..phrase_count];
-            found.sort_unstable();
-            for (i, &hit) in found.iter().enumerate() {
-                if i == 0 || hit != found[i - 1] {
-                    (*(*self.phrases.add((hit >> 32) as usize)).tally).add_found(hit as u32);
                 }
             }
             if !SAMPLE {
@@ -668,6 +635,9 @@ impl Run {
                     emit((action as u64) << 32 | doc);
                 }
                 from = to;
+            }
+            for &hit in &b.list_hits[..phrase_count] {
+                emit(hit);
             }
             // A newline left over belongs to a document whose id comes in the next batch.
             b.lines[0] = 0;
@@ -759,7 +729,7 @@ impl Run {
                 .min_by_key(|&(_, term)| self.sample[term].load(Relaxed))
                 .unwrap();
             let anchor = &mut (*self.terms.add(term)).phrases;
-            phrase.pivot = pivot as u8;
+            phrase.pivot = pivot as u32;
             phrase.next = AtomicU32::from_ptr(anchor).swap(index as u32 + 1, Relaxed);
         }
     }
@@ -906,10 +876,6 @@ impl Run {
             prefetch(index + 2, false);
             prefetch(index + 1, true);
             let steps = steps_of(index);
-            // A phrase has no steps: the scan has filled in its tally.
-            if steps.is_empty() {
-                continue;
-            }
             let tally = &mut *tallies.add(index);
             match self.answer_bool(steps, phase, scratch) {
                 Set::List(list) => tally.add_list(base, list),
@@ -937,8 +903,6 @@ impl Run {
                 .map_or(size, |n| at + n),
         };
         let (mut parsed, mut ids, mut op) = (Parsed::default(), 0..0, Op::And);
-        // A query takes at least 7 bytes; only the pages that are touched cost memory.
-        let tallies = space::<Tally>((start(k + 1) - start(k)) / 7 + 1);
         for line in self.queries[start(k)..start(k + 1)].split(|&c| c == b'\n') {
             // A share ends with a newline, so its last piece is empty.
             if line.is_empty() {
@@ -967,17 +931,15 @@ impl Run {
                 }
             }
             if phrase {
+                let term = new_id(self, &mut ids);
+                parsed.steps.push((Op::And, term));
                 // Fresh pages are zeros, which are the unplanned `pivot` and `next`.
                 let slot = &mut *self.phrases.add(self.setup[5].fetch_add(1, Relaxed));
-                (slot.tally, slot.len, slot.words) = (
-                    tallies.as_mut_ptr().add(parsed.queries.len()),
-                    count as u8,
-                    words,
-                );
+                (slot.term, slot.len, slot.words) = (term, count as u32, words);
             }
             parsed.queries.push(first..parsed.steps.len());
         }
-        parsed.tallies = tallies;
+        parsed.tallies = space(parsed.queries.len());
         parsed
     }
 
