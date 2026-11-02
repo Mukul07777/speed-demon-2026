@@ -114,3 +114,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Not kept (2026-11-02): shards own 32-id blocks to stop false sharing of `Term` lines.** Laptop tie; box `run-a2c126a86f56` 94.4 ms, 78.56 and `run-a50b6666fcdb` 101.2 ms, 77.80, S 1007, inside unchanged code's range. Candidate in tools/wt_b31_f.
 
 **Not kept (2026-11-02, tools/wt_b32): job-completion waits instead of the three pre-scan barriers.** Ceiling about 2 ms (pre-scan is 10.2 ms; thread-start stagger and the parse barrier are untouched). Paired medians 80.5 against 91.4 and 81.8 against 82.3 ms, tie. Hash correct, not pushed.
+
+**No lead (2026-11-02, tools/wt_b40).** Scan is uop-bound under SMT, so only fewer uops/token help. Every countable cut is 1-2%, under ~3% noise: phrase-anchor removal 0% wall, lookup-loop re-encoding 1-2%, tokenise single-transition stream ~1.5%. Compiler target-cpu haswell tie, skylake worse (hash identical). Closing 67 ms needs a 20%+ per-token change; only candidate (exact-key short tokens) already measured worse at wt_b23. No candidate built.
