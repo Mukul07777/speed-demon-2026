@@ -50,7 +50,7 @@ const MAX_RECORDS: usize = 32 * 64 / 11 + 5;
 // id, amount and region.
 // Quote masks kept for the rank query, more than one batch.
 const QUOTE_WORDS: usize = 1 << 10;
-const BUCKETS: usize = 1 << 14;
+const BUCKETS: usize = 1 << 15;
 // A name's dense number has 17 bits; the generator draws from 100,000 names.
 const NUMBER_BITS: i32 = 17;
 const NAME_MASK: u64 = (1 << NUMBER_BITS) - 1;
@@ -155,7 +155,7 @@ fn take_block(counter: &AtomicUsize, size: usize, len: usize) -> Option<usize> {
 impl Run {
     /// The number of a name, new if this is its first appearance.
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let index = (hash >> 50) as usize;
+        let index = (hash >> 49) as usize;
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
@@ -214,7 +214,7 @@ impl Run {
         // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
         // it while the regions load. It must end before huge pages are disabled.
         let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
-        if page < size_of::<Tables>() {
+        if page < 2 * HUGE_PAGE {
             (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
         // Region claims are 64 KiB. Each starts after the first LF at or past its start, so the
@@ -339,7 +339,7 @@ impl Run {
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     // The top 14 bits of the hash pick the bucket.
-                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 50) as usize].as_ptr().cast());
+                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
                     // Ids past the table share its last entry, which stays 0: unmatched.
                     let region = (numbers[2][at] as usize).min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
@@ -408,7 +408,7 @@ unsafe fn map(name: &str) -> &'static [u8] {
 unsafe fn zeroed<T>() -> &'static T {
     let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
     let aligned = region.add(region.align_offset(HUGE_PAGE));
-    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
+    madvise(aligned, 2 * HUGE_PAGE, 14); // MADV_HUGEPAGE
     &*aligned.cast()
 }
 
