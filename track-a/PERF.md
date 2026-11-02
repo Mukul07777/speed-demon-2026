@@ -119,3 +119,4 @@ Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 Mi
 **Kept (2026-11-02, tools/wt_a53, wt_a54): line cut 362 to 341.** `read` helper removed, `names` and `order` under one mutex, `work` folded into `parse`, `solve` an `unsafe fn`, three constants inlined, `name_hash` xors four lanes (same value); hot loops, `#[inline(always)]` and the id assert kept. Laptop tie on both settings; hash, worked example, empty file and 10 adversarial files pass. Box `run-3aa6add9ab79` 19.0 ms, 15.9 MB, S 341, 86.35, the best score.
 
 **Box test (2026-11-02, tools/wt_a55): S 341 to 334.** Four counters in one array, main thread only joins. Laptop tie; hash, worked, empty and adversarial pass. First run `run-f9ce2e1411b3` 19.3 ms, 86.07 in a slow round (B 92.3 ms).
+Second run `run-fcfb1dbe094f` 19.9 ms, 85.94. Two runs below 86.35 at 19.0 ms: not kept, likely the idle main thread. Code back at cdd7a88.
