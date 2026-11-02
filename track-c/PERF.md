@@ -106,3 +106,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Box test (2026-11-02): 2^15 buckets with the matrix's last 1 MiB on small pages.** Two samples of 2^14 buckets ran 23.8 ms. This variant: laptop tie, 25 rounds 20.8/22.7 -> 20.5/23.3 ms; box `run-0c2cae6bc60a` 22.5 ms, 10.5 MB, 82.36 in a round where A ran 10% slow.
 
 **Not kept (2026-11-02): the box test above.** Second sample `run-5812c71190cb` 22.4 ms, 10.5 MB, 82.38. Two runs each: 82.36, 82.38 against 82.47, 82.30 for 2^14 buckets, a tie: 1.4 ms won back, 1.5 MB lost. Code back at a27b66a, the best score.
+
+**Failed (box, 2026-11-02, tools/wt_c52): spill table for full buckets.** 214,188 lookups walked to a cold next bucket at 2^14 buckets (ceiling 1.4-1.8 ms). A 128 KB spill table replaced the walk: exact, laptop tie, but `run-1c23080414bf` 23.6 ms, 10.5 MB, S 299, 81.77. Reverted; the same a27b66a code later scored best, 24.0 ms, 82.54 (commit 9f9817b).

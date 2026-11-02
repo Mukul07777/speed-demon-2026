@@ -50,7 +50,6 @@ const HOURS: usize = 72; // the span is fixed for every seed: 2026-10-30T18 to 2
 const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
-const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
@@ -96,7 +95,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     }
     // Two more AES rounds (`vaesenc` does both 16-byte halves at once) mix far better than a
     // multiply, at about the same cost.
-    let key = _mm256_set1_epi64x(KEY as i64);
+    let key = _mm256_set1_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
     let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
         _mm256_castsi256_si128(mixed),
@@ -104,8 +103,6 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     ));
     (a ^ b) | 1 << ID_BITS
 }
-
-const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Run {
     input: *mut u8,
@@ -148,12 +145,12 @@ impl Run {
         loop {
             let slot = self.slots[i].load(Acquire);
             if slot >> ID_BITS == hash >> ID_BITS {
-                return (slot & ID_MASK) as usize - 1;
+                return (slot & ((1 << ID_BITS) - 1)) as usize - 1;
             } else if slot == 0 {
                 let mut names = self.names.lock().unwrap();
                 if self.slots[i].load(Acquire) == 0 {
                     let id = names.len();
-                    assert!(id < ID_MASK as usize); // id + 1 must fit the low bits of a slot
+                    assert!(id + 1 < 1 << ID_BITS); // id + 1 must fit the low bits of a slot
                     names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
                     self.slots[i].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
                     return id;
@@ -298,25 +295,23 @@ impl Run {
         }
         self.sealed.fetch_max(sealed, Release);
         let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
-        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
-            return;
-        };
-        // The names may have grown since the last hour was summarised.
-        let order = {
-            let names = self.names.lock().unwrap();
-            let mut order = self.order.lock().unwrap();
-            if order.len() != names.len() {
-                let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
-                sorted.sort_unstable();
-                *order = Arc::new(sorted);
-            }
-            order.clone()
-        };
-        let part = unsafe { self.summarise(hour, &order) };
-        self.texts[hour].set(part).unwrap();
-        // Whoever takes the lock after an hour's text is set sees it, so every hour is
-        // written exactly once, by the thread that finds it ready.
-        self.write_ready();
+        if let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) {
+            // The names may have grown since the last hour was summarised.
+            let order = {
+                let (names, mut order) = (self.names.lock().unwrap(), self.order.lock().unwrap());
+                if order.len() != names.len() {
+                    let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
+                    sorted.sort_unstable();
+                    *order = Arc::new(sorted);
+                }
+                order.clone()
+            };
+            let part = unsafe { self.summarise(hour, &order) };
+            self.texts[hour].set(part).unwrap();
+            // Whoever takes the lock after an hour's text is set sees it, so every hour is
+            // written exactly once, by the thread that finds it ready.
+            self.write_ready();
+        }
     }
 
     /// Sorts and summarises one hour, and returns its text. Everything lives in the hour's own
@@ -424,19 +419,17 @@ impl Run {
     /// matters: one thread writing 10 MB to tmpfs fell up to 2 ms behind the summaries.
     fn write_ready(&self) {
         let mut ready = Vec::new();
-        {
-            let mut placed = self.placed.lock().unwrap();
-            let (next, offset) = &mut *placed;
-            while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
-                ready.push((*next, *offset, *text));
-                (*next, *offset) = (*next + 1, *offset + text.len() as u64);
-            }
+        let mut placed = self.placed.lock().unwrap();
+        let (next, offset) = &mut *placed;
+        while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
+            ready.push((*next, *offset, *text));
+            (*next, *offset) = (*next + 1, *offset + text.len() as u64);
         }
+        drop(placed);
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back.
-            let rows = unsafe { self.rows.add(hour * self.stride) };
-            unsafe { madvise(rows.cast(), self.stride * 4, 4) };
+            unsafe { madvise(self.rows.add(hour * self.stride).cast(), self.stride * 4, 4) };
         }
     }
 
@@ -504,8 +497,8 @@ fn solve(early: bool) -> bool {
             (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
         // Hour areas are multiples of 2 MiB and the first starts on a 2 MiB boundary, so each
         // hour's pages share one page table instead of spilling into the next.
-        let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);
-        let rows = rows.map_addr(|a| a.next_multiple_of(2 << 20));
+        let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1)
+            .map_addr(|a| a.next_multiple_of(2 << 20));
         (input, rows.cast(), stride)
     };
 
@@ -529,9 +522,7 @@ fn solve(early: bool) -> bool {
         placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
-        }
+        (1..threads).for_each(|_| drop(s.spawn(|| run.work())));
         run.work();
     });
     run.dirty.load(Relaxed)
