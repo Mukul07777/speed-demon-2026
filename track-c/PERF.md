@@ -94,3 +94,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Not pushed (2026-11-02): setup pre-fault (tools/wt_c30).** Removal probes, 12 CPUs, best ms: process and map 1.2, spawn tree 1.9, huge page zero 2.4, regions and barrier 3.1. `MAP_POPULATE` of regions ties in the setup probe (3.10 against 3.06), `MADV_POPULATE_WRITE` of the region table is worse (3.53). Ceiling under 2%.
 
 **Not pushed (2026-11-02): guided tail claims (16 MiB at 256 KiB, tools/wt_c31/v/g16_4.rs).** Worker end spread 0.6-1.1 ms, ceiling about 0.5 ms (2%); paired 25 and 40 rounds within noise, order flips the sign.
+
+**Failed at counting (2026-11-02, tools/wt_c32).** Removal probes, median ms, 12 CPUs then 6: base 21.4 / 27.2, no lookup 20.1 / 24.2, no matrix update 17.7 / 21.3, plain or instead of locked 21.0 / 23.4, field floor 16.2 / 18.4. Lock-free matrix with verify has no airtight proof; owner staging costs 13 MB; fused name entry costs 2 MiB and 40 lines. No design clears 5%.
