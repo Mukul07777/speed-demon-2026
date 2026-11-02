@@ -51,6 +51,8 @@ const MAX_RECORDS: usize = 32 * 64 / 11 + 5;
 // Quote masks kept for the rank query, more than one batch.
 const QUOTE_WORDS: usize = 1 << 10;
 const BUCKETS: usize = 1 << 14;
+// Slots of the table for names whose bucket is full.
+const SPILL: usize = 1 << 14;
 // A name's dense number has 17 bits; the generator draws from 100,000 names.
 const NUMBER_BITS: i32 = 17;
 const NAME_MASK: u64 = (1 << NUMBER_BITS) - 1;
@@ -68,6 +70,7 @@ const BIAS: i64 = 1 << 40;
 // Counters that hand out work: region claims, record claims, huge pages to zero, name numbers.
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 // Region id to group, and country code (as base-26 digits) to group. Both start zeroed.
+static SPILLED: [AtomicU64; SPILL] = [const { AtomicU64::new(0) }; SPILL];
 static REGION_GROUP: [AtomicU8; REGION_IDS + 1] = [const { AtomicU8::new(0) }; REGION_IDS + 1];
 static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
 // The sums of all workers, in groups. A group's slots, for a worker and for these totals alike:
@@ -166,26 +169,29 @@ impl Run {
         });
         let found = low | high << 4;
         if found == 0 {
-            return self.insert(index, tag, spare);
+            return self.insert(hash, spare);
         }
         (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
     }
 
-    /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
-    /// whose bucket is full and spills into the next. A compare-and-swap decides each slot, so
-    /// no lock is needed. A worker that loses a race to the same name wastes one number.
+    /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the 7% of
+    /// names whose bucket is full. Those go to a small table that stays in cache, instead of to
+    /// the next bucket, which would be a miss on every lookup. A compare-and-swap decides each
+    /// slot, so no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
-    unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
+    unsafe fn insert(&self, hash: u64, spare: &mut Range<usize>) -> usize {
         if spare.is_empty() {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
             assert!(first + 32 <= SEEN_WORDS * 64);
             *spare = first..first + 32;
         }
+        let tag = hash & (1 << 47) - 1 | 1;
         let claimed = tag << NUMBER_BITS | spare.start as u64;
-        // From the bucket's first slot to the end of the table, and round again if need be.
-        let slots = self.2 .0.as_flattened();
-        for slot in slots[index * 8..].iter().chain(slots) {
+        // A full bucket stays full, so a name past it is only ever in the spill table.
+        let bucket = &self.2 .0[(hash >> 50) as usize];
+        let spill = (0..SPILL).cycle().skip((hash >> 3) as usize % SPILL);
+        for slot in bucket.iter().chain(spill.map(|i| &SPILLED[i])) {
             // Read first: a compare-and-swap on a taken slot would only pull its line away from
             // the other cores.
             match slot.load(Relaxed) {
