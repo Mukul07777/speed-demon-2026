@@ -35,12 +35,7 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
-// MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-const MAP_ANON: i32 = 0x4022;
-
-const HUGE_PAGE: usize = 1 << 21;
 // Structural bytes per record: four commas and an LF.
-const FIELDS: usize = 5;
 // A batch is 32 steps of 64 bytes of the file. Records that fit in one (the shortest is
 // `1,,,1,0.00` and an LF, 11 bytes), two more that were left over from the one before, and three
 // for the digit arrays, which are decoded four at a time and so may be read up to three past the
@@ -49,13 +44,8 @@ const MAX_RECORDS: usize = 32 * 64 / 11 + 5;
 // The three numbers of a record that wait for `decode_digits` are kept in a batch's arrays 0 to 2:
 // id, amount and region.
 // Quote masks kept for the rank query, more than one batch.
-const QUOTE_WORDS: usize = 1 << 10;
-const BUCKETS: usize = 1 << 14;
 // A name's dense number has 17 bits; the generator draws from 100,000 names.
-const NUMBER_BITS: i32 = 17;
-const NAME_MASK: u64 = (1 << NUMBER_BITS) - 1;
 // Lookup ids stay below this; anything above is unmatched.
-const REGION_IDS: usize = 1_000_000;
 // 240 countries (fixed by the spec), with index 0 for unmatched
 const GROUPS: usize = 241;
 // Words of one group's row of the name bit matrix: 104,320 name numbers, for the 100,000 names
@@ -68,7 +58,7 @@ const BIAS: i64 = 1 << 40;
 // Counters that hand out work: region claims, record claims, huge pages to zero, name numbers.
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 // Region id to group, and country code (as base-26 digits) to group. Both start zeroed.
-static REGION_GROUP: [AtomicU8; REGION_IDS + 1] = [const { AtomicU8::new(0) }; REGION_IDS + 1];
+static REGION_GROUP: [AtomicU8; 1_000_001] = [const { AtomicU8::new(0) }; 1_000_001];
 static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
 // The sums of all workers, in groups. A group's slots, for a worker and for these totals alike:
 // 0 count, 1 id sum, 2 amount sum, 3 name bytes in the low half and note bytes in the high half
@@ -84,12 +74,13 @@ static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// tag above the name's dense number, so one compare-and-swap claims a slot with its number.
 /// Numbers keep the bit matrix small.
 /// 1: the name bit matrix, `SEEN_WORDS` words per group.
-#[repr(C)]
-struct Tables([[AtomicU64; 8]; BUCKETS], [AtomicU64; GROUPS * SEEN_WORDS]);
+#[repr(C, align(2097152))]
+struct Tables([[AtomicU64; 8]; 1 << 14], [AtomicU64; GROUPS * SEEN_WORDS]);
+static T: Tables = unsafe { std::mem::zeroed() };
 
-/// What the workers share: 0 the records file, 1 the regions file, 2 the tables, 3 the barrier
-/// after the regions are loaded.
-struct Run(&'static [u8], &'static [u8], &'static Tables, Barrier);
+/// What the workers share: 0 the records file, 1 the regions file, 2 the barrier after the
+/// regions are loaded.
+struct Run(&'static [u8], &'static [u8], Barrier);
 
 unsafe fn load(p: *const u8) -> __m256i {
     _mm256_loadu_si256(p.cast())
@@ -102,8 +93,8 @@ unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
 /// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
 /// Shifting them to the top makes the bytes below read as leading zeros.
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
-    (read_unaligned(end.sub(8).cast::<u64>()) ^ 0x3030_3030_3030_3030) >> (64 - 8 * len)
-        << (64 - 8 * len)
+    let shift = 64 - 8 * len;
+    (read_unaligned(end.sub(8).cast::<u64>()) ^ 0x3030_3030_3030_3030) >> shift << shift
 }
 
 /// Turns the first `count` words of eight digit bytes each into numbers, four at a time, like
@@ -157,18 +148,18 @@ impl Run {
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
         let index = (hash >> 50) as usize;
         let tag = hash & (1 << 47) - 1 | 1;
-        let bucket = &self.2 .0[index];
+        let bucket = &T.0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
         let [low, high] = [0, 1].map(|half| {
             let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
-            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
+            let slots = _mm256_srli_epi64::<17>(slots);
             _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
         });
         let found = low | high << 4;
         if found == 0 {
             return self.insert(index, tag, spare);
         }
-        (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
+        (bucket[found.trailing_zeros() as usize].load(Relaxed) & (1 << 17) - 1) as usize
     }
 
     /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
@@ -182,24 +173,22 @@ impl Run {
             assert!(first + 32 <= SEEN_WORDS * 64);
             *spare = first..first + 32;
         }
-        let claimed = tag << NUMBER_BITS | spare.start as u64;
+        let claimed = tag << 17 | spare.start as u64;
         // From the bucket's first slot to the end of the table, and round again if need be.
-        let slots = self.2 .0.as_flattened();
-        for slot in slots[index * 8..].iter().chain(slots) {
+        let slots = T.0.as_flattened();
+        slots[index * 8..].iter().chain(slots).find_map(|slot| {
             // Read first: a compare-and-swap on a taken slot would only pull its line away from
-            // the other cores.
-            match slot.load(Relaxed) {
-                // On failure the slot holds another name, or this one if a worker just added it.
-                0 => match slot.compare_exchange(0, claimed, Relaxed, Relaxed) {
-                    Ok(_) => return spare.next().unwrap(),
-                    Err(held) if held >> NUMBER_BITS == tag => return (held & NAME_MASK) as usize,
-                    Err(_) => {}
-                },
-                held if held >> NUMBER_BITS == tag => return (held & NAME_MASK) as usize,
-                _ => {}
+            // the other cores. On failure the slot holds another name, or this one if a worker
+            // just added it.
+            let mut held = slot.load(Relaxed);
+            if held == 0 {
+                held = match slot.compare_exchange(0, claimed, Relaxed, Relaxed) {
+                    Ok(_) => return Some(spare.next().unwrap()),
+                    Err(now) => now,
+                };
             }
-        }
-        unreachable!()
+            (held >> 17 == tag).then_some((held & (1 << 17) - 1) as usize)
+        }).unwrap()
     }
 
     /// One worker's whole life. It starts `descendants` more workers as a tree, so that no thread
@@ -213,9 +202,9 @@ impl Run {
         }
         // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
         // it while the regions load. It must end before huge pages are disabled.
-        let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
+        let page = NEXT[2].fetch_add(1, Relaxed) << 21;
         if page < size_of::<Tables>() {
-            (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
+            (*(&T as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
         // Region claims are 64 KiB. Each starts after the first LF at or past its start, so the
         // header goes to nobody and a line belongs to the claim holding the LF before it.
@@ -241,21 +230,18 @@ impl Run {
                 line += at + 5;
             }
         }
-        self.3.wait();
+        self.2.wait();
         // Records follow. PR_SET_THP_DISABLE is
         // idempotent, and set before the worker allocates anything for them.
         prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
-        let mut stats = [[0i64; 8]; GROUPS];
-        let mut pos = [0u32; MAX_RECORDS * FIELDS];
+        let (mut stats, mut pos) = ([[0i64; 8]; GROUPS], [0u32; MAX_RECORDS * 5]);
         // Each 64-byte step's quote mask, and the number of quote bytes before the step.
-        let mut quotes = [(0u64, 0u32); QUOTE_WORDS];
         // Per record between the passes: the name's hash (later the address of its bit), the name
         // and note lengths (`lengths` in the totals), and -1 for a negative amount, else 0.
         let [mut hashes, mut lengths] = [[0u64; MAX_RECORDS]; 2];
-        let mut signs = [0i64; MAX_RECORDS];
-        let mut spare = 0..0; // name numbers this worker reserved
-        let mut digits = [[0u64; MAX_RECORDS]; 3];
+        let (mut signs, mut spare) = ([0i64; MAX_RECORDS], 0..0); // spare: reserved name numbers
+        let (mut digits, mut quotes) = ([[0u64; MAX_RECORDS]; 3], [(0u64, 0u32); 1024]);
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
         while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
             // Claims are 1 MiB.
@@ -281,7 +267,7 @@ impl Run {
                     // All ones if the step ended inside quotes: the next step starts inverted.
                     inside = ((inside_now as i64) >> 63) as u64;
                     let mut bits = (comma | newline) & !inside_now;
-                    quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
+                    quotes[(at - origin) / 64 % 1024] = (quote, quote_total);
                     quote_total += quote.count_ones();
                     // Unconditional stores, so that a varying count needs no loop exit to
                     // predict. Eight cover almost every step.
@@ -297,18 +283,18 @@ impl Run {
                 }
 
                 let quotes_up_to = |position: usize| {
-                    let (quote, before) = quotes[(position - origin) / 64 % QUOTE_WORDS];
+                    let (quote, before) = quotes[(position - origin) / 64 % 1024];
                     let below = _bzhi_u64(quote, ((position - origin) % 64) as u32);
                     before.wrapping_add(below.count_ones())
                 };
                 let field = |at: usize| {
-                    let five = pos.as_ptr().add(at * FIELDS).cast::<[u32; FIELDS]>();
+                    let five = pos.as_ptr().add(at * 5).cast::<[u32; 5]>();
                     (*five).map(|p| p as usize)
                 };
                 // Pass A: how many records start inside this claim, and their numbers.
                 let mut count = 0;
                 let mut start = record;
-                while count < filled / FIELDS && start < end {
+                while count < filled / 5 && start < end {
                     let [comma1, _, comma3, comma4, newline] = field(count);
                     // Only the file's first record can start with a BOM, three bytes before its id.
                     let bom = (*input.add(start) == 0xEF) as usize * 3;
@@ -339,9 +325,9 @@ impl Run {
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     // The top 14 bits of the hash pick the bucket.
-                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 50) as usize].as_ptr().cast());
+                    _mm_prefetch::<_MM_HINT_T0>(T.0[(hash >> 50) as usize].as_ptr().cast());
                     // Ids past the table share its last entry, which stays 0: unmatched.
-                    let region = (numbers[2][at] as usize).min(REGION_IDS);
+                    let region = (numbers[2][at] as usize).min(1_000_000);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
                     numbers[2][at] = region as u32;
                     hashes[at] = hash;
@@ -364,17 +350,17 @@ impl Run {
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
                     let word = group * SEEN_WORDS + name / 64;
-                    _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
+                    _mm_prefetch::<_MM_HINT_ET0>(T.1.as_ptr().add(word).cast());
                     // The hash is done with, so its slot carries the bit's address to the next pass.
                     hashes[at] = (word << 6 | name % 64) as u64;
                 }
                 for &bit in &hashes[..count] {
-                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
+                    let word = T.1.get_unchecked((bit >> 6) as usize);
                     word.fetch_or(1 << (bit & 63), Relaxed);
                 }
 
-                pos.copy_within(count * FIELDS..filled, 0);
-                filled -= count * FIELDS;
+                pos.copy_within(count * 5..filled, 0);
+                filled -= count * 5;
             }
             // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
             // ~50,000 page-table entries on one thread at exit, which the timer includes. A
@@ -384,10 +370,9 @@ impl Run {
             madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
         let mut totals = TOTALS.lock().unwrap();
-        for (total, part) in totals.iter_mut().zip(&stats) {
-            for (i, (a, &b)) in total.iter_mut().zip(part).enumerate() {
-                *a = if i < 4 { *a + b } else { (*a).max(b) };
-            }
+        let all = totals.as_flattened_mut().iter_mut().zip(stats.as_flattened());
+        for (i, (a, &b)) in all.enumerate() {
+            *a = if i % 8 < 4 { *a + b } else { (*a).max(b) };
         }
     }
 }
@@ -395,44 +380,37 @@ impl Run {
 /// Maps a file for reading, with a spare zero page after it so wide loads may run past the end.
 unsafe fn map(name: &str) -> &'static [u8] {
     let file = File::open(format!("/data/{name}.csv")).unwrap();
-    let (fd, len) = (file.as_raw_fd(), file.metadata().unwrap().len() as usize);
-    let size = len.next_multiple_of(4096) + 4096;
-    let base = mmap(null_mut(), size, 1, MAP_ANON, -1, 0); // PROT_READ
-    mmap(base, len, 1, 0x12, fd, 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
+    let len = file.metadata().unwrap().len() as usize;
+    // PROT_READ, flags MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE; two spare pages
+    let base = mmap(null_mut(), len + 8192, 1, 0x4022, -1, 0);
+    mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
     slice::from_raw_parts(base, len)
-}
-
-/// A zeroed table of whole huge pages, which must start on a huge page boundary to get any. Its
-/// pages are touched later by the workers, because huge pages are disabled for everything else
-/// before the records start.
-unsafe fn zeroed<T>() -> &'static T {
-    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
-    let aligned = region.add(region.align_offset(HUGE_PAGE));
-    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
-    &*aligned.cast()
 }
 
 fn main() {
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
-    let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };
+    // MADV_HUGEPAGE on the tables, which are two aligned huge pages. The workers touch them
+    // later, because huge pages are disabled for everything else before the records start.
+    unsafe { madvise(&T as *const Tables as *mut u8, size_of::<Tables>(), 14) };
+    let run = unsafe { Run(map("records"), map("regions"), Barrier::new(n)) };
     thread::scope(|s| unsafe { run.start(s, n - 1) });
-
-    let totals = TOTALS.lock().unwrap();
     // `_UNMATCHED` sorts after every country code.
+    let totals = TOTALS.lock().unwrap();
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
     let mut out = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
+        let row = &T.1[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
         // Cents as text. A double holds any total of cents to well within half a cent.
         let [sum, min, max] =
             [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
         let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];
         if count > 0 {
-            out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n");
+            out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}
+");
         }
     }
     std::fs::write("/out/aggregates.txt", out).unwrap();
