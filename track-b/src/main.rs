@@ -570,12 +570,12 @@ impl Run {
                     b.counts[term as usize] += 1;
                     continue;
                 }
-                let shard = term as usize & (SHARDS - 1);
+                let shard = (term as usize >> 5) & (SHARDS - 1);
                 let cursor = cursors.get_unchecked_mut(shard);
                 if cursor.0 == cursor.1 {
                     *cursor = self.claim_chunk(shard, claim);
                 }
-                *cursor.0 = ((term >> SHARDS.trailing_zeros()) + 1) << DOC_BITS | hit as u32;
+                *cursor.0 = ((term >> 11 << 5 | term & 31) + 1) << DOC_BITS | hit as u32;
                 cursor.0 = cursor.0.add(1);
             }
             // A newline left over belongs to a document whose id comes in the next batch.
@@ -714,9 +714,9 @@ impl Run {
             .collect();
         chunks.sort_unstable();
         let term_count = self.term_count.load(Relaxed);
-        let terms = term_count.div_ceil(SHARDS) + 1;
+        let terms = term_count.div_ceil(2048) * 32 + 1;
         // Lists belong to one phase: last phase's are gone.
-        for id in (shard..term_count).step_by(SHARDS) {
+        for id in (shard * 32..term_count).step_by(2048).flat_map(|b| b..b + 32) {
             (*self.terms.add(id)).count = 0;
         }
         let mut cursors = vec![0u32; terms];
@@ -743,7 +743,7 @@ impl Run {
             *cursor += (*slot.sub(1) != *slot) as u32;
         });
         for low in (0..terms).filter(|&low| firsts[low] > 0) {
-            let info = &mut *self.terms.add(low * SHARDS + shard);
+            let info = &mut *self.terms.add((low >> 5 << 11) + (shard << 5) + (low & 31));
             info.first = firsts[low] - HEADER as u32;
             info.count = cursors[low] - firsts[low];
         }

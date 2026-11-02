@@ -105,3 +105,5 @@ Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 Mi
 **Failed (box test, 2026-11-01): name sort outside the lock.** Laptop mixed (12 CPUs lost, 6 CPUs median -8%). Board `run-128bfe97d2c8` 23.4 ms, 17.8 MB, 83.31. Reverted.
 
 **Failed (box test, 2026-11-01): `-align-loops=32`.** Test of whether code layout explains box swings. Run on 87ea886 inside the usual range of unchanged code; one sample. Reverted.
+
+**Not built (2026-11-02): thread-start stagger.** Spawn and start spread leave about 0.4 ms idle, about half recoverable with raw thread creation for 30 lines; ceiling about 1%. Slow claims of 2-9 ms have CPU equal to wall or blocked time, so they are kernel or VM stalls, not claim size.
