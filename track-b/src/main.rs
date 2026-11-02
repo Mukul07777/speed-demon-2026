@@ -89,7 +89,10 @@ struct Buffers {
     heavy_hits: &'static mut [u32], // the bitmap index of each heavy token, with the HEAVY flag
     heavy_ends: &'static mut [u32], // per line, how many heavy hits end with it
     group: &'static mut [u64],      // the heavy terms of 64 documents, one row of bits each
-    list_hits: &'static mut [u64],  // action << 32 | document
+    list_hits: &'static mut [u64],  // phrase matches: action << 32 | document
+    acts: &'static mut [u32],       // the action of every token of a batch
+    list_acts: &'static mut [u32],  // the list actions, packed
+    list_ends: &'static mut [u32],  // per line, how many list actions end with it
     anchor_hits: &'static mut [u64], // term + 1 << 40 | document << 20 | token (the shift drops the action's flags)
     counts: &'static mut [u32],      // in the sample, how often each term occurs
 }
@@ -300,6 +303,24 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 /// check on each byte.
 const KEY: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 
+/// For each 8-bit mask, the positions of its set bits in order, for a left-pack with permute.
+static PACK: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut mask = 0;
+    while mask < 256 {
+        let (mut lane, mut n) = (0, 0);
+        while lane < 8 {
+            if mask >> lane & 1 == 1 {
+                table[mask][n] = lane as u8;
+                n += 1;
+            }
+            lane += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
 /// A load from `MASKS` at `16 - len` is ones for the first `len` bytes and zeros after.
 static MASKS: [[u8; 16]; 2] = [[255; 16], [0; 16]];
 
@@ -487,31 +508,58 @@ impl Run {
             }
             let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
             let batch_doc = doc;
-            // Local copies of the pointers: through `self` and `b` the compiler reloads them
-            // after every store, as a store might have changed them.
             let buckets = self.buckets;
-            let (heavy_hits, list_hits) = (b.heavy_hits.as_mut_ptr(), b.list_hits.as_mut_ptr());
+            let (heavy_hits, list_acts) = (b.heavy_hits.as_mut_ptr(), b.list_acts.as_mut_ptr());
+            let acts = b.acts.as_mut_ptr();
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
-                while token < to {
-                    let ahead = bucket_of(*hashes.add(token + AHEAD));
+                let from = token;
+                for t in from..to {
+                    let ahead = bucket_of(*hashes.add(t + AHEAD));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
-                    let action = action_in(buckets, *hashes.add(token));
-                    // All three stores happen, and only the right counts move.
-                    *heavy_hits.add(heavy_count) = action;
-                    heavy_count += (action >> 31) as usize;
-                    *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
-                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
-                    list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
-                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
-                    if action & ANCHOR != 0 {
-                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                            (action as u64) << 40 | (doc as u64) << 20 | token as u64;
-                        anchor_count += 1;
-                    }
-                    token += 1;
+                    *acts.add(t) = action_in(buckets, *hashes.add(t));
                 }
+                // Left-pack the hits, eight tokens at a time. Heavy actions are negative and list
+                // actions positive; the lanes past `to` are masked off.
+                let mut t = from;
+                while t < to {
+                    let v = _mm256_loadu_si256(acts.add(t).cast());
+                    let valid = if to - t >= 8 { 255 } else { (1u32 << (to - t)) - 1 };
+                    let heavy = _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 & valid;
+                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(
+                        _mm256_cmpgt_epi32(v, _mm256_setzero_si256()),
+                    )) as u32
+                        & valid;
+                    let pick = |mask: u32| {
+                        _mm256_cvtepu8_epi32(_mm_loadl_epi64(PACK[mask as usize].as_ptr().cast()))
+                    };
+                    _mm256_storeu_si256(
+                        heavy_hits.add(heavy_count).cast(),
+                        _mm256_permutevar8x32_epi32(v, pick(heavy)),
+                    );
+                    heavy_count += heavy.count_ones() as usize;
+                    _mm256_storeu_si256(
+                        list_acts.add(list_count).cast(),
+                        _mm256_permutevar8x32_epi32(v, pick(list)),
+                    );
+                    list_count += list.count_ones() as usize;
+                    // Rare: about 1 token in 150 starts a phrase check.
+                    let tagged = _mm256_and_si256(v, _mm256_set1_epi32(ANCHOR as i32));
+                    if _mm256_testz_si256(tagged, tagged) == 0 {
+                        for u in t..(t + 8).min(to) {
+                            let action = *acts.add(u);
+                            if action & ANCHOR != 0 {
+                                *b.anchor_hits.get_unchecked_mut(anchor_count) =
+                                    (action as u64) << 40 | (doc as u64) << 20 | u as u64;
+                                anchor_count += 1;
+                            }
+                        }
+                    }
+                    t += 8;
+                }
+                token = to;
                 *b.heavy_ends.get_unchecked_mut(line) = heavy_count as u32;
+                *b.list_ends.get_unchecked_mut(line) = list_count as u32;
                 // The token after a line is the next document's id. As hash 0 it also stops a
                 // phrase check from running on into the next document. The last line stays
                 // for the next batch.
@@ -521,6 +569,7 @@ impl Run {
                     token = to + 1;
                 }
             }
+            let mut phrase_count = 0;
             for (i, &hit) in b.anchor_hits[..anchor_count].iter().enumerate() {
                 let later = |ahead: usize| (b.anchor_hits[i + ahead] >> 40) as usize;
                 _mm_prefetch::<_MM_HINT_T0>(self.terms.add(later(8).wrapping_sub(1)).cast());
@@ -538,9 +587,9 @@ impl Run {
                         && token - pivot + len <= ready
                         && b.hashes[token - pivot..token - pivot + len] == phrase.words[..len]
                     {
-                        b.list_hits[list_count] =
+                        b.list_hits[phrase_count] =
                             (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
-                        list_count += 1;
+                        phrase_count += 1;
                     }
                 }
             }
@@ -564,11 +613,11 @@ impl Run {
                     }
                 }
             }
-            for &hit in &b.list_hits[..list_count] {
+            let mut emit = |hit: u64| {
                 let term = ((hit >> 32) as u32 & !ANCHOR) - 1;
                 if SAMPLE {
                     b.counts[term as usize] += 1;
-                    continue;
+                    return;
                 }
                 let shard = term as usize & (SHARDS - 1);
                 let cursor = cursors.get_unchecked_mut(shard);
@@ -577,6 +626,18 @@ impl Run {
                 }
                 *cursor.0 = ((term >> SHARDS.trailing_zeros()) + 1) << DOC_BITS | hit as u32;
                 cursor.0 = cursor.0.add(1);
+            };
+            let mut from = 0;
+            for line in 0..line_count {
+                let to = b.list_ends[line] as usize;
+                let doc = (batch_doc as usize + line) as u64;
+                for &action in &b.list_acts[from..to] {
+                    emit((action as u64) << 32 | doc);
+                }
+                from = to;
+            }
+            for &hit in &b.list_hits[..phrase_count] {
+                emit(hit);
             }
             // A newline left over belongs to a document whose id comes in the next batch.
             b.lines[0] = 0;
@@ -894,6 +955,9 @@ impl Run {
             heavy_ends: take(&mut next, BATCH / 2 + 64),
             group: take(&mut next, 64 * MAX_HEAVY / 64),
             list_hits: take(&mut next, tokens),
+            acts: take(&mut next, tokens + 8),
+            list_acts: take(&mut next, tokens + 8),
+            list_ends: take(&mut next, BATCH / 2 + 64),
             anchor_hits: take(&mut next, tokens),
             counts: take(&mut next, MAX_TERMS),
         };
