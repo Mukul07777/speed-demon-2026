@@ -19,7 +19,7 @@
 //!
 //! Threads. One worker per CPU, started as a tree (`spawn_tree`), all running `Run::work`:
 //! parse a share of `queries.txt` and intern its terms into the shared bucket table, sample
-//! 12 claims, plan anchors and bitmaps, then for each phase scan its 256 KiB claims, build
+//! 6 claims, plan anchors and bitmaps, then for each phase scan its 512 KiB claims, build
 //! its postings shard by shard (zeroing a slice of the idle bitmaps), and answer it. The
 //! answers of phase k - 1 run on whichever threads have run out of scan claims in phase k,
 //! so no thread waits for the slowest scanner. Work is shared through atomic job counters,
@@ -964,7 +964,7 @@ impl Run {
         self.shares[id].set(self.parse_share(id)).ok();
         self.barrier();
         // Threads that wake late find fewer claims left, instead of delaying everyone.
-        // 12 claims are read to choose the terms that get bitmaps.
+        // 6 claims are read to choose the terms that get bitmaps.
         self.each_job(&self.setup[0], 6, |claim| {
             self.setup[4].fetch_add(self.index_claim::<true>(claim, &mut buffers), Relaxed);
         });

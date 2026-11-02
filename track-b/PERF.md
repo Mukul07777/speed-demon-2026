@@ -2,7 +2,7 @@
 
 ## Where it ended
 
-Best board run: `run-b9a388fc542a`, the code in `src` (commit 4eeb9d1, the SIMD left-pack; first board run `run-8e9b84007bcc`, 89.8 ms, 78.90). T 89.7 ms, M 43.0 MB, S 1073, 78.91 points. From the first Rust version: 208 ms to 89.7, 137.1 MB to 43.0, 64.93 to 78.91 points.
+Best board run: `run-6eab8597b205`, the code in `src` (commit 958036a, 512 KiB claims on top of the SIMD left-pack). T 88.2 ms, M 42.2 MB, S 1073, 79.09 points. From the first Rust version: 208 ms to 88.2, 137.1 MB to 42.2, 64.93 to 79.09 points.
 
 Three lessons:
 
@@ -132,4 +132,4 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 
 **Failed (box test, 2026-11-02, tools/wt_b60_v1): phrase queries answered by the scan.** A phrase match goes straight into its query's tally (a spinlock per tally, sorted insert of the ten smallest, per-batch sort to drop repeats), so the 19k phrase queries need no pseudo-term, rows, postings or answer work. Laptop CPU -6% on both settings, hash and brute-force cases pass, S +25. Box, commit 4db70cb on 1 MiB claims, `run-a480de71a872`: 100.9 ms, 39.9 MB, 77.55, against 88.9 ms for 1 MiB claims alone, in a normal round. The sort and the shared tally lines inside the scan's hot loop cost far more on the box than the answer work they replace. Reverted.
 1 MiB claims, second sample, commit 1b0395d, `run-184a1a12e9d4`: 89.2 ms, 41.7 MB, 78.96. Then 2 MiB claims (25 per phase, sample of 2 claims).
-2 MiB claims, commit 9790356, `run-3b2dd19b9ab4`: 91.7 ms, 40.9 MB, 78.66 in a normal round: worse (2 MiB is about 4 ms of one thread's scan, so phases end unevenly). Back to 512 KiB for a second sample.
+2 MiB claims, commit 9790356, `run-3b2dd19b9ab4`: 91.7 ms, 40.9 MB, 78.66 in a normal round: worse (2 MiB is about 4 ms of one thread's scan, so phases end unevenly). 512 KiB, second sample, commit 81c47e7, `run-c3d3b8158430`: 90.6 ms in a round where unchanged A, C and D ran slow. Means over two runs: 512 KiB 89.4 ms, 1 MiB 89.05 ms, against about 90.8 ms for 256 KiB. The two tie, so 512 KiB stays, as the best score.
