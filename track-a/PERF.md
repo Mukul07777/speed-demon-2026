@@ -109,3 +109,5 @@ Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 Mi
 **Not built (2026-11-02): thread-start stagger.** Spawn and start spread leave about 0.4 ms idle, about half recoverable with raw thread creation for 30 lines; ceiling about 1%. Slow claims of 2-9 ms have CPU equal to wall or blocked time, so they are kernel or VM stalls, not claim size.
 
 **No lead (2026-11-02, tools/wt_a40).** Row page pre-fault/recycle under 1%; removing per-hour or per-claim madvise is slower and heavier; spin-lock name fill worse. Key finding: many mid-run claims take 3-16 ms wall but 0.3-0.5 ms CPU, 0-1 context switches, no major faults (getrusage) — vCPU preemption/steal, not locks or I/O. The contiguous-prefix sealing rule turns one stalled claim into a summary burst; no exact fix without per-claim idempotent output (a regroup pass). M at floor (~0.8 MB slack). No candidate built.
+
+**Kept (2026-11-02, tools/wt_a50): line cut with hot loops untouched.** rustfmt S 363 to 355. Laptop tie over five sets of 30 rounds. Box `run-13bd96c54346` 19.4 ms, 85.89 and `run-814f5233647c` 18.7 ms, 15.8 MB, S 362, 86.34, the best score.
