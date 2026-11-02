@@ -98,6 +98,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
 struct Run {
     input: *mut u8,
     len: usize,
+    next_claim: AtomicUsize,
     // The catalogue: every endpoint seen so far. Workers share it: it fills in the first
     // moments of the run and is read-only after that, so one copy stays hot in cache.
     // Names are identified by a 64-bit hash alone (53 bits of it are compared), the same
@@ -110,11 +111,11 @@ struct Run {
     claimed: [AtomicUsize; HOURS], // rows of each hour's region given out in chunks
     // Per claim: 0 until parsed, then 1 << 16 | lowest hour << 8 | highest hour of its lines.
     parsed: Vec<AtomicU32>,
-    // Shared counters: [0] the next file claim; [1] the hours below it have all their rows (early
-    // sealing is a bet on the input's order, see `advance`); [2] the next hour to summarise; [3] nonzero
-    // once a line turned up in an hour that was already sealed.
-    ctl: [AtomicUsize; 4],
+    // Hours below this have all their rows. Early sealing is a bet on the input's order (see `advance`).
+    sealed: AtomicUsize,
     early: bool,
+    dirty: AtomicBool, // a line turned up in an hour that was already sealed
+    next_hour: AtomicUsize,
     texts: [OnceLock<&'static [u8]>; HOURS], // each hour's text, until it is written
     output: File,
     placed: Mutex<(usize, u64)>, // the next hour to place in the file, and its offset
@@ -158,7 +159,7 @@ impl Run {
         let mut ends = [0u32; BLOCK / 40 + 1];
         loop {
             self.advance();
-            let claim = self.ctl[0].fetch_add(CLAIM, Relaxed);
+            let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= self.len {
                 break;
             }
@@ -258,7 +259,7 @@ impl Run {
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
         }
         // Out of claims: what is left is hours that wait for the last claims in flight.
-        while self.ctl[2].load(Relaxed) < HOURS {
+        while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
             thread::yield_now();
         }
@@ -283,12 +284,12 @@ impl Run {
                 sealed = top.saturating_sub(1);
                 break;
             }
-            self.ctl[3].fetch_or(((info >> 8 & 255) + 1 < top) as usize, Relaxed);
+            self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
             top = top.max((info & 255) * self.early as usize);
         }
-        self.ctl[1].fetch_max(sealed, Release);
-        let sealed = |hour| (hour < self.ctl[1].load(Acquire)).then_some(hour + 1);
-        if let Ok(hour) = self.ctl[2].try_update(Relaxed, Relaxed, sealed) {
+        self.sealed.fetch_max(sealed, Release);
+        let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
+        if let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) {
             // The names may have grown since the last hour was summarised.
             let order = {
                 let (names, order) = &mut *self.names.lock().unwrap();
@@ -481,14 +482,17 @@ unsafe fn solve(early: bool) -> bool {
     let run = Run {
         input,
         len,
+        next_claim: AtomicUsize::new(0),
         slots: [const { AtomicU64::new(0) }; SLOTS],
         names: Mutex::default(),
         rows: rows.cast(),
         stride,
         claimed: [const { AtomicUsize::new(0) }; HOURS],
         parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
-        ctl: Default::default(),
+        sealed: AtomicUsize::new(0),
         early,
+        dirty: AtomicBool::new(false),
+        next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new((0, 0)),
@@ -497,5 +501,5 @@ unsafe fn solve(early: bool) -> bool {
         (1..threads).for_each(|_| drop(s.spawn(|| unsafe { run.parse() })));
         unsafe { run.parse() };
     });
-    run.ctl[3].load(Relaxed) != 0
+    run.dirty.load(Relaxed)
 }
