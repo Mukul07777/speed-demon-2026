@@ -62,8 +62,6 @@ const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
 
-/// Endpoint names in output order, with their ids.
-
 unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
 }
