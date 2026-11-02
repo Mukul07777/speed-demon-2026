@@ -112,3 +112,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Not built (2026-11-02): answers batched per term.** Laptop 15 paired rounds: answers removed saves 13-25 ms, warm second pass 9.1 ms. 91,168 term uses over 53,444 distinct terms, so a term-major order reads each list only 1.7 times, and running sets between terms bring the misses back. Ceiling under 2%.
 
 **Not kept (2026-11-02): shards own 32-id blocks to stop false sharing of `Term` lines.** Laptop tie; box `run-a2c126a86f56` 94.4 ms, 78.56 and `run-a50b6666fcdb` 101.2 ms, 77.80, S 1007, inside unchanged code's range. Candidate in tools/wt_b31_f.
+
+**Not kept (2026-11-02, tools/wt_b32): job-completion waits instead of the three pre-scan barriers.** Ceiling about 2 ms (pre-scan is 10.2 ms; thread-start stagger and the parse barrier are untouched). Paired medians 80.5 against 91.4 and 81.8 against 82.3 ms, tie. Hash correct, not pushed.
