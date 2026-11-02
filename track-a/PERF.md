@@ -130,3 +130,4 @@ Claims of 2 MiB, commit 9e875c6, `run-cf5016863d93`: 19.28 ms, 16.2 MB, 86.11, i
 Second sample, commit b23dd70, `run-ac610e6c7b9c`: 20.56 ms, 16.3 MB, 85.38. Unchanged code ran 19.25-21.2 ms with one 23.6 ms outlier the same morning, so two runs do not settle it; more samples follow.
 Third sample, commit 9b900c6, `run-f782a226fa36`: 18.28 ms, 16.0 MB, 86.74. **Kept**: 18.14, 20.56, 18.28, median 18.3 against about 19.7 for the same morning's unchanged code. Next, a one-group path in `put_number` for values under 1e8 (tools/wt_a60 a1): summary microbench 15.4 to 14.45 Mticks on 64 MiB, S +6.
 One-group numbers, first sample, commit 0ede539, `run-3ae4607df00b`: 18.63 ms, 16.1 MB, S 348, 86.45.
+Second sample, commit 89a7956, `run-151e429a8ea5`: 17.63 ms, 16.6 MB, S 348, 86.90.

@@ -138,3 +138,4 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 
 **Box test (2026-11-02, tools/wt_b60_s5): an even sample.** 1 MiB claims had left the sample on 3 threads. It now reads a quarter of each of 12 claims, so all 12 threads sample, and each thread sums a slice of the terms over all threads' counts with plain reads, instead of 12 threads adding into one array with `fetch_add`. In-process marks: sample and merge 2.05 to 0.80 ms. One thread discards the counts, because 12 discards are 12 rounds of TLB shootdowns. Hash, worked, mixed pass, S +9.
 First sample, commit 0ede539, `run-795cdd705133`: 89.9 ms, 41.2 MB, S 1082, 78.86.
+Second sample, commit 89a7956, `run-596f54fa1cea`: 87.68 ms, 41.5 MB, S 1082, 79.13.
