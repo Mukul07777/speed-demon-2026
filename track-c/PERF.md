@@ -114,3 +114,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (2026-11-02, tools/wt_c54): compact region table.** A rank bitmap in 64-byte lines with group bytes ranked per claim (about 0.5 MB instead of 1 MB). Exact, peak -0.55 MB, but median +0.4 to 2 ms from the dependent load chain, S +72: net loss. Freeing page tables by re-mmapping consumed windows cut VmPTE 540 to 200 kB but not the peak, and ran far slower.
 
 **Failed (box, 2026-11-02, tools/wt_c55): line cut with the tables as a zeroed static.** S 295 to 286 and laptop tie, but `run-c8d494a9df4f` peaked at 27.2 MB (77.51): on the box (THP always) the large bss static was charged far beyond the two huge pages the mmap version uses. Reverted to a27b66a.
+
+**Tried, tie (2026-11-02, tools/wt_c56):** overflow probed in the same 128-byte line pair first, and the per-record stats as two AVX2 add and max-blend operations. All exact. Medians within noise on 12 CPUs; on 6 CPUs the pair probe was about 4% slower and the vector stats about 1.4% slower. Not pushed.

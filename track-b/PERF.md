@@ -124,3 +124,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Not kept (2026-11-02): the pext table above.** Box `run-ae450ddf8737` 91.4 ms, S 1063, 78.74 and `run-5b6c766f9709` 90.8 ms, 78.80, against 78.90 and 78.66 for the table: a tie. Code back at 4eeb9d1, the best score.
 
 **Tried, tie (2026-11-02, tools/wt_b53):** hash pair written with one vector store and the tag broadcast loaded from memory. Four paired sets, mixed signs (-1.2 to +2.5 ms), +12 lines. Fresh profile (Mticks over threads): tokenise 300, hash 190, lookup 440, left-pack 120, heavy rows 150, emit 170; threads finish each scan within 1-3 ms.
+
+**Tried, no gain (2026-11-02, tools/wt_b55):** claims of 128 KiB (about 7% slower on both settings), 512 KiB and 1 MiB (ties); vector emit of list rows (8 hits per vector) looked -2% in one paired set and tied in the swapped repeat. Tokenise positions by a per-byte table counted out at about 64 uops per 64 bytes against about 48 now; the box has no AVX-512 compress.
