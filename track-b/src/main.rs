@@ -303,24 +303,6 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
 /// check on each byte.
 const KEY: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 
-/// For each 8-bit mask, the positions of its set bits in order, for a left-pack with permute.
-static PACK: [[u8; 8]; 256] = {
-    let mut table = [[0u8; 8]; 256];
-    let mut mask = 0;
-    while mask < 256 {
-        let (mut lane, mut n) = (0, 0);
-        while lane < 8 {
-            if mask >> lane & 1 == 1 {
-                table[mask][n] = lane as u8;
-                n += 1;
-            }
-            lane += 1;
-        }
-        mask += 1;
-    }
-    table
-};
-
 /// A load from `MASKS` at `16 - len` is ones for the first `len` bytes and zeros after.
 static MASKS: [[u8; 16]; 2] = [[255; 16], [0; 16]];
 
@@ -531,7 +513,11 @@ impl Run {
                     )) as u32
                         & valid;
                     let pick = |mask: u32| {
-                        _mm256_cvtepu8_epi32(_mm_loadl_epi64(PACK[mask as usize].as_ptr().cast()))
+                        {
+                        // The lanes of the set bits in order: pext gathers their numbers.
+                        let lanes = _pext_u64(0x0706_0504_0302_0100, _pdep_u64(mask as u64, 0x0101_0101_0101_0101) * 255);
+                        _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(lanes as i64))
+                    }
                     };
                     _mm256_storeu_si256(
                         heavy_hits.add(heavy_count).cast(),
