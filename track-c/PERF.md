@@ -2,7 +2,7 @@
 
 ## Where it ended
 
-Best board run: `run-b7163ec15e9a`, commit a8a3d87 (the code in `src`). T 22.0 ms, M 11.1 MB, S 294, 82.40 points. Unchanged code ranged from 21.96 to 23.4 ms across rounds. From the first Rust version: 51.4 ms to 22.0, 13.2 MB to 11.1, 70.62 to 82.40 points.
+Best board run: `run-3e9d3d24711b`, the code in `src` (commit a27b66a, shared tables in two huge pages; first board run `run-613018fe0caa`, 23.8 ms, 8.9 MB, 82.47). T 24.0 ms, M 8.6 MB, S 295, 82.54 points. From the first Rust version: 51.4 ms to 24.0, 13.2 MB to 8.6, 70.62 to 82.54 points. The earlier best, `run-b7163ec15e9a` (22.0 ms, 11.1 MB, 82.40), was faster but larger.
 
 Three lessons:
 

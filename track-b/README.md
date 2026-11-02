@@ -12,7 +12,7 @@ Rust, standard library only. The queries can be read before the corpus, so the p
 
 1. AVX2 marks token bytes and newlines, 64 bytes at a time. Token starts and ends are written with unconditional stores.
 2. Tokens are hashed two at a time with VAES.
-3. One loop looks up each token, with its bucket prefetched 20 tokens ahead. It splits hits with no branch into bitmap hits, list hits and phrase anchors. A bitmap hit only sets a bit in a small row for the current document, which stays in L1; every 64 documents a 64x64 bit transpose moves those rows into the phase's bitmaps.
+3. One loop looks up each token, with its bucket prefetched 20 tokens ahead. It stores one action per token, then packs the hits 8 tokens at a time with one AVX2 `permutevar8x32` and a 256-entry table, with no branch and no scalar store per token, into bitmap hits, list hits and phrase anchors. A bitmap hit only sets a bit in a small row for the current document, which stays in L1; every 64 documents a 64x64 bit transpose moves those rows into the phase's bitmaps.
 
 A small sample (12 claims) chooses which terms get bitmaps: those in at least 1/32 of the documents. List terms write 4-byte rows into chunks per shard, and each chunk records the claim that wrote it. Taking the chunks in claim order therefore gives sorted document lists without sorting.
 

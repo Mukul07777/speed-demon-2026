@@ -2,7 +2,7 @@
 
 ## Where it ended
 
-Best board run: `run-82b2e3580122`, commit f14bedd5 (same code as `run-97ec79f353b0`). T 94.3 ms, M 42.6 MB, S 1004, 78.58 points. From the first Rust version: 208 ms to 94.3, 137.1 MB to 42.6, 64.93 to 78.58 points.
+Best board run: `run-b9a388fc542a`, the code in `src` (commit 4eeb9d1, the SIMD left-pack; first board run `run-8e9b84007bcc`, 89.8 ms, 78.90). T 89.7 ms, M 43.0 MB, S 1073, 78.91 points. From the first Rust version: 208 ms to 89.7, 137.1 MB to 43.0, 64.93 to 78.91 points.
 
 Three lessons:
 

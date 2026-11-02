@@ -24,11 +24,11 @@ Rust, standard library only. The design comes from measuring the data first. `PE
 2. Read both, update the statistics, and number the name. Then prefetch the bit-matrix line for write.
 3. Set the bit with `fetch_or`.
 
-A name is a 64-bit AES hash. Its top 15 bits select a 64-byte bucket of eight u64 slots. Each slot holds a 47-bit tag above the name's dense 17-bit number, so a single compare-and-swap claims a slot together with its number, and no lock is needed. Workers reserve numbers in blocks of 32, so a first appearance does not touch a shared counter.
+A name is a 64-bit AES hash. Its top 14 bits select a 64-byte bucket of eight u64 slots. Each slot holds a 47-bit tag above the name's dense 17-bit number, so a single compare-and-swap claims a slot together with its number, and no lock is needed. Workers reserve numbers in blocks of 32, so a first appearance does not touch a shared counter.
 
 Comparing hashes instead of names is a deliberate shortcut. Two of the 100,000 names would have to match on all 62 bits, at odds of about 1 in a billion, and the shortcut saves a memory access per record.
 
-**Distinct names.** One shared bit matrix has a row per country group, indexed by the name's number. It is 256 × 2^17 bits, or 4 MiB, on huge pages. Popcounts of the rows give the distinct-name counts.
+**Distinct names.** One shared bit matrix has a row per country group, indexed by the name's number. It is 241 groups by 104,320 name numbers, about 3 MiB; with the 1 MiB name table it fills exactly two huge pages, which keeps peak memory near 8.6 MB. Popcounts of the rows give the distinct-name counts.
 
 ## Tried and reverted
 
