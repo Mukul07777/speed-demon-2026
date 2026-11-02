@@ -110,3 +110,5 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 **Failed (2026-11-01, tools/wt_b27, wt_b27s):** software write-combining for list rows, laptop tie with worse best times, +35 lines.
 
 **Not built (2026-11-02): answers batched per term.** Laptop 15 paired rounds: answers removed saves 13-25 ms, warm second pass 9.1 ms. 91,168 term uses over 53,444 distinct terms, so a term-major order reads each list only 1.7 times, and running sets between terms bring the misses back. Ceiling under 2%.
+
+Box test (2026-11-02): shards own 32-id blocks, so neighbouring threads stop writing the same `Term` lines. Laptop tie, first box run `run-a2c126a86f56` 94.4 ms, S 1007, 78.56.
