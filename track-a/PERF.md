@@ -131,3 +131,6 @@ Second sample, commit b23dd70, `run-ac610e6c7b9c`: 20.56 ms, 16.3 MB, 85.38. Unc
 Third sample, commit 9b900c6, `run-f782a226fa36`: 18.28 ms, 16.0 MB, 86.74. **Kept**: 18.14, 20.56, 18.28, median 18.3 against about 19.7 for the same morning's unchanged code. Next, a one-group path in `put_number` for values under 1e8 (tools/wt_a60 a1): summary microbench 15.4 to 14.45 Mticks on 64 MiB, S +6.
 One-group numbers, first sample, commit 0ede539, `run-3ae4607df00b`: 18.63 ms, 16.1 MB, S 348, 86.45.
 Second sample, commit 89a7956, `run-151e429a8ea5`: 17.63 ms, 16.6 MB, S 348, 86.90.
+Third sample, commit d3cac82, `run-0c034abca03d`: 21.52 ms, 18.8 MB, 84.21, an outlier in time and memory together, as the unchanged code's 23.6 ms run was. One-group numbers: 18.63, 17.63, 21.52.
+
+**Box test (2026-11-02, tools/wt_a60 d2): the end of the parse.** `advance` ran a locked `fetch_or` on one shared line for each of about 239 claims on every call, 17-83K ticks per call with 12 threads. It is now a plain store, only when it happens. Workers out of claims wait with `pause` instead of `sched_yield`, so the hyperthread beside a worker still parsing keeps the core. The laptop cannot show this: it has E-cores and few real siblings. Hash, worked, empty and 10 adversarial files pass.

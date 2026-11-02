@@ -50,7 +50,8 @@ const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ZEROS: u64 = 0x3030_3030_3030_3030;
-// Loaded from offset d, eight bytes: zeros, then the low-nibble mask of the last d bytes.
+// Eight bytes loaded at offset `digits`: zeros, then the digit mask 0x0F for the last `digits`
+// bytes, which keeps just the latency's digits out of the last eight bytes of a line.
 const KEEP_LAST: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 15, 15, 15, 15, 15, 15, 15, 15];
 
 /// A row is id + 1 in 11 bits, an error bit, then the latency in 20 bits. Only about 1% of
@@ -259,10 +260,12 @@ impl Run {
             madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
         }
-        // Out of claims: what is left is hours that wait for the last claims in flight.
+        // Out of claims: what is left is hours that wait for the last claims in flight. Wait with
+        // `pause`, not a system call, so that the hyperthread next to a worker still parsing keeps
+        // the core: the last claims decide when the run ends.
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            thread::yield_now();
+            std::hint::spin_loop();
         }
     }
 
@@ -285,7 +288,11 @@ impl Run {
                 sealed = top.saturating_sub(1);
                 break;
             }
-            self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
+            // A plain store when it happens: this scan runs in a loop, and an atomic update on
+            // every claim made the idle threads fight over one cache line.
+            if (info >> 8 & 255) + 1 < top {
+                self.dirty.store(true, Relaxed);
+            }
             top = top.max((info & 255) * self.early as usize);
         }
         self.sealed.fetch_max(sealed, Release);
