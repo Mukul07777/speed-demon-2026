@@ -50,6 +50,8 @@ const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ZEROS: u64 = 0x3030_3030_3030_3030;
+// Loaded from offset d, eight bytes: zeros, then the low-nibble mask of the last d bytes.
+const KEEP_LAST: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 15, 15, 15, 15, 15, 15, 15, 15];
 
 /// A row is id + 1 in 11 bits, an error bit, then the latency in 20 bits. Only about 1% of
 /// latencies need more: those store ESCAPE here and the full value in the next row, which
@@ -59,11 +61,11 @@ const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
 
-/// Sets the high bit of each space byte. A borrow can also mark the byte above a space if
-/// that byte is `!`, which never sits above the first space in a method or among digits.
-fn spaces_in(word: u64) -> u64 {
-    let z = word ^ 0x2020_2020_2020_2020;
-    z.wrapping_sub(0x0101_0101_0101_0101) & !z & 0x8080_8080_8080_8080
+/// Bit k is set if byte k of the 8 bytes at `at` is a space.
+#[inline(always)]
+unsafe fn spaces_in(at: *const u8) -> u32 {
+    let word = _mm_loadl_epi64(at.cast());
+    _mm_movemask_epi8(_mm_cmpeq_epi8(word, _mm_set1_epi8(b' ' as i8))) as u32
 }
 
 /// A hash of the whole name without a length-dependent loop: the first and last 32 bytes, with
@@ -207,24 +209,23 @@ impl Run {
                         cursor = cursors[hour];
                         (low, high) = (low.min(hour), high.max(hour));
                     }
-                    // The method starts at byte 28 and is 3 to 6 letters, so the first space
+                    // The method starts at byte 28 and is 3 to 7 letters, so the first space
                     // in that word gives its length, and the name follows it.
-                    let method = spaces_in(read(line.add(28).cast())).trailing_zeros() as usize / 8;
+                    let method = spaces_in(line.add(28)).trailing_zeros() as usize;
                     let name = line.add(29 + method);
                     // Read the latency back from the newline. Its length varies line by
-                    // line, so a digit loop would mispredict on nearly every one.
-                    let last_eight = read::<u64>(end.sub(8).cast());
-                    let spaces = spaces_in(last_eight);
-                    let (latency, digits) = if spaces != 0 {
-                        // The digits are the top `digits` bytes of the little-endian word.
-                        // Keep only those, as values 0 to 9, and join neighbours in three
-                        // multiply-shift steps: pairs, then fours, then all eight.
-                        let digits = spaces.leading_zeros() as usize / 8;
-                        let v = (last_eight ^ ZEROS) >> (64 - 8 * digits) << (64 - 8 * digits);
-                        let v = (v & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
-                        let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
-                        let v = (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
-                        (v as u32, digits)
+                    // line, so a digit loop would mispredict on nearly every one. The digits
+                    // are the bytes of the last eight that follow the last space.
+                    let digits = spaces_in(end.sub(8)).leading_zeros() as usize - 24;
+                    let (latency, digits) = if digits < 8 {
+                        // Keep only the digits, as values 0 to 9, and join them in three
+                        // multiply-adds: pairs, then fours, then all eight.
+                        let keep = _mm_loadl_epi64(KEEP_LAST.as_ptr().add(digits).cast());
+                        let v = _mm_and_si128(_mm_loadl_epi64(end.sub(8).cast()), keep);
+                        let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+                        let v = _mm_madd_epi16(v, _mm_set1_epi32(0x0001_0064));
+                        let v = _mm_madd_epi16(_mm_packus_epi32(v, v), _mm_set1_epi32(0x0001_2710));
+                        (_mm_cvtsi128_si32(v) as u32, digits)
                     } else {
                         // Eight digits or more: the word-wide decode cannot see where they start.
                         let digits = (1..).find(|&n| *end.sub(n + 1) == b' ').unwrap();
