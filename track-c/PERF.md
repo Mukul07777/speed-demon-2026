@@ -122,3 +122,4 @@ The same round's run of unchanged code (commit 9e875c6, `run-fa65dbff777e`) gave
 Claims of 512 KiB, commit 958036a, `run-120b48b5b701`: 23.95 ms, 9.7 MB, 82.03, a tie in time and memory with the unchanged code of the round before. 1 MiB stays.
 
 **Box test (2026-11-02, tools/wt_c60 n2): fewer instructions, counted with callgrind (1.2256G to 1.0074G, -17.8%).** No `0x30` xor before `decode_digits`, which masks the nibble anyway; the region id clamped in the batch decode, so the table reads need no bounds check; record starts taken from the previous newline; the BOM by one predicted branch; positions extracted by a fixed 8-step loop. Laptop paired: tie (12 CPUs 19.6/22.2 to 18.7/21.9 and 20.2/24.0 to 20.3/23.7; CPUs 0-5 23.4/26.0 to 23.4/26.2). Hash, four hostile cases and long names pass, S +14.
+First sample, commit 0ede539, `run-7740b8c5846f`: 23.77 ms, 9.0 MB, S 309, 82.26.
