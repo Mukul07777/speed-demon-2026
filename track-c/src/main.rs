@@ -21,12 +21,12 @@
 //!    Digits of ids, amounts and regions are gathered and decoded four records at a time.
 //! 3. Stats and name numbers. Names are drawn uniformly from 100,000 values, so every lookup
 //!    is a cache miss, and pass B prefetches before this pass touches anything. A name is a
-//!    64-bit hash: its top 15 bits pick a 64-byte bucket of eight slots, which holds 47 more
+//!    64-bit hash: its top 14 bits pick a 64-byte bucket of eight slots, which holds 47 more
 //!    bits of it as a tag beside the name's dense number. Two of 100,000 names matching on
-//!    all 62 bits has odds of about 1 in a billion, and comparing hashes instead of bytes
+//!    all 61 bits has odds of about 1 in 500 million, and comparing hashes instead of bytes
 //!    saves a second memory access per record.
 //! 4. Distinct names. Each record sets its name's bit in its country's row of one shared bit
-//!    matrix (256 groups by 2^17 names, 4 MiB), and popcounts of the rows give the counts.
+//!    matrix (241 groups by 104,320 names, 3 MiB), and popcounts of the rows give the counts.
 use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex, OnceLock};
 use std::{arch::x86_64::*, fs::File, ops::Range, os::fd::AsRawFd, ptr::*, slice, thread};
 
@@ -50,16 +50,17 @@ const MAX_RECORDS: usize = 32 * 64 / 11 + 5;
 // id, amount and region.
 // Quote masks kept for the rank query, more than one batch.
 const QUOTE_WORDS: usize = 1 << 10;
-const BUCKETS: usize = 1 << 15;
+const BUCKETS: usize = 1 << 14;
 // A name's dense number has 17 bits; the generator draws from 100,000 names.
 const NUMBER_BITS: i32 = 17;
 const NAME_MASK: u64 = (1 << NUMBER_BITS) - 1;
 // Lookup ids stay below this; anything above is unmatched.
 const REGION_IDS: usize = 1_000_000;
-// 240 countries, with index 0 for unmatched
-const GROUPS: usize = 256;
-// Words of one group's row of the name bit matrix.
-const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
+// 240 countries (fixed by the spec), with index 0 for unmatched
+const GROUPS: usize = 241;
+// Words of one group's row of the name bit matrix: 104,320 name numbers, for the 100,000 names
+// and those lost to races, and just small enough that the tables fill two huge pages.
+const SEEN_WORDS: usize = 1630;
 // Amounts are kept as the largest of `BIAS + amount` and of `BIAS - amount`, both positive, so
 // that a zeroed group is a valid empty one and merging two needs only sums and maxima.
 const BIAS: i64 = 1 << 40;
@@ -78,7 +79,7 @@ static TOTALS: Mutex<[[i64; 8]; GROUPS]> = Mutex::new([[0; 8]; GROUPS]);
 // Group to country code, with the unmatched group first.
 static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// The two shared tables, zeroed. Together they are exactly three huge pages.
+/// The two shared tables, zeroed. Together they just fit two huge pages.
 /// 0: the name buckets. A bucket is one cache line of eight slots. A slot holds a 47-bit name
 /// tag above the name's dense number, so one compare-and-swap claims a slot with its number.
 /// Numbers keep the bit matrix small.
@@ -154,7 +155,7 @@ fn take_block(counter: &AtomicUsize, size: usize, len: usize) -> Option<usize> {
 impl Run {
     /// The number of a name, new if this is its first appearance.
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let index = (hash >> 49) as usize;
+        let index = (hash >> 50) as usize;
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
@@ -178,6 +179,7 @@ impl Run {
         if spare.is_empty() {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
+            assert!(first + 32 <= SEEN_WORDS * 64);
             *spare = first..first + 32;
         }
         let claimed = tag << NUMBER_BITS | spare.start as u64;
@@ -336,8 +338,8 @@ impl Run {
                     let name_quotes = inner + 2 * (raw_name != 0) as usize;
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
-                    // The top 15 bits of the hash pick the bucket.
-                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
+                    // The top 14 bits of the hash pick the bucket.
+                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 50) as usize].as_ptr().cast());
                     // Ids past the table share its last entry, which stays 0: unmatched.
                     let region = (numbers[2][at] as usize).min(REGION_IDS);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
