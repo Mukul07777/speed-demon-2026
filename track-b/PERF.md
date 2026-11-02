@@ -2,7 +2,7 @@
 
 ## Where it ended
 
-Best board run: `run-6eab8597b205`, the code in `src` (commit 958036a, 512 KiB claims on top of the SIMD left-pack). T 88.2 ms, M 42.2 MB, S 1073, 79.09 points. From the first Rust version: 208 ms to 88.2, 137.1 MB to 42.2, 64.93 to 79.09 points.
+Best board run: `run-fde1b291e7c2`, the code in `src` (commit 7af4a23, 1 MiB claims on top of the SIMD left-pack). T 88.2 ms, M 41.7 MB, S 1073, 79.09 points. From the first Rust version: 208 ms to 88.2, 137.1 MB to 41.7, 64.93 to 79.09 points.
 
 Three lessons:
 
@@ -134,3 +134,4 @@ Phrases carry their 8 word hashes inline (the spec allows 2 to 8 terms), so the 
 1 MiB claims, second sample, commit 1b0395d, `run-184a1a12e9d4`: 89.2 ms, 41.7 MB, 78.96. Then 2 MiB claims (25 per phase, sample of 2 claims).
 2 MiB claims, commit 9790356, `run-3b2dd19b9ab4`: 91.7 ms, 40.9 MB, 78.66 in a normal round: worse (2 MiB is about 4 ms of one thread's scan, so phases end unevenly). 512 KiB, second sample, commit 81c47e7, `run-c3d3b8158430`: 90.6 ms in a round where unchanged A, C and D ran slow. Means over two runs: 512 KiB 89.4 ms, 1 MiB 89.05 ms, against about 90.8 ms for 256 KiB. The two tie, so 512 KiB stays, as the best score.
 512 KiB, third sample, commit 7475afe, `run-706cf95d358d`: 92.5 ms in an ordinary round, so 512 KiB is 88.2, 90.6, 92.5 (mean 90.4) and its 88.2 looks like a lucky run. 1 MiB gets more samples.
+1 MiB, third sample, commit 7af4a23, `run-fde1b291e7c2`: 88.2 ms, 41.7 MB, 79.09. **Kept: 1 MiB claims.** Over all runs on the box: 256 KiB about 91 ms, 512 KiB 88.2, 90.6, 92.5 (mean 90.4), 1 MiB 88.9, 89.2, 88.2 (mean 88.8), 2 MiB 91.7. The laptop had called all of these a tie. The curve has a reason at each end: small claims open a partly filled 64-row chunk in every shard, large ones end each phase unevenly.
