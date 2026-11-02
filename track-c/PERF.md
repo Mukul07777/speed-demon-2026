@@ -119,3 +119,4 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 
 **Failed (box test, 2026-11-02): claims of 2 MiB.** Commit 87a4dd3, `run-b6ccdd877b34`: 23.68 ms but 9.1 MB, 82.44, against 23.97 ms, 8.6 MB, 82.54 for 1 MiB. Twelve threads each hold twice the file pages (and their page tables) between claim start and release, and the 0.5 MB costs more than the 0.3 ms gains. Reverted.
 The same round's run of unchanged code (commit 9e875c6, `run-fa65dbff777e`) gave 23.9 ms and 9.7 MB, so box memory for this code varies by about 1 MB between runs (8.6 to 9.7 MB); the 2 MiB result above is inside that spread.
+Claims of 512 KiB, commit 958036a, `run-120b48b5b701`: 23.95 ms, 9.7 MB, 82.03, a tie in time and memory with the unchanged code of the round before. 1 MiB stays.

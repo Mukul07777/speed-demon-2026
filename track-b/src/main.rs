@@ -45,9 +45,9 @@ extern "C" {
 const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 
 const HUGE_PAGE: usize = 1 << 21;
-const CLAIM: usize = 1 << 19;
+const CLAIM: usize = 1 << 20;
 // 50 MiB of text between turning rows into postings.
-const PHASE_CLAIMS: usize = 100;
+const PHASE_CLAIMS: usize = 50;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
@@ -965,7 +965,7 @@ impl Run {
         self.barrier();
         // Threads that wake late find fewer claims left, instead of delaying everyone.
         // 12 claims are read to choose the terms that get bitmaps.
-        self.each_job(&self.setup[0], 6, |claim| {
+        self.each_job(&self.setup[0], 3, |claim| {
             self.setup[4].fetch_add(self.index_claim::<true>(claim, &mut buffers), Relaxed);
         });
         let terms = self.term_count.load(Relaxed);
