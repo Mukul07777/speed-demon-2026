@@ -112,3 +112,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (box, 2026-11-02, tools/wt_c53): bucket misses deferred to their own prefetch pass.** Exact. Laptop 12 CPUs median -4 to -5%, best tie, 6 CPUs tie or worse. Box `run-d722366e0d38` 24.1 ms, 9.0 MB, S 317, 82.05 against 82.54. Variants with a branch in the loop, or a neighbour prefetch per record, were slower on the laptop. Reverted.
 
 **Failed (2026-11-02, tools/wt_c54): compact region table.** A rank bitmap in 64-byte lines with group bytes ranked per claim (about 0.5 MB instead of 1 MB). Exact, peak -0.55 MB, but median +0.4 to 2 ms from the dependent load chain, S +72: net loss. Freeing page tables by re-mmapping consumed windows cut VmPTE 540 to 200 kB but not the peak, and ran far slower.
+
+**Failed (box, 2026-11-02, tools/wt_c55): line cut with the tables as a zeroed static.** S 295 to 286 and laptop tie, but `run-c8d494a9df4f` peaked at 27.2 MB (77.51): on the box (THP always) the large bss static was charged far beyond the two huge pages the mmap version uses. Reverted to a27b66a.

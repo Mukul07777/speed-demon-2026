@@ -32,12 +32,12 @@
 //!
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
-use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
+use std::ptr::{read_unaligned as read, write_unaligned};
 use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
 use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn mmap(addr: usize, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     // Every `madvise` below passes advice 4, MADV_DONTNEED: give the pages back.
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
@@ -45,12 +45,10 @@ extern "C" {
 
 const CLAIM: usize = 1 << 20;
 const BLOCK: usize = 1 << 16; // fits in L2 between the newline pass and the line pass
-const MIN_LINE: usize = 40; // ts 27, method 3, endpoint 1, status 3, latency 1, 4 spaces, LF
 const HOURS: usize = 72; // the span is fixed for every seed: 2026-10-30T18 to 2026-11-02T17
 const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
-const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 /// A row is id + 1 in 11 bits, an error bit, then the latency in 20 bits. Only about 1% of
@@ -60,10 +58,6 @@ const LATENCY_BITS: u32 = 20;
 const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS; // of the two radix passes over a 20-bit latency
-
-unsafe fn read(p: *const u8) -> u64 {
-    read_unaligned(p.cast())
-}
 
 /// Sets the high bit of each space byte. A borrow can also mark the byte above a space if
 /// that byte is `!`, which never sits above the first space in a method or among digits.
@@ -97,11 +91,8 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     // multiply, at about the same cost.
     let key = _mm256_set1_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
-    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
-        _mm256_castsi256_si128(mixed),
-        _mm256_extracti128_si256(mixed, 1),
-    ));
-    (a ^ b) | 1 << ID_BITS
+    let [a, b, c, d]: [u64; 4] = std::mem::transmute(mixed);
+    (a ^ b ^ c ^ d) | 1 << ID_BITS
 }
 
 struct Run {
@@ -114,9 +105,7 @@ struct Run {
     // deliberate shortcut Tracks B and C take: with 1,842 names the chance of any two
     // colliding is about 2e-10.
     slots: [AtomicU64; SLOTS], // hash >> 11 << 11 | id + 1; 0 is an empty slot
-    names: Mutex<Vec<&'static [u8]>>, // by id
-    // The names in output order with their ids, as of the last time anyone asked.
-    order: Mutex<Arc<Vec<(&'static [u8], usize)>>>,
+    names: Mutex<(Vec<&'static [u8]>, Arc<Vec<(&'static [u8], usize)>>)>, // by id, then in output order
     rows: *mut u32,
     stride: usize,
     claimed: [AtomicUsize; HOURS], // rows of each hour's region given out in chunks
@@ -147,7 +136,7 @@ impl Run {
             if slot >> ID_BITS == hash >> ID_BITS {
                 return (slot & ((1 << ID_BITS) - 1)) as usize - 1;
             } else if slot == 0 {
-                let mut names = self.names.lock().unwrap();
+                let (names, _) = &mut *self.names.lock().unwrap();
                 if self.slots[i].load(Acquire) == 0 {
                     let id = names.len();
                     assert!(id + 1 < 1 << ID_BITS); // id + 1 must fit the low bits of a slot
@@ -167,12 +156,12 @@ impl Run {
         // two free, in case it has to escape.
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
         let (mut hour, mut cursor) = (0, (std::ptr::null_mut(), std::ptr::null_mut()));
-        let mut ends = [0u32; BLOCK / MIN_LINE + 1];
+        let mut ends = [0u32; BLOCK / 40 + 1];
         loop {
             self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= self.len {
-                return;
+                break;
             }
             // A line belongs to the claim holding its newline. The first one starts after
             // the previous claim's last newline, at most one line back.
@@ -206,7 +195,7 @@ impl Run {
                     // Nov 1 and Nov 2 are day 0 to 3 of the span: the day's units digit plus
                     // one, less one in October, whose tens digit '3' (0x33) has bit 1 set
                     // where '0' (0x30) does not.
-                    let clock = read(line.add(8));
+                    let clock = read::<u64>(line.add(8).cast());
                     if clock << 24 != key {
                         // Hours change rarely along the file, so the cursor of the current
                         // hour stays in registers until the day and hour digits differ.
@@ -220,11 +209,11 @@ impl Run {
                     }
                     // The method starts at byte 28 and is 3 to 6 letters, so the first space
                     // in that word gives its length, and the name follows it.
-                    let method = spaces_in(read(line.add(28))).trailing_zeros() as usize / 8;
+                    let method = spaces_in(read(line.add(28).cast())).trailing_zeros() as usize / 8;
                     let name = line.add(29 + method);
                     // Read the latency back from the newline. Its length varies line by
                     // line, so a digit loop would mispredict on nearly every one.
-                    let last_eight = read(end.sub(8));
+                    let last_eight = read::<u64>(end.sub(8).cast());
                     let spaces = spaces_in(last_eight);
                     let (latency, digits) = if spaces != 0 {
                         // The digits are the top `digits` bytes of the little-endian word.
@@ -269,6 +258,11 @@ impl Run {
             madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
         }
+        // Out of claims: what is left is hours that wait for the last claims in flight.
+        while self.next_hour.load(Relaxed) < HOURS {
+            self.advance();
+            thread::yield_now();
+        }
     }
 
     /// Seals hours. The input is the interleaving of eight time-ordered streams, so the lines of
@@ -298,7 +292,7 @@ impl Run {
         if let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) {
             // The names may have grown since the last hour was summarised.
             let order = {
-                let (names, mut order) = (self.names.lock().unwrap(), self.order.lock().unwrap());
+                let (names, order) = &mut *self.names.lock().unwrap();
                 if order.len() != names.len() {
                     let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
                     sorted.sort_unstable();
@@ -322,10 +316,10 @@ impl Run {
     unsafe fn summarise(&self, hour: usize, order: &[(&[u8], usize)]) -> &'static [u8] {
         let rows = self.rows.add(hour * self.stride);
         let claimed = self.claimed[hour].load(Relaxed);
-        // The scratch starts past the rows and at least SPARE_AT rows (1 MiB) in: the text is
+        // The scratch starts past the rows and at least (1 << 18) rows (1 MiB) in: the text is
         // written over the rows and can grow longer than them, though never to 1 MiB. Rounded
         // to whole pages so that `madvise` can release it.
-        let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
+        let spare = rows.add(claimed.max((1 << 18)).next_multiple_of(1024));
         // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
         // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
         let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
@@ -391,16 +385,14 @@ impl Run {
         let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
         let label = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
         let (text, mut w) = (rows.cast::<u8>(), rows.cast::<u8>());
-        for &(name, id) in order {
+        for &(name, id) in order.iter().filter(|&&(_, id)| starts[id] < starts[id + 1]) {
             let span = starts[id] as usize..starts[id + 1] as usize;
-            if span.is_empty() {
-                continue;
-            }
             let (n, bad) = (span.len() as u32, errors[id + 1]);
             let sorted = std::slice::from_raw_parts(spare.add(span.start), span.len());
             let at_rank = |p: usize| sorted[(p * sorted.len() + 99) / 100 - 1];
-            copy_nonoverlapping(label.as_ptr(), w, 21);
-            copy_nonoverlapping(name.as_ptr(), w.add(21), name.len());
+            w.copy_from_nonoverlapping(label.as_ptr(), 21);
+            w.add(21)
+                .copy_from_nonoverlapping(name.as_ptr(), name.len());
             w = w.add(21 + name.len());
             for number in [n, at_rank(50), at_rank(95), at_rank(99), bad] {
                 w = put_number(w, number);
@@ -420,25 +412,15 @@ impl Run {
     fn write_ready(&self) {
         let mut ready = Vec::new();
         let mut placed = self.placed.lock().unwrap();
-        let (next, offset) = &mut *placed;
-        while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
-            ready.push((*next, *offset, *text));
-            (*next, *offset) = (*next + 1, *offset + text.len() as u64);
+        while let Some(text) = self.texts.get(placed.0).and_then(|text| text.get()) {
+            ready.push((placed.0, placed.1, *text));
+            *placed = (placed.0 + 1, placed.1 + text.len() as u64);
         }
         drop(placed);
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back.
             unsafe { madvise(self.rows.add(hour * self.stride).cast(), self.stride * 4, 4) };
-        }
-    }
-
-    fn work(&self) {
-        unsafe { self.parse() };
-        // Out of claims: what is left is hours that wait for the last claims in flight.
-        while self.next_hour.load(Relaxed) < HOURS {
-            self.advance();
-            thread::yield_now();
         }
     }
 }
@@ -469,11 +451,11 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    solve(true) && solve(false);
+    unsafe { solve(true) && solve(false) };
 }
 
 /// Returns whether the early sealing failed.
-fn solve(early: bool) -> bool {
+unsafe fn solve(early: bool) -> bool {
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -481,37 +463,31 @@ fn solve(early: bool) -> bool {
     // Huge pages would turn each hour's first touch into 2 MB of memory.
     // Name lookups read a little past a line, so a spare zero page follows the file.
     // Each hour reserves room for every line, and only the pages it touches cost anything.
-    let (input, rows, stride) = unsafe {
-        // Linux constants: prctl 41 is PR_SET_THP_DISABLE; mmap protections 1 (read) and 3
-        // (read and write); flags 0x4022 (private, anonymous, no reserve) and 0x12 (private, fixed).
-        prctl(41, 1usize, 0usize, 0usize, 0usize);
-        let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
-        let null = std::ptr::null_mut();
-        let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
-        // For an empty file this fails, and the zero page stays.
-        map(input, len, 1, 0x12, file.as_raw_fd());
-        // An hour has room for its rows (two per line, if every line escaped), then for the
-        // scratch (one value per line) after them, or after SPARE_AT rows if that is further,
-        // plus the unused ends of one partly filled chunk per thread.
-        let stride =
-            (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
-        // Hour areas are multiples of 2 MiB and the first starts on a 2 MiB boundary, so each
-        // hour's pages share one page table instead of spilling into the next.
-        let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1)
-            .map_addr(|a| a.next_multiple_of(2 << 20));
-        (input, rows.cast(), stride)
-    };
+    // Linux constants: prctl 41 is PR_SET_THP_DISABLE; mmap protections 1 (read) and 3
+    // (read and write); flags 0x4022 (private, anonymous, no reserve) and 0x12 (private, fixed).
+    prctl(41, 1usize, 0usize, 0usize, 0usize);
+    let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
+    let input = map(0, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
+    // For an empty file this fails, and the zero page stays.
+    map(input as usize, len, 1, 0x12, file.as_raw_fd());
+    // An hour has room for its rows (two per line, if every line escaped), then for the
+    // scratch (one value per line) after them, or after (1 << 18) rows if that is further,
+    // plus the unused ends of one partly filled chunk per thread.
+    let stride = ((1 << 18) + (len / 40 + 1) * 4 + threads * 512).next_multiple_of(1 << 19);
+    // Hour areas are multiples of 2 MiB and the first starts on a 2 MiB boundary, so each
+    // hour's pages share one page table instead of spilling into the next.
+    let rows = map(0, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1)
+        .map_addr(|a| a.next_multiple_of(2 << 20));
 
     let run = Run {
         input,
         len,
         next_claim: AtomicUsize::new(0),
         slots: [const { AtomicU64::new(0) }; SLOTS],
-        names: Mutex::new(Vec::new()),
-        rows,
+        names: Mutex::default(),
+        rows: rows.cast(),
         stride,
         claimed: [const { AtomicUsize::new(0) }; HOURS],
-        order: Mutex::default(),
         parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
         sealed: AtomicUsize::new(0),
         early,
@@ -522,8 +498,8 @@ fn solve(early: bool) -> bool {
         placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
-        (1..threads).for_each(|_| drop(s.spawn(|| run.work())));
-        run.work();
+        (1..threads).for_each(|_| drop(s.spawn(|| unsafe { run.parse() })));
+        unsafe { run.parse() };
     });
     run.dirty.load(Relaxed)
 }
