@@ -116,3 +116,6 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Failed (box, 2026-11-02, tools/wt_c55): line cut with the tables as a zeroed static.** S 295 to 286 and laptop tie, but `run-c8d494a9df4f` peaked at 27.2 MB (77.51): on the box (THP always) the large bss static was charged far beyond the two huge pages the mmap version uses. Reverted to a27b66a.
 
 **Tried, tie (2026-11-02, tools/wt_c56):** overflow probed in the same 128-byte line pair first, and the per-record stats as two AVX2 add and max-blend operations. All exact. Medians within noise on 12 CPUs; on 6 CPUs the pair probe was about 4% slower and the vector stats about 1.4% slower. Not pushed.
+
+**Failed (box test, 2026-11-02): claims of 2 MiB.** Commit 87a4dd3, `run-b6ccdd877b34`: 23.68 ms but 9.1 MB, 82.44, against 23.97 ms, 8.6 MB, 82.54 for 1 MiB. Twelve threads each hold twice the file pages (and their page tables) between claim start and release, and the 0.5 MB costs more than the 0.3 ms gains. Reverted.
+The same round's run of unchanged code (commit 9e875c6, `run-fa65dbff777e`) gave 23.9 ms and 9.7 MB, so box memory for this code varies by about 1 MB between runs (8.6 to 9.7 MB); the 2 MiB result above is inside that spread.

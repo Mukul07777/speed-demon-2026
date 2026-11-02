@@ -43,7 +43,7 @@ extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
-const CLAIM: usize = 1 << 21;
+const CLAIM: usize = 1 << 20;
 const BLOCK: usize = 1 << 16; // fits in L2 between the newline pass and the line pass
 const HOURS: usize = 72; // the span is fixed for every seed: 2026-10-30T18 to 2026-11-02T17
 const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time

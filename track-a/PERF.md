@@ -122,3 +122,6 @@ Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 Mi
 Second run `run-fcfb1dbe094f` 19.9 ms, 85.94. Two runs below 86.35 at 19.0 ms: not kept, likely the idle main thread. Code back at cdd7a88.
 Counters merged with main still working (S 335): `run-3213f43cbc08` 19.7 ms, 86.02.
 Second run `run-f0e128850679` 21.0 ms, 85.39. Not kept; code back at cdd7a88 (S 341, 86.35). Every cut below 341 has run 19.3-21.0 ms against 19.0-19.2 for 341.
+
+**Failed (box test, 2026-11-02): claims of 512 KiB.** Laptop had called 512 KiB and 2 MiB ties, so the box decided. Commit 87a4dd3, `run-9a3755dcd52c`: 20.25 ms, 16.2 MB, 85.59, against 19.0 ms for 1 MiB; unchanged B and D ran in their usual range that round. Twice the claims means twice the `madvise` calls and claim starts; reverted.
+Claims of 2 MiB, commit 9e875c6, `run-cf5016863d93`: 19.28 ms, 16.2 MB, 86.11, inside the 1 MiB band (19.0-19.7 ms) and no better. 1 MiB stays.
