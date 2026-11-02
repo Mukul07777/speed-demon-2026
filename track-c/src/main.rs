@@ -154,7 +154,7 @@ fn take_block(counter: &AtomicUsize, size: usize, len: usize) -> Option<usize> {
 
 impl Run {
     /// The number of a name, new if this is its first appearance.
-    unsafe fn find(&self, hash: u64) -> (bool, usize) {
+    unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
         let index = (hash >> 50) as usize;
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
@@ -165,16 +165,17 @@ impl Run {
             _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
         });
         let found = low | high << 4;
-        (found != 0, (bucket[(found | 256).trailing_zeros() as usize & 7].load(Relaxed) & NAME_MASK) as usize)
+        if found == 0 {
+            return self.insert(index, tag, spare);
+        }
+        (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
     }
 
     /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
     /// whose bucket is full and spills into the next. A compare-and-swap decides each slot, so
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
-    unsafe fn insert(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let index = (hash >> 50) as usize;
-        let tag = hash & (1 << 47) - 1 | 1;
+    unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
         if spare.is_empty() {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
@@ -253,8 +254,6 @@ impl Run {
         // and note lengths (`lengths` in the totals), and -1 for a negative amount, else 0.
         let [mut hashes, mut lengths] = [[0u64; MAX_RECORDS]; 2];
         let mut signs = [0i64; MAX_RECORDS];
-        let mut bits = [0u64; MAX_RECORDS];
-        let mut later_at = [0u32; MAX_RECORDS];
         let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
@@ -353,7 +352,6 @@ impl Run {
                 // half of the pass above when it read them itself. Now both are prefetched
                 // before this pass reads them. A locked update of a cold line stalls the core,
                 // so its lines are fetched here and updated in the pass after.
-                let (mut later, mut ready) = (0, 0);
                 for at in 0..count {
                     let group = REGION_GROUP[numbers[2][at] as usize].load(Relaxed) as usize;
                     let amount = (numbers[1][at] as i64 ^ signs[at]) - signs[at];
@@ -364,30 +362,13 @@ impl Run {
                     s[3] += lengths[at] as i64;
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
-                    numbers[2][at] = group as u32;
-                    let (hit, name) = self.find(hashes[at]);
+                    let name = self.intern(hashes[at], &mut spare);
                     let word = group * SEEN_WORDS + name / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
-                    bits[ready] = (word << 6 | name % 64) as u64;
-                    ready += hit as usize;
-                    later_at[later] = at as u32;
-                    later += !hit as usize;
+                    // The hash is done with, so its slot carries the bit's address to the next pass.
+                    hashes[at] = (word << 6 | name % 64) as u64;
                 }
-                // A miss is a new name, or one that spilled into the next bucket, which is
-                // fetched now and read after the rest.
-                for &at in &later_at[..later] {
-                    let next = ((hashes[at as usize] >> 50) as usize + 1) % BUCKETS;
-                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[next].as_ptr().cast());
-                }
-                for &at in &later_at[..later] {
-                    let at = at as usize;
-                    let name = self.insert(hashes[at], &mut spare);
-                    let word = numbers[2][at] as usize * SEEN_WORDS + name / 64;
-                    _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
-                    bits[ready] = (word << 6 | name % 64) as u64;
-                    ready += 1;
-                }
-                for &bit in &bits[..ready] {
+                for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
                     word.fetch_or(1 << (bit & 63), Relaxed);
                 }
