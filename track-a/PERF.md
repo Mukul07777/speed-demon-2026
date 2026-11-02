@@ -120,3 +120,4 @@ Failed (2026-11-01, tools/wt_a20): per-thread persistent scratch (peak 17->19 Mi
 
 **Box test (2026-11-02, tools/wt_a55): S 341 to 334.** Four counters in one array, main thread only joins. Laptop tie; hash, worked, empty and adversarial pass. First run `run-f9ce2e1411b3` 19.3 ms, 86.07 in a slow round (B 92.3 ms).
 Second run `run-fcfb1dbe094f` 19.9 ms, 85.94. Two runs below 86.35 at 19.0 ms: not kept, likely the idle main thread. Code back at cdd7a88.
+Counters merged with main still working (S 335): `run-3213f43cbc08` 19.7 ms, 86.02.
