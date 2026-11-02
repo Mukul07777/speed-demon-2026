@@ -92,3 +92,5 @@ Removal probes on cpuset 0-5: stats updates -2%, region lookup -6 to -12%, name 
 **Not kept (2026-11-02): at most 10 worker threads.** Laptop 15 alternating rounds, median 22.3 (12 threads), 22.7 (10), 23.8 (8). Box `run-51e8cd3bc33d` 23.40 ms, 10.7 MB, 81.85 and `run-dd3c3a0bb464` 23.39 ms, 10.6 MB, 81.89; unchanged code the next round `run-8a9f225a0f61` 23.72 ms, 11.8 MB, 81.30. Memory 1 MB lower, time no better, never near the 82.40 best.
 
 **Not pushed (2026-11-02): setup pre-fault (tools/wt_c30).** Removal probes, 12 CPUs, best ms: process and map 1.2, spawn tree 1.9, huge page zero 2.4, regions and barrier 3.1. `MAP_POPULATE` of regions ties in the setup probe (3.10 against 3.06), `MADV_POPULATE_WRITE` of the region table is worse (3.53). Ceiling under 2%.
+
+**Not pushed (2026-11-02): guided tail claims (16 MiB at 256 KiB, tools/wt_c31/v/g16_4.rs).** Worker end spread 0.6-1.1 ms, ceiling about 0.5 ms (2%); paired 25 and 40 rounds within noise, order flips the sign.
