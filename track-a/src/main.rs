@@ -441,6 +441,13 @@ fn eight_digits(value: u32) -> u64 {
 /// the first eight-digit group and the low eight from the second.
 unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
     *w = b' ';
+    if value < 100_000_000 {
+        // Nearly every number: one group of eight digits is enough.
+        let digits = eight_digits(value);
+        let skip = (digits | 1 << 63).trailing_zeros() as usize / 8;
+        write_unaligned(w.add(1).cast(), (digits + ZEROS) >> (8 * skip));
+        return w.add(9 - skip);
+    }
     let digits = eight_digits(value / 100_000_000) as u128
         | (eight_digits(value % 100_000_000) as u128) << 64;
     // Leading zero digits are the low bytes. The top bit is a sentinel, so 0 still prints one

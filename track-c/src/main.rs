@@ -100,16 +100,17 @@ unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
 }
 
 /// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
-/// Shifting them to the top makes the bytes below read as leading zeros.
+/// Shifting them to the top makes the bytes below read as leading zeros. The digits stay ASCII,
+/// and `decode_digits` keeps only each byte's low nibble.
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
-    (read_unaligned(end.sub(8).cast::<u64>()) ^ 0x3030_3030_3030_3030) >> (64 - 8 * len)
-        << (64 - 8 * len)
+    read_unaligned(end.sub(8).cast::<u64>()) >> (64 - 8 * len) << (64 - 8 * len)
 }
 
 /// Turns the first `count` words of eight digit bytes each into numbers, four at a time, like
 /// `eight_digits` does for one. The three arrays of a batch go through the same few
-/// instructions, so a record's numbers cost far less than three scalar multiply chains.
-unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
+/// instructions, so a record's numbers cost far less than three scalar multiply chains. No number
+/// is kept above `limit`.
+unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize, limit: u32) {
     for at in (0..count).step_by(4) {
         let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
         // Pairs of digits (times 10 and 1), then groups of four (times 100 and 1), then all eight
@@ -120,6 +121,7 @@ unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
         let eights = _mm256_madd_epi16(fours, _mm256_set1_epi32(0x0001_2710));
         // Each 128-bit half now holds its two numbers in its low 64 bits.
         let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(eights));
+        let packed = _mm_min_epu32(packed, _mm_set1_epi32(limit as i32));
         _mm_storeu_si128(numbers.as_mut_ptr().add(at).cast(), packed);
     }
 }
@@ -286,8 +288,13 @@ impl Run {
                     // Unconditional stores, so that a varying count needs no loop exit to
                     // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
+                    // A fixed count, which the compiler unrolls to four instructions a position.
+                    for extra in 0..8 {
+                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                        bits &= bits.wrapping_sub(1);
+                    }
+                    let mut extra = 8;
+                    while bits != 0 {
                         *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
                         extra += 1;
@@ -305,25 +312,36 @@ impl Run {
                     let five = pos.as_ptr().add(at * FIELDS).cast::<[u32; FIELDS]>();
                     (*five).map(|p| p as usize)
                 };
-                // Pass A: how many records start inside this claim, and their numbers.
-                let mut count = 0;
-                let mut start = record;
-                while count < filled / FIELDS && start < end {
-                    let [comma1, _, comma3, comma4, newline] = field(count);
-                    // Only the file's first record can start with a BOM, three bytes before its id.
-                    let bom = (*input.add(start) == 0xEF) as usize * 3;
-                    digits[0][count] = digits_before(input.add(comma1), comma1 - start - bom);
-                    digits[2][count] = digits_before(input.add(comma4), comma4 - comma3 - 1);
+                // Pass A: how many records start inside this claim, and their numbers. A record
+                // starts after the newline of the one before.
+                let start_of = |at: usize| {
+                    if at == 0 {
+                        record
+                    } else {
+                        field(at - 1)[4] + 1
+                    }
+                };
+                let count = (0..filled / FIELDS).rev().find(|&at| start_of(at) < end);
+                let count = count.map_or(0, |at| at + 1);
+                for at in 0..count {
+                    let [comma1, _, comma3, comma4, newline] = field(at);
+                    let mut start = start_of(at);
+                    // Only the file's first record and records after a BOM start with it.
+                    if *input.add(start) == 0xEF {
+                        start += 3;
+                    }
+                    digits[0][at] = digits_before(input.add(comma1), comma1 - start);
+                    digits[2][at] = digits_before(input.add(comma4), comma4 - comma3 - 1);
                     let stop = newline - (*input.add(newline - 1) == b'\r') as usize;
                     let negative = (*input.add(comma4 + 1) == b'-') as usize;
                     let cents = digits_before(input.add(stop), stop - comma4 - 1 - negative);
                     // Close the gap the point leaves: its byte is always third from the end.
-                    digits[1][count] = (cents & 0xFF_FFFF_FFFF) << 8 | cents >> 48 << 48;
-                    signs[count] = -(negative as i64);
-                    start = newline + 1;
-                    count += 1;
+                    digits[1][at] = (cents & 0xFF_FFFF_FFFF) << 8 | cents >> 48 << 48;
+                    signs[at] = -(negative as i64);
                 }
-                [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                // Ids past the region table share its last entry, which stays 0: unmatched.
+                let limits = [u32::MAX, u32::MAX, REGION_IDS as u32];
+                [0, 1, 2].map(|k| decode_digits(&digits[k], &mut numbers[k], count, limits[k]));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -340,22 +358,22 @@ impl Run {
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     // The top 14 bits of the hash pick the bucket.
                     _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 50) as usize].as_ptr().cast());
-                    // Ids past the table share its last entry, which stays 0: unmatched.
-                    let region = (numbers[2][at] as usize).min(REGION_IDS);
-                    _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
-                    numbers[2][at] = region as u32;
+                    let region = REGION_GROUP.as_ptr().add(numbers[2][at] as usize);
+                    _mm_prefetch::<_MM_HINT_T0>(region.cast());
                     hashes[at] = hash;
                     lengths[at] = name_len as u64 | (note_len as u64) << 32;
                 }
-                record = start;
+                record = start_of(count);
                 // The region table and the name table were each a cache miss on every record,
                 // half of the pass above when it read them itself. Now both are prefetched
                 // before this pass reads them. A locked update of a cold line stalls the core,
                 // so its lines are fetched here and updated in the pass after.
                 for at in 0..count {
-                    let group = REGION_GROUP[numbers[2][at] as usize].load(Relaxed) as usize;
+                    let group = REGION_GROUP
+                        .get_unchecked(numbers[2][at] as usize)
+                        .load(Relaxed);
                     let amount = (numbers[1][at] as i64 ^ signs[at]) - signs[at];
-                    let s = &mut stats[group];
+                    let s = stats.get_unchecked_mut(group as usize);
                     s[0] += 1;
                     s[1] += numbers[0][at] as i64;
                     s[2] += amount;
@@ -363,7 +381,7 @@ impl Run {
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
-                    let word = group * SEEN_WORDS + name / 64;
+                    let word = group as usize * SEEN_WORDS + name / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
                     // The hash is done with, so its slot carries the bit's address to the next pass.
                     hashes[at] = (word << 6 | name % 64) as u64;

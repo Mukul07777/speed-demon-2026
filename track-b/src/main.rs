@@ -252,6 +252,7 @@ struct Run {
     postings: *mut u16,
     parts: Vec<Mutex<Vec<u8>>>, // the output of each batch of queries
     workspace: *mut u8,
+    counts: *mut u32, // per thread, in the sample, how often each term occurs
 }
 unsafe impl Sync for Run {}
 
@@ -403,7 +404,9 @@ impl Run {
     /// Reads one claim. With SAMPLE set, it only counts how often each term appears.
     unsafe fn index_claim<const SAMPLE: bool>(&self, claim: usize, b: &mut Buffers) -> usize {
         let (start, mut doc) = aligned_line(self.text, self.docs, claim * CLAIM);
-        let end = aligned_line(self.text, self.docs, claim * CLAIM + CLAIM).0;
+        // The sample reads the start of each of its claims only, so that every thread has one.
+        let span = if SAMPLE { CLAIM / 4 } else { CLAIM };
+        let end = aligned_line(self.text, self.docs, claim * CLAIM + span).0;
         if start >= end {
             return 0;
         }
@@ -524,11 +527,16 @@ impl Run {
                 let mut t = from;
                 while t < to {
                     let v = _mm256_loadu_si256(acts.add(t).cast());
-                    let valid = if to - t >= 8 { 255 } else { (1u32 << (to - t)) - 1 };
+                    let valid = if to - t >= 8 {
+                        255
+                    } else {
+                        (1u32 << (to - t)) - 1
+                    };
                     let heavy = _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 & valid;
-                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(
-                        _mm256_cmpgt_epi32(v, _mm256_setzero_si256()),
-                    )) as u32
+                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+                        v,
+                        _mm256_setzero_si256(),
+                    ))) as u32
                         & valid;
                     let pick = |mask: u32| {
                         _mm256_cvtepu8_epi32(_mm_loadl_epi64(PACK[mask as usize].as_ptr().cast()))
@@ -959,22 +967,32 @@ impl Run {
             list_acts: take(&mut next, tokens + 8),
             list_ends: take(&mut next, BATCH / 2 + 64),
             anchor_hits: take(&mut next, tokens),
-            counts: take(&mut next, MAX_TERMS),
+            counts: std::slice::from_raw_parts_mut(self.counts.add(id * MAX_TERMS), MAX_TERMS),
         };
         self.shares[id].set(self.parse_share(id)).ok();
         self.barrier();
         // Threads that wake late find fewer claims left, instead of delaying everyone.
-        // 3 claims are read to choose the terms that get bitmaps.
-        self.each_job(&self.setup[0], 3, |claim| {
+        // A quarter of each of 12 claims is read to choose the terms that get bitmaps.
+        self.each_job(&self.setup[0], 12, |claim| {
             self.setup[4].fetch_add(self.index_claim::<true>(claim, &mut buffers), Relaxed);
         });
-        let terms = self.term_count.load(Relaxed);
-        for (total, &part) in self.sample.iter().zip(&buffers.counts[..terms]) {
-            total.fetch_add(part, Relaxed);
-        }
-        // The counts are done with: give their pages back, so they do not add to the peak.
-        discard(buffers.counts.as_ptr().cast(), MAX_TERMS * 4);
         self.barrier();
+        // Each thread adds up a slice of the terms over all the threads' counts: plain reads and
+        // one write per term, where every thread adding all its counts into one array would
+        // pass the same cache lines through all the cores.
+        let (terms, threads) = (self.term_count.load(Relaxed), self.shares.len());
+        for term in terms * id / threads..terms * (id + 1) / threads {
+            let total = (0..threads)
+                .map(|t| *self.counts.add(t * MAX_TERMS + term))
+                .sum();
+            self.sample[term].store(total, Relaxed);
+        }
+        self.barrier();
+        // The counts are done with: give their pages back, so they do not add to the peak. One
+        // thread does it for all: each call makes every other core flush its TLB.
+        if id == 0 {
+            discard(self.counts.cast(), threads * MAX_TERMS * 4);
+        }
         self.each_job(&self.setup[1], JOBS, |slice| self.plan_phrases(slice));
         self.barrier();
         self.each_job(&self.setup[2], JOBS, |part| self.plan_buckets(part));
@@ -1295,6 +1313,7 @@ fn main() {
             postings: reserve(text.len() + HUGE_PAGE, true),
             parts: (0..batches).map(|_| Mutex::default()).collect(),
             workspace: reserve(threads * WORKSPACE, false),
+            counts: reserve(threads * MAX_TERMS, false),
         };
         // Huge pages are wanted for the bucket table alone: touch it so it is faulted in as one,
         // then forbid them. Where the kernel gives every region huge pages (THP `always`), thread
